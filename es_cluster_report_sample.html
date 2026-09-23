@@ -1,0 +1,45 @@
+<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ES 클러스터 디스크 관점 리포트</title><style>
+:root{--ink:#1c2430;--mut:#5d6776;--line:#e2e5ea;--panel:#f5f6f8;--bg:#fff;--nav:#23324a;
+--ok:#1d7a4b;--info:#2d5f9e;--caution:#946300;--warn:#bf4a10;--crit:#b3261e;--na:#8b93a1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);
+font:15px/1.65 "Pretendard","Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR","Segoe UI",sans-serif;
+word-break:keep-all;font-variant-numeric:tabular-nums}
+.wrap{max-width:1080px;margin:0 auto;padding:36px 24px 72px}
+h1{font-size:15px;font-weight:600;color:var(--mut);margin:0 0 4px}
+h2{font-size:20px;margin:48px 0 6px;letter-spacing:-.2px}
+h2+p.lead{margin:0 0 16px;color:var(--mut);font-size:14px}
+.meta{font-size:13px;color:var(--mut)}
+.verdict{margin:18px 0 8px;padding:26px 28px;border-radius:6px;border-left:8px solid}
+.verdict.good{background:#eef7f1;border-color:var(--ok)}.verdict.risk{background:#fdf6e7;border-color:var(--caution)}
+.verdict.bad{background:#fcefec;border-color:var(--crit)}.verdict.hold{background:#eef3fa;border-color:var(--info)}
+.verdict b{display:block;font-size:30px;line-height:1.25;letter-spacing:-.6px;margin-bottom:8px}
+.verdict span{font-size:15px;color:#3a4453}
+.dims{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:0;margin:18px 0 0;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.dim{padding:12px 10px;border-right:1px solid var(--line);background:#fff}.dim:last-child{border-right:0}
+.dim .n{font-size:12px;color:var(--mut)}.dim .s{font-size:15px;font-weight:700;margin-top:2px}
+.dim .bar{height:4px;border-radius:2px;margin-top:8px}
+.s-ok{color:var(--ok)}.s-info{color:var(--info)}.s-caution{color:var(--caution)}.s-warn{color:var(--warn)}.s-crit{color:var(--crit)}.s-na{color:var(--na)}
+.b-ok{background:var(--ok)}.b-info{background:var(--info)}.b-caution{background:var(--caution)}.b-warn{background:var(--warn)}.b-crit{background:var(--crit)}.b-na{background:#d5d9e0}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:16px}
+.kpi{background:var(--panel);border-radius:6px;padding:14px 16px}.kpi .l{font-size:12px;color:var(--mut)}
+.kpi .v{font-size:24px;font-weight:700;margin-top:2px}.kpi .d{font-size:12px;color:var(--mut)}
+.chart{border:1px solid var(--line);border-radius:6px;padding:12px 14px 6px;margin:12px 0}
+.chart .t{font-size:13px;font-weight:600}.chart .lg{font-size:12px;color:var(--mut)}
+.chart svg{width:100%;height:190px;display:block}.chart .ro{font-size:12px;color:var(--mut);min-height:18px}
+.topact{margin:16px 0 0;border:1px solid var(--line);border-radius:6px;padding:14px 18px}.topact .tt{font-weight:700;color:var(--nav);margin-bottom:6px}.topact ol{margin:0;padding-left:20px}.topact li{margin:6px 0}.topact .who{font-size:12px;color:var(--mut);margin-left:4px}.bp td.st{white-space:nowrap}.grp{margin-top:18px}.grp>h3{font-size:14px;margin:0 0 8px;color:var(--nav)}
+details.f{border:1px solid var(--line);border-left:5px solid;border-radius:5px;margin:8px 0;background:#fff}
+details.f[open]{box-shadow:0 1px 0 var(--line)}
+details.f summary{cursor:pointer;padding:11px 14px;list-style:none;display:flex;gap:10px;align-items:baseline}
+details.f summary::-webkit-details-marker{display:none}
+.tag{font-size:12px;font-weight:700;padding:1px 8px;border-radius:3px;color:#fff;white-space:nowrap}
+.f-body{padding:0 16px 14px 16px;font-size:14px}.f-body dt{font-weight:700;margin-top:8px;font-size:13px;color:var(--nav)}
+.f-body dd{margin:2px 0 0}.f-body .src{font-size:12px;color:var(--mut);margin-top:10px}
+code{font-family:Consolas,"D2Coding",monospace;font-size:13px;background:var(--panel);padding:1px 5px;border-radius:3px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;margin:8px 0}th,td{border-bottom:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+th{background:var(--panel);font-weight:600;color:#3a4453}td.n{text-align:right}
+.scroll{overflow-x:auto}.note{font-size:13px;color:var(--mut)}
+pre{background:var(--panel);padding:10px 12px;border-radius:5px;font-size:12px;overflow-x:auto;white-space:pre-wrap}
+@media(max-width:820px){.kpis{grid-template-columns:repeat(2,1fr)}.verdict b{font-size:24px}}
+@media print{.wrap{padding:0}details.f{break-inside:avoid}details.f .f-body{display:block}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head><body><div class="wrap"><h1>Elasticsearch 클러스터 — 디스크 관점 리포트</h1><div class="meta">- · ES 8.15.3 · 노드 3개 · 2026-09-23 02:43:28 +0000 ~ 02:43:33 (간격 5초)</div><div class="verdict risk"><b>일부 노드에 쏠림이나 위험 요인이 있습니다</b><span>표에서 눈에 띄는 노드에 접속해 es_disk_collect.sh 로 커널 레벨을 확인하세요.</span></div><h2>노드별 비교</h2><div class="scroll"><table><tr><th>노드</th><th>역할</th><th>디스크 busy</th><th>쓰기</th><th>디스크 사용률</th><th>보관 용량</th><th>인덱싱</th><th>스로틀</th><th>write 거절</th><th>heap</th><th>CPU</th></tr><tr><td><b>es-hot-02</b></td><td class="note">data_hot,ingest</td><td class="n">91%</td><td class="n">888.7 MB/s</td><td class="n">78%</td><td class="n">1,210GB</td><td class="n">31,667/s</td><td class="n">4,200ms</td><td class="n">9</td><td class="n">63%</td><td class="n">52%</td></tr><tr><td><b>es-hot-03</b></td><td class="note">data_hot,ingest</td><td class="n">38%</td><td class="n">376.0 MB/s</td><td class="n">86%</td><td class="n">1,190GB</td><td class="n">31,667/s</td><td class="n">0ms</td><td class="n">0</td><td class="n">64%</td><td class="n">64%</td></tr><tr><td><b>es-hot-01</b></td><td class="note">data_hot,ingest</td><td class="n">35%</td><td class="n">341.8 MB/s</td><td class="n">70%</td><td class="n">1,200GB</td><td class="n">31,667/s</td><td class="n">0ms</td><td class="n">0</td><td class="n">62%</td><td class="n">40%</td></tr></table></div><h2>판정 근거와 조치 안내</h2><details class="f" open style="border-left-color:#946300"><summary><span class="tag" style="background:#946300">주의</span><span><b>디스크 사용 시간(busy) 쏠림 — es-hot-02 노드만 유독 높음</b> <span class="note">· 원인 분리 필요</span></span></summary><div class="f-body"><dl><dt>측정 근거</dt><dd>es-hot-02 91.0% vs 클러스터 중앙값 38.5%</dd><dt>왜 중요한가</dt><dd>전체가 아니라 특정 노드만 높다면 그 노드의 스토리지나 샤드 배치가 원인일 가능성이 큽니다. 클러스터 전체가 비슷하게 높다면 스토리지 공통 구간이나 워크로드 자체를 봐야 합니다.</dd><dt>조치 안내</dt><dd>해당 노드에서 es_disk_collect.sh 를 실행해 커널 레벨로 확인하세요.</dd></dl><div class="src">기준 출처: _nodes/stats (노드 간 비교)</div></div></details><details class="f" open style="border-left-color:#946300"><summary><span class="tag" style="background:#946300">주의</span><span><b>쓰기 처리량 쏠림 — es-hot-02 노드만 유독 높음</b> <span class="note">· 원인 분리 필요</span></span></summary><div class="f-body"><dl><dt>측정 근거</dt><dd>es-hot-02 888.7 MB/s vs 클러스터 중앙값 376.0 MB/s</dd><dt>왜 중요한가</dt><dd>전체가 아니라 특정 노드만 높다면 그 노드의 스토리지나 샤드 배치가 원인일 가능성이 큽니다. 클러스터 전체가 비슷하게 높다면 스토리지 공통 구간이나 워크로드 자체를 봐야 합니다.</dd><dt>조치 안내</dt><dd>해당 노드에서 es_disk_collect.sh 를 실행해 커널 레벨로 확인하세요.</dd></dl><div class="src">기준 출처: _nodes/stats (노드 간 비교)</div></div></details><details class="f" open style="border-left-color:#946300"><summary><span class="tag" style="background:#946300">주의</span><span><b>디스크 사용률이 watermark에 도달했거나 근접한 노드 있음</b> <span class="note">· ES 설정</span></span></summary><div class="f-body"><dl><dt>측정 근거</dt><dd>es-hot-03 86% (high 90%)</dd><dt>왜 중요한가</dt><dd>high watermark를 넘으면 ES가 샤드를 다른 노드로 옮깁니다. 이 복사 작업 자체가 큰 디스크 부하라, 느려서 넘쳤는데 더 느려지는 악순환이 생깁니다.</dd><dt>조치 안내</dt><dd>ILM 정책 점검으로 오래된 인덱스를 정리하거나 용량을 늘리세요. 임시로 watermark를 올리는 것은 원인을 미루는 것뿐입니다.</dd></dl><div class="src">기준 출처: Elastic 문서 &#x27;Disk-based shard allocation&#x27;</div></div></details><details class="f" open style="border-left-color:#2d5f9e"><summary><span class="tag" style="background:#2d5f9e">참고</span><span><b>측정 시점에 클러스터가 스스로 디스크를 쓰고 있었음</b> <span class="note">· 참고</span></span></summary><div class="f-body"><dl><dt>측정 근거</dt><dd>샤드 복구 1건 진행 중 · 샤드 이동 2개 · 초기화 중 샤드 1개 · indices.recovery.max_bytes_per_sec=40mb</dd><dt>왜 중요한가</dt><dd>복구·이동·스냅샷은 정상 동작이지만 순간적으로 디스크를 크게 씁니다. 이 시간대 측정값은 평상시보다 나쁘게 나옵니다.</dd><dt>조치 안내</dt><dd>작업이 끝난 뒤 다시 측정해 비교하세요. 복구가 상시 디스크를 압박한다면 indices.recovery.max_bytes_per_sec 조정을 검토합니다(운영 영향 확인 필요).</dd></dl><div class="src">기준 출처: _cat/recovery, _cluster/health, _snapshot/_status</div></div></details><details class="f" open style="border-left-color:#2d5f9e"><summary><span class="tag" style="background:#2d5f9e">참고</span><span><b>shard allocation awareness 미설정</b> <span class="note">· VMware 관리자</span></span></summary><div class="f-body"><dl><dt>측정 근거</dt><dd>cluster.routing.allocation.awareness.attributes 없음 · data 노드 3개</dd><dt>왜 중요한가</dt><dd>ESXi 호스트 한 대에 primary와 replica를 가진 VM이 같이 올라가 있으면, 호스트 한 대가 죽을 때 두 벌을 동시에 잃습니다. ES는 VM이 어느 호스트에 있는지 모릅니다.</dd><dt>조치 안내</dt><dd>노드에 호스트 정보를 attribute로 넣고 awareness를 설정하는 방법과, VMware 쪽 DRS anti-affinity 규칙을 함께 검토하세요.</dd></dl><div class="src">기준 출처: Elastic 문서 &#x27;Shard allocation awareness&#x27;</div></div></details><p class="note" style="margin-top:28px">es_cluster_probe.sh · ES 조회 API(GET)만으로 만든 읽기 전용 리포트입니다.</p></div></body></html>
