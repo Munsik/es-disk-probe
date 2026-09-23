@@ -7,50 +7,65 @@ VMware + vSAN 환경을 기본으로 가정했고, 물리 서버에서도 동작
 
 | 파일 | 역할 | 서버 영향 |
 |---|---|---|
-| `es_disk_collect.sh` | 데이터 수집 (서버에서 실행) | 읽기만 함. 설정 변경 없음 |
+| `es_disk_collect.sh` | **수집 전부** — 로컬 + 클러스터 + 인덱스별 분포 | 읽기만 함. 설정 변경 없음 |
 | `es_disk_render.py` | 분석·판정·HTML 생성 (서버 또는 PC) | 서버에서 안 돌려도 됨 |
-| `es_cluster_probe.sh` | 클러스터 관점 수집 (ES API만) | 조회 API GET만. SSH 불필요 |
+| `es_cluster_probe.sh` | (선택) 클러스터만 따로 조회 — 노드 접속 불가할 때 | 조회 API GET만 |
 | `es_disk_bench.sh` | 최대 능력 측정 (선택) | **부하를 검. 점검 시간에만** |
 | `GUARDLINE.md` | 설계·구성·상시 감시 기준과 변경 원칙 | 문서 |
 
 ## 실행
 
+데이터 노드에서 이것 하나만 실행하면 됩니다. 로컬 디스크, 클러스터 전체, 인덱스별 분포를 한 번에 수집합니다.
+
 ```bash
-# 1) 피크 시간대에 수집 (기본 300초 / 5초 간격)
+# 피크 시간대에 실행 (기본 300초 / 5초 간격)
 sudo ES_PASSWORD='***' ./es_disk_collect.sh --es-user elastic -d 600
 
-# API Key를 쓰는 경우
+# API Key
 sudo ES_API_KEY='base64값' ./es_disk_collect.sh -d 600
 
-# Hybrid vSAN이면 기준을 바꿔서
+# Hybrid vSAN
 sudo ./es_disk_collect.sh -s hybrid
 
-# 2) 서버에 python3가 없으면 번들만 가져와 PC에서 생성
-python3 es_disk_render.py esdisk_<host>_<시각>.tar.gz
-
-# 3) 클러스터 관점 — 노트북에서 실행해도 됨 (ES 접근만 되면)
-ES_PASSWORD='***' ./es_cluster_probe.sh --es-url https://es-host:9200 --es-user elastic -g 60
-python3 es_disk_render.py <노드 번들> --cluster /tmp/escluster_<시각>
-python3 es_disk_render.py --cluster-only /tmp/escluster_<시각>   # 노드 접속 없이 클러스터만
-
-# 4) (선택) 서비스 투입 전·점검 시간에 최대 능력 측정 후 리포트에 반영
-sudo ./es_disk_bench.sh -t /data/elasticsearch -s 4G
-python3 es_disk_render.py <번들> --bench /tmp/esbench_<host>_<시각>
+# 이 노드만 (클러스터 조회 권한이 없을 때)
+sudo ./es_disk_collect.sh --no-cluster
 ```
 
-필요한 것: bash, awk, coreutils, curl(ES 조회 시). sysstat·jq 불필요.
-분석기는 Python 3.6+ 표준 라이브러리만 씁니다 (RHEL 8의 `/usr/libexec/platform-python` 자동 인식).
+클러스터 조회에 실패해도 경고만 남기고 로컬 결과로 리포트를 만듭니다. 필요 권한은 `cluster monitor`입니다.
 
-## 노드 로컬 / 클러스터 관점의 역할
+서버에 python3가 없으면 번들만 PC로 옮겨 렌더합니다.
 
-| | 노드 로컬 (`es_disk_collect.sh`) | 클러스터 (`es_cluster_probe.sh`) |
-|---|---|---|
-| 접근 | 해당 노드 SSH 필요 | ES 접근만 되면 어디서든 |
-| 깊이 | 커널 레벨 응답시간·큐·PSI·설정 | 노드 간 비교 수준 |
-| 답하는 질문 | 이 노드 디스크가 느린가, 원인이 VM 안인가 밖인가 | 이 노드만인가 전체인가, 지금 클러스터가 디스크를 쓰고 있나 |
-| 권한 | root 권장 | cluster monitor 권한이면 충분 |
+```bash
+python3 es_disk_render.py esdisk_<host>_<시각>.tar.gz
+```
 
-둘을 같이 쓰면 "이 노드 디스크가 느리다"에서 끝나지 않고 "전체가 아니라 이 노드만이고, 원인은 VM 바깥이다"까지 말할 수 있습니다.
+선택 사항 두 가지입니다.
+
+```bash
+# 최대 능력 측정 — 서비스 투입 전이나 점검 시간에만
+sudo ./es_disk_bench.sh -t /data/elasticsearch -s 4G
+python3 es_disk_render.py <번들> --bench /tmp/esbench_<host>_<시각>
+
+# 노드에 접속할 수 없을 때, 클러스터만 원격 조회
+ES_PASSWORD='***' ./es_cluster_probe.sh --es-url https://es:9200 --es-user elastic
+python3 es_disk_render.py --cluster-only /tmp/escluster_<시각>
+```
+
+## 한 번 실행으로 얻는 것
+
+| 관점 | 내용 |
+|---|---|
+| 로컬 (커널) | 응답시간 p95, 대기 I/O, PSI, D 상태, 설정 전수, 커널 로그, VMware 자원 |
+| 클러스터 | 노드별 디스크 사용량 비교, 샤드·용량 쏠림, 복구·스냅샷 등 클러스터발 부하 |
+| 인덱스 | 이 노드 샤드의 인덱스별 쓰기·merge·검색 분포, ILM phase |
+
+클러스터 스냅샷은 로컬 측정과 **같은 창**으로 찍습니다. 시간대가 어긋난 비교가 아닙니다.
+
+교차 판정으로 아래를 가립니다.
+
+- 디스크가 느린 게 아니라 **이 노드에 샤드가 몰린** 경우
+- 한 노드가 아니라 **여러 노드가 동시에** 느려진 경우 (공용 스토리지 의심)
+- 쓰기가 **특정 인덱스 하나에 집중**된 경우
 
 ## 서버에 주는 영향 (실측)
 
