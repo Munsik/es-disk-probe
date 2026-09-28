@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-es_disk_render.py (v0.9.2)
+es_disk_render.py (v0.9.3)
 es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 지표 계산 → 판정 → HTML 리포트를 생성합니다.
 
@@ -14,10 +14,10 @@ es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 """
 import argparse, html, json, os, re, sys, tarfile, tempfile, datetime
 
-TOOL_VERSION = "0.9.2"
+TOOL_VERSION = "0.9.3"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 기준값 (출처를 함께 표기 — 리포트에도 그대로 노출)
+# 기준값 (출처를 함께 표기. 리포트에도 그대로 노출)
 # ─────────────────────────────────────────────────────────────────────────────
 # Guest에서 관측한 디스크 응답시간(ms). Broadcom vSAN KB 389082(All-Flash <5ms, Hybrid <20ms 정상)
 # 를 기준으로 삼고 단계는 실무 기준으로 나눔. Elastic이 공식 수치를 제시하지는 않음.
@@ -52,7 +52,7 @@ def open_bundle(path):
                 t.extract(m, tmp)
         subs = sorted(os.path.join(tmp, d) for d in os.listdir(tmp))
         subs = [d for d in subs if os.path.isdir(d)]
-        # 번들 루트는 meta 파일이 있는 디렉터리 — 여러 개면 그것으로 고른다
+        # 번들 루트는 meta 파일이 있는 디렉터리. 여러 개면 그것으로 고른다
         for d in subs:
             if os.path.isfile(os.path.join(d, "meta")):
                 return d
@@ -553,7 +553,7 @@ def analyze_cluster(cdir, add, th):
             top = max(group, key=lambda r: r[key] if r[key] is not None else -1)
             if med and top[key] and top[key] >= floor and top[key] >= med * factor:
                 scope = "" if len(tiers) == 1 else " ({} tier 내 비교)".format(tname)
-                add("caution", "클러스터", "원인 분리 필요", "{} 쏠림 — {} 노드만 유독 높음".format(label, top["name"]),
+                add("caution", "클러스터", "원인 분리 필요", "{} 쏠림. {} 노드만 유독 높음".format(label, top["name"]),
                     "{} {} vs 같은 tier 중앙값 {}{} · 비교 대상 {}개 노드".format(
                         top["name"], fmt(top[key], 1, unit), fmt(med, 1, unit), scope, len(vals)),
                     "전체가 아니라 특정 노드만 높다면 그 노드의 스토리지나 샤드 배치가 원인일 가능성이 큽니다. "
@@ -769,7 +769,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         fmt(A["r_await_p95"], 2, "ms"), fmt(A["r_await_mean"], 2, "ms"),
         fmt(A["w_await_p95"], 2, "ms"), fmt(A["w_await_mean"], 2, "ms"),
         MIN_IOS_PER_INTERVAL, A["valid_r"], A["valid_w"])
-    src_lat = "[VMware 공식] Broadcom KB 389082 — All-Flash 5ms 미만 / Hybrid 20ms 미만을 정상으로 제시. 주의·경고·위험 3단계 구분은 실무 기준이며 Elastic 공식 수치는 없음"
+    src_lat = "[VMware 공식] Broadcom KB 389082. All-Flash 5ms 미만 / Hybrid 20ms 미만을 정상으로 제시. 주의·경고·위험 3단계 구분은 실무 기준이며 Elastic 공식 수치는 없음"
     lat_sev = sev_max(r_sev, w_sev)
     if A["valid_r"] + A["valid_w"] == 0:
         add("info", "지연", "참고", "측정 구간에 디스크 I/O가 거의 없어 응답시간을 평가할 수 없음",
@@ -788,7 +788,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             "아래 '병목 위치' 판정을 먼저 확인하세요. Guest 큐가 원인이면 서버에서, 아니면 VMware 쪽에서 풀어야 합니다.",
             src_lat)
 
-    # 병목 위치 — 큐 사용률과 응답시간의 조합
+    # 병목 위치: 큐 사용률과 응답시간의 조합
     qd = [num(topo.attr.get(d, {}).get("device/queue_depth")) for d in phys]
     qd = [q for q in qd if q]
     qd_total = sum(qd) if qd else None
@@ -800,12 +800,12 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         fmt(A["aqu_p95"], 1),
         " · 장치 처리 중(inflight) p95 {}".format(fmt(A["inflight_p95"], 1)) if A["inflight_p95"] is not None else "",
         int(qd_total) if qd_total else "미확인")
-    QSRC = ("[VMware 공식] KB 2053145 — PVSCSI 기본 큐 64(device)/254(adapter), ring_pages 8→32 및 cmd_per_lun 254 권장. "
+    QSRC = ("[VMware 공식] KB 2053145. PVSCSI 기본 큐 64(device)/254(adapter), ring_pages 8→32 및 cmd_per_lun 254 권장. "
             "게스트 내부 지연과 VM/VMDK 레벨 지연의 차이가 큐 깊이 낮은 컨트롤러의 큐 고갈에서 비롯될 수 있다는 서술은 "
             "Broadcom 'Troubleshooting vSAN Performance'. 큐 사용률 구간(40%·80%)은 실무 기준")
     if SEV_ORDER.get(lat_sev, 0) >= SEV_ORDER["caution"]:
         if qratio is None:
-            add("caution", "지연", "원인 분리 필요", "병목 위치: 판정 보류 — queue_depth를 읽지 못함",
+            add("caution", "지연", "원인 분리 필요", "병목 위치 판정 보류: queue_depth를 읽지 못함",
                 q_ev, "queue_depth를 모르면 지연이 VM 안의 큐에서 생긴 것인지 밖에서 생긴 것인지 가를 수 없습니다.",
                 "/sys/block/<장치>/device/queue_depth 를 읽을 수 있는 권한(root)으로 재측정하세요. "
                 "그 전까지는 VM 안·밖 양쪽을 함께 확인해야 합니다.", QSRC)
@@ -819,7 +819,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         elif qratio >= 0.4:
             # 큐도 깊고 지연도 높다 → 한쪽으로 단정할 수 없는 구간
             add("warn" if lat_sev in ("warn", "crit") else "caution", "지연", "원인 분리 필요",
-                "병목 위치: 큐도 깊고 지연도 높음 — VM 안·밖을 함께 확인 (큐 사용률 {:.0f}%)".format(qratio * 100),
+                "병목 위치: 큐도 깊고 지연도 높음. VM 안과 밖을 함께 확인 (큐 사용률 {:.0f}%)".format(qratio * 100),
                 q_ev,
                 "큐가 절반 이상 차 있으면서 응답시간도 높습니다. 백엔드가 느려서 요청이 밀려 큐가 쌓인 것일 수도 있고, "
                 "큐가 좁아서 대기가 길어진 것일 수도 있어 한쪽으로 단정할 수 없습니다. 두 원인은 함께 나타나는 경우가 많습니다.",
@@ -836,7 +836,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     # 쓰기만 느림 → vSAN 쓰기 경로 힌트
     if (A["w_await_p95"] and A["r_await_p95"] and A["valid_w"] >= 3 and A["valid_r"] >= 3
             and A["w_await_p95"] >= th["caution"] and A["w_await_p95"] > 3 * A["r_await_p95"]):
-        add("caution", "지연", "VMware 관리자", "쓰기만 유독 느림 — vSAN 쓰기 경로 확인 필요",
+        add("caution", "지연", "VMware 관리자", "쓰기만 유독 느림. vSAN 쓰기 경로 확인 필요",
             "쓰기 p95 {} vs 읽기 p95 {}".format(fmt(A["w_await_p95"], 2, "ms"), fmt(A["r_await_p95"], 2, "ms")),
             "vSAN은 쓰기를 복제본 전부에서 확인받아야 끝납니다(RAID-1 FTT=1이면 호스트 2대). 그래서 쓰기만 느리면 vSAN 네트워크, "
             "쓰기 버퍼 destage, RAID-5/6 정책의 read-modify-write를 의심할 수 있습니다. Guest에서는 vSAN 네트워크를 직접 볼 수 없어 추정입니다.",
@@ -859,7 +859,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             # 기다리는 시간은 많은데 한 건 한 건은 빠름 → 디스크가 느린 게 아니라 I/O 양이 많은 상태
             s = "caution" if s == "warn" else "info"
             sat_sevs.append(s)
-            add(s, "포화", "원인 분리 필요", "I/O 대기 비율은 높지만 응답시간은 빠름 — 디스크보다 I/O 양이 많은 상태",
+            add(s, "포화", "원인 분리 필요", "I/O 대기 비율은 높지만 응답시간은 빠름. 디스크보다 I/O 양이 많은 상태",
                 psi_ev + " · 응답시간 p95 읽기 {} / 쓰기 {}".format(fmt(A["r_await_p95"], 2, "ms"), fmt(A["w_await_p95"], 2, "ms")),
                 "PSI는 '작업이 I/O를 기다리며 멈춘 시간 비율'이라 동기 쓰기(fsync)를 쉬지 않고 반복하는 작업이 있으면 디스크가 빨라도 높게 나옵니다. "
                 "또 서버 전체 지표라 ES가 아닌 백업·로그 수집 에이전트 때문일 수도 있습니다.",
@@ -948,7 +948,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             ("인덱싱 평균 소요 (문서당, 샤드 기준)", fmt(per(idx_t, idx_n), 3, " ms"), ""),
             ("인덱싱 스로틀 시간 (merge 지연 때문)", fmt(thr, 0, " ms"), "0이 아니면 merge가 쓰기를 못 따라가는 상태"),
             ("검색 query 평균", fmt(per(q_t, q_n), 1, " ms"), "샤드 단위 시간"),
-            ("검색 fetch 평균", fmt(per(f_t, f_n), 1, " ms"), "_source 읽기 — 디스크 영향 큼"),
+            ("검색 fetch 평균", fmt(per(f_t, f_n), 1, " ms"), "_source 읽기. 디스크 영향이 큼"),
             ("flush 평균 (fsync 포함)", fmt(per(fl_t, fl_n), 0, " ms"), ""),
             ("refresh 평균", fmt(per(rf_t, rf_n), 0, " ms"), ""),
             ("merge 자동 스로틀 비율", fmt((100.0 * mg_thr / mg_t) if (mg_t and mg_thr is not None) else None, 0, "%"), "ES가 의도적으로 merge 속도를 조절한 비율 (정상 동작)"),
@@ -1029,7 +1029,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         add("info", "메모리·캐시", "참고", "page cache로 쓸 수 있는 메모리 약 {}".format(fmt(cache_mb / 1024, 1, "GB")),
             "RAM {} − heap {}{}".format(fmt(mem_total_mb / 1024, 1, "GB"), fmt(heap_mb / 1024, 1, "GB"), ratio_txt),
             "검색에서 자주 읽는 segment가 이 안에 들어가면 디스크를 거의 읽지 않습니다. 비율이 낮을수록 검색이 디스크 속도에 좌우됩니다.",
-            "검색 지연이 문제라면 이 비율과 ES major fault 추이를 함께 보세요.", "[Elastic 공식] Tune for search speed — Give memory to the filesystem cache")
+            "검색 지연이 문제라면 이 비율과 ES major fault 추이를 함께 보세요.", "[Elastic 공식] Tune for search speed > Give memory to the filesystem cache")
     mj = [r.get("es_majflt") for r in sysr if r.get("es_majflt") is not None]
     if mj:
         mj95 = pctl(mj, .95)
@@ -1051,7 +1051,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
 
     # ═════════════ 6. 설정 ═════════════
     cfg_sevs = []
-    # readahead — Elastic 공식 권고 128KiB
+    # readahead: Elastic 공식 권고 128KiB
     ra_bad = []
     for d in sorted(set(phys + logical)):
         ra = num(topo.attr.get(topo.whole(d), {}).get("queue/read_ahead_kb"))
@@ -1063,7 +1063,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         add(s, "설정", "서버 담당자", "readahead가 Elastic 권고값(128KiB)보다 큼", ", ".join(ra_bad),
             "검색은 무작위 읽기가 많아 readahead가 크면 필요 없는 데이터까지 읽어 page cache를 밀어냅니다. LVM·dm 장치는 수 MB로 잡히는 경우가 있습니다.",
             "blockdev --setra 256 /dev/<장치> (512B 섹터 단위 → 128KiB) 로 즉시 적용 가능, udev 규칙으로 영구화. LVM이면 dm 장치에도 적용하세요.",
-            "[Elastic 공식] Tune for search speed — LVM·software RAID·dm-crypt에서 readahead가 수 MiB로 커질 수 있으며 128KiB 권장 (blockdev --setra 256)")
+            "[Elastic 공식] Tune for search speed. LVM, software RAID, dm-crypt에서 readahead가 수 MiB로 커질 수 있으며 128KiB 권장 (blockdev --setra 256)")
     # scheduler
     sch_bad = []
     for d in phys:
@@ -1077,19 +1077,19 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         add("caution", "설정", "서버 담당자", "I/O 스케줄러가 가상 디스크에 불리함", ", ".join(sch_bad),
             "cfq/bfq는 프로세스 간 공평 분배에 시간을 씁니다. 스케줄링은 vSAN이 이미 하므로 VM에서는 가볍게 두는 편이 낫습니다. none과 mq-deadline의 차이는 작습니다.",
             "mq-deadline 또는 none으로 변경 (echo mq-deadline > /sys/block/<장치>/queue/scheduler, udev 규칙으로 영구화).",
-            "Red Hat 'Monitoring and managing system status and performance' — Setting the disk scheduler")
+            "Red Hat 'Monitoring and managing system status and performance' > Setting the disk scheduler")
     # max_map_count
     mmc = num(sysctl.get("vm.max_map_count"))
     if mmc is not None and mmc < 262144:
         cfg_sevs.append("crit")
         add("crit", "설정", "서버 담당자", "vm.max_map_count가 ES 최소 요구치 미만", "현재 {}".format(int(mmc)),
             "ES는 segment를 mmap으로 엽니다. 매핑 개수 한도가 부족하면 운영 모드에서 기동이 거부되거나 mmap 실패가 납니다.",
-            "sysctl -w vm.max_map_count=1048576 + /etc/sysctl.d/ 에 영구 설정.", "[Elastic 공식] Bootstrap checks — Maximum map count (최소 262144, 권장 1048576)")
+            "sysctl -w vm.max_map_count=1048576 + /etc/sysctl.d/ 에 영구 설정.", "[Elastic 공식] Bootstrap checks > Maximum map count (최소 262144, 권장 1048576)")
     elif mmc is not None and mmc < 1048576:
         cfg_sevs.append("info")
         add("info", "설정", "서버 담당자", "vm.max_map_count 최소치는 충족, 권장치 미만", "현재 {} (권장 1048576)".format(int(mmc)),
             "샤드·segment가 많은 노드일수록 매핑 수가 늘어납니다.", "여유 있게 1048576으로 올려 두는 것을 권장합니다.",
-            "Elastic 문서 'Bootstrap checks — Maximum map count'")
+            "Elastic 문서 'Bootstrap checks > Maximum map count'")
     # THP
     thp = sysctl.get("thp.enabled", "")
     m = re.search(r'\[(\w+)\]', thp)
@@ -1110,10 +1110,10 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             cfg_sevs.append(s)
             add(s, "설정", "서버 담당자", "ES data 경로 파일시스템이 {}".format(m["fs"]), "{} on {}".format(m["mnt"], m["src"]),
                 "ES는 로컬 블록 장치 위의 xfs/ext4를 전제로 합니다. 네트워크 파일시스템은 잠금·fsync 동작이 달라 위험합니다.",
-                "xfs 또는 ext4 로컬 볼륨으로 이전하세요.", "[Elastic 공식] Hardware — 로컬 스토리지 권장, 원격 파일시스템 회피")
+                "xfs 또는 ext4 로컬 볼륨으로 이전하세요.", "[Elastic 공식] Hardware. 로컬 스토리지 권장, 원격 파일시스템 회피")
         if "strictatime" in opts:
             cfg_sevs.append("caution")
-            add("caution", "설정", "서버 담당자", "strictatime 마운트 — 읽을 때마다 메타데이터 쓰기", m["opts"],
+            add("caution", "설정", "서버 담당자", "strictatime 마운트. 읽을 때마다 메타데이터 쓰기", m["opts"],
                 "파일을 읽을 때마다 접근 시각을 기록합니다. 기본값 relatime은 이 비용이 거의 없습니다.", "noatime 또는 기본 relatime으로 변경.", "mount(8)")
         if "discard" in opts:
             cfg_sevs.append("caution")
@@ -1128,12 +1128,12 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                 add("caution", "설정", "서버 담당자", "파티션 시작 위치가 1MiB 정렬이 아님", "{} start sector {}".format(part, start),
                     "정렬이 어긋나면 I/O 한 번이 하부 블록 두 개에 걸쳐 불필요한 추가 I/O가 생깁니다.",
                     "신규 구성 시 1MiB(2048 섹터) 정렬로 파티션을 만드세요. 운영 중 변경은 데이터 이전이 필요합니다.", "parted/fdisk 정렬 가이드")
-    # SCSI timeout — vSAN failover 대비
+    # SCSI timeout: vSAN failover 대비
     to_bad = ["{}={}s".format(d, topo.attr[d]["device/timeout"]) for d in phys
               if num(topo.attr.get(d, {}).get("device/timeout"), 999) < 60]
     if to_bad:
         cfg_sevs.append("warn")
-        add("warn", "설정", "서버 담당자", "SCSI 명령 타임아웃이 짧음 — vSAN 순간 정지 시 I/O 오류 위험", ", ".join(to_bad),
+        add("warn", "설정", "서버 담당자", "SCSI 명령 타임아웃이 짧음. vSAN이 잠깐 멈추면 I/O 오류 위험", ", ".join(to_bad),
             "vSAN 호스트 장애나 경로 전환 중에는 I/O가 수십 초 멈출 수 있습니다. 타임아웃이 짧으면 Guest가 이를 오류로 처리해 파일시스템이 읽기전용으로 바뀔 수 있습니다.",
             "open-vm-tools를 설치하면 udev 규칙으로 180초가 설정됩니다. 설치 여부와 /sys/block/<장치>/device/timeout 값을 확인하세요.",
             "open-vm-tools udev 규칙 (99-vmware-scsi-udev.rules)")
@@ -1194,7 +1194,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         if hosts and set(hosts) <= set(rhosts):
             add("info", "설정", "VMware 관리자", "OS 디스크와 data 디스크가 같은 가상 SCSI 컨트롤러에 연결", "controller {}".format(", ".join(hosts)),
                 "컨트롤러 하나의 큐를 함께 씁니다. 부하가 높을 때 컨트롤러를 나누면 큐가 분산됩니다.",
-                "ES data VMDK를 별도 PVSCSI 컨트롤러(SCSI 1:x 등)에 연결하는 것을 권장합니다.", "VMware 'Performance Best Practices for vSphere' — PVSCSI")
+                "ES data VMDK를 별도 PVSCSI 컨트롤러(SCSI 1:x 등)에 연결하는 것을 권장합니다.", "VMware 'Performance Best Practices for vSphere' > PVSCSI")
     # LVM linear over multiple PVs
     for d in logical:
         if d.startswith("dm-") and len(topo.slaves.get(d, [])) > 1:
@@ -1207,7 +1207,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                     "{} ← {}".format(dmn, ", ".join(topo.slaves[d])),
                     "linear는 앞 디스크를 채운 뒤 다음 디스크를 씁니다. I/O가 한 디스크에 몰려 병렬 효과가 거의 없습니다.",
                     "신규 구성 시 lvcreate -i <디스크 수> -I 256k 로 stripe 구성을 권장합니다.", "LVM lvcreate(8)")
-    # iostats 비활성 — 이러면 측정 자체가 무의미
+    # iostats 비활성. 이러면 측정 자체가 무의미
     for d in phys:
         if topo.attr.get(d, {}).get("queue/iostats") == "0":
             cfg_sevs.append("warn")
@@ -1215,7 +1215,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                 "/sys/block/{}/queue/iostats = 0".format(d),
                 "커널이 이 장치의 I/O 통계를 쌓지 않습니다. iostat·sar를 포함해 어떤 도구도 이 디스크의 응답시간을 볼 수 없습니다. 이 리포트의 해당 장치 수치도 신뢰할 수 없습니다.",
                 "iostats를 1로 되돌린 뒤 재측정하세요 (성능 영향은 무시할 수준).", "Linux block layer sysfs")
-    # writeback throttling — 커널이 쓰기를 의도적으로 억제
+    # writeback throttling: 커널이 쓰기를 의도적으로 억제
     wbt = [(d, num(topo.attr.get(d, {}).get("queue/wbt_lat_usec"))) for d in phys]
     wbt_on = [(d, v) for d, v in wbt if v and v > 0]
     if wbt_on and SEV_ORDER.get(w_sev, 0) >= SEV_ORDER["caution"]:
@@ -1266,7 +1266,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                 "현재 매핑 {:,}개 / 한도 {:,}개 ({:.0f}%)".format(int(mapc), int(mmc), use),
                 "한도에 닿으면 새 segment를 열지 못해 인덱싱·검색이 실패합니다. 샤드와 segment가 늘수록 함께 증가합니다.",
                 "vm.max_map_count를 1048576으로 올리고, 동시에 샤드·segment 수가 과한지 점검하세요.",
-                "Elastic 문서 'Bootstrap checks — Maximum map count'")
+                "Elastic 문서 'Bootstrap checks > Maximum map count'")
     # ES 로그에 남은 디스크 관련 메시지
     eslog = [l for l in rd(S, "es_log").splitlines() if l.strip() and not l.startswith("#FILE")]
     if eslog:
@@ -1326,7 +1326,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             add("caution", "VMware 자원", "VMware 관리자", "메모리 예약이 VM 메모리보다 작음",
                 "예약 {} MB / VM 메모리 약 {} MB".format(memres, int(mem_total_mb)),
                 "예약되지 않은 만큼은 호스트 메모리가 부족할 때 balloon·swap 대상이 됩니다. 지금은 괜찮아도 다른 VM이 몰리면 ES가 먼저 영향을 받습니다.",
-                "ES VM은 메모리 예약 100%(Reserve all guest memory)를 권장합니다.", "VMware 'Performance Best Practices for vSphere' — memory")
+                "ES VM은 메모리 예약 100%(Reserve all guest memory)를 권장합니다.", "VMware 'Performance Best Practices for vSphere' > memory")
         if memlim is not None and 0 < memlim < mem_total_mb * 0.95 and memlim < 4000000:
             vm_sevs.append("warn")
             add("warn", "VMware 자원", "VMware 관리자", "VM에 메모리 한도(limit)가 설정됨", "{} MB".format(memlim),
@@ -1340,7 +1340,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     if st95 is not None and st95 >= 5:
         s = "warn" if st95 >= 10 else "caution"
         vm_sevs.append(s)
-        add(s, "VMware 자원", "VMware 관리자", "CPU steal — 호스트 CPU 경합", "p95 {} · 최대 {}".format(fmt(st95, 1, "%"), fmt(vmax(steal), 1, "%")),
+        add(s, "VMware 자원", "VMware 관리자", "CPU steal 발생. 호스트 CPU 경합", "p95 {} · 최대 {}".format(fmt(st95, 1, "%"), fmt(vmax(steal), 1, "%")),
             "VM이 실행하려 할 때 호스트가 CPU를 내주지 못한 시간입니다. vSAN은 호스트 CPU로 동작하므로 경합이 크면 I/O 처리도 늦어집니다.",
             "호스트 과할당 여부, VM CPU ready 값을 VMware 관리자에게 확인 요청하세요.", "Linux /proc/stat steal")
     vm_sev = sev_max(*vm_sevs) if vm_sevs else ("ok" if is_vmware else "na")
@@ -1369,7 +1369,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     add("info", "네트워크", "참고", "vSAN 네트워크는 Guest에서 보이지 않음",
         "Guest NIC에는 ES 트래픽만 흐름. vSAN 복제 트래픽은 ESXi vmkernel 포트로 흐름",
         "vSAN 네트워크 지연은 Guest에서 '쓰기 응답시간 증가'로만 간접 관측됩니다. 그래서 네트워크는 보조 지표로만 씁니다.",
-        "쓰기 지연이 높으면 VMware 관리자에게 vSAN 네트워크(전용 대역, 25GbE 이상 권장, 재전송·지연)를 확인 요청하세요.", "[VMware 공식] Troubleshooting vSAN Performance — 2% 패킷 손실로 스토리지 성능 32% 저하, vSwitch 드롭 0.0001% 이하 권고")
+        "쓰기 지연이 높으면 VMware 관리자에게 vSAN 네트워크(전용 대역, 25GbE 이상 권장, 재전송·지연)를 확인 요청하세요.", "[VMware 공식] Troubleshooting vSAN Performance. 2% 패킷 손실로 스토리지 성능 32% 저하, vSwitch 드롭 0.0001% 이하 권고")
 
     # ═════════════ 9. 과거 이력 (sar) ═════════════
     want = set(phys) | set(logical) | set(topo.attr.get(d, {}).get("dm/name", "") for d in logical)
@@ -1467,7 +1467,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     else:
         sw_cur, sw_st = "swap 있음 · swappiness {} · memory_lock {}".format(sysctl.get("vm.swappiness"), "미확인" if mlock is None else "꺼짐"), "warn"
     bp("커널", "swap 차단", "swap 비활성 > memory_lock > swappiness=1", sw_cur, sw_st, "Elastic 공식")
-    bp("커널", "Transparent HugePage", "madvise 또는 never (Elastic 필수 아님)", thp_cur or "-", "info" if thp_cur == "always" else "ok", "[참고] DB 벤더 운영 관행 — Elastic 공식 요구사항 아님")
+    bp("커널", "Transparent HugePage", "madvise 또는 never (Elastic 필수 아님)", thp_cur or "-", "info" if thp_cur == "always" else "ok", "[참고] DB 벤더 운영 관행. Elastic 공식 요구사항 아님")
     bp("커널", "dirty page 기준", "기본값 유지, 쓰기 지연 급등 시 바이트 단위 검토",
        "ratio {}/{} · bytes {}/{}".format(sysctl.get("vm.dirty_background_ratio", "-"), sysctl.get("vm.dirty_ratio", "-"),
                                          sysctl.get("vm.dirty_background_bytes", "-"), sysctl.get("vm.dirty_bytes", "-")), "info", "커널 문서")
@@ -1480,7 +1480,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     bp("ES 프로세스", "cgroup I/O 제한", "없음", "있음" if (cg and re.search(r'(rbps|wbps|riops|wiops)=\d', cg)) else "없음",
        "warn" if (cg and re.search(r'(rbps|wbps|riops|wiops)=\d', cg)) else "ok", "cgroup v2")
     bp("구성", "OS와 ES data 디스크 분리", "별도 가상 디스크", "같은 디스크: " + ", ".join(share_dev) if share_dev else "분리됨",
-       "info" if share_dev else "ok", "[VMware 공식] Performance Best Practices — 워크로드별 컨트롤러 분리")
+       "info" if share_dev else "ok", "[VMware 공식] Performance Best Practices. 워크로드별 컨트롤러 분리")
     dh = sorted(set(topo.scsihost.get(d) for d in phys if topo.scsihost.get(d)))
     rh = sorted(set(topo.scsihost.get(d) for d in root_phys if topo.scsihost.get(d)))
     if dh and rh:
@@ -1548,7 +1548,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             if mine and med and mine >= med * 1.3:
                 loaded = SEV_ORDER.get(lat_sev, 0) >= SEV_ORDER["caution"] or SEV_ORDER.get(sat_sev, 0) >= SEV_ORDER["caution"]
                 add("warn" if loaded else "info", "클러스터", "ES 설정" if loaded else "참고",
-                    "이 노드에 샤드가 몰려 있음" + (" — 디스크 부하와 함께 나타남" if loaded else ""),
+                    "이 노드에 샤드가 몰려 있음" + (", 디스크 부하와 함께 나타남" if loaded else ""),
                     "{} 샤드 {:.0f}개 / 클러스터 중앙값 {:.0f}개 · 이 노드 지연 {} · 포화 {}".format(
                         me_name, mine, med, SEV_LABEL.get(lat_sev, lat_sev), SEV_LABEL.get(sat_sev, sat_sev)),
                     "샤드가 많으면 그만큼 segment·merge·translog가 이 노드 디스크에 집중됩니다. 스토리지가 느린 게 아니라 일이 몰린 것일 수 있습니다."
@@ -1560,7 +1560,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         if len(busy) >= 3:
             high = [n_ for n_, v in busy if v >= 70]
             if len(high) >= max(2, len(busy) // 2) and SEV_ORDER.get(lat_sev, 0) >= SEV_ORDER["caution"]:
-                add("warn", "클러스터", "VMware 관리자", "여러 노드가 동시에 디스크를 많이 쓰고 있음 — 공용 스토리지 의심",
+                add("warn", "클러스터", "VMware 관리자", "여러 노드가 동시에 디스크를 많이 쓰고 있음. 공용 스토리지 의심",
                     "디스크 busy 70% 이상 {}개 노드 ({}) / 전체 {}개 · 이 노드 지연 {}".format(
                         len(high), ", ".join(high[:6]), len(busy), SEV_LABEL.get(lat_sev, lat_sev)),
                     "노드 하나가 아니라 여러 노드가 같은 시간에 느려졌다면, 각 VM의 문제가 아니라 그 VM들이 공유하는 vSAN 데이터스토어나 호스트 쪽 원인일 가능성이 큽니다. "
@@ -1623,7 +1623,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                    "측정 구간의 응답시간·포화·오류가 모두 기준 안이고, ES 운영에 불리한 설정도 발견되지 않았습니다.")
 
     if CL and CL["data_rows"]:
-        # 비교는 같은 data tier 안에서만 — hot 노드를 warm/cold 노드와 섞으면 중앙값이 왜곡된다
+        # 비교는 같은 data tier 안에서만. hot 노드를 warm/cold 노드와 섞으면 중앙값이 왜곡된다
         my_row = next((r for r in CL["data_rows"] if r["name"] == me_name), None)
         def _tier(r):
             for t in ("data_hot", "data_warm", "data_cold", "data_frozen", "data_content"):
@@ -1640,7 +1640,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                 if me > med * 1.5:
                     rel = "이 노드만 다른 노드보다 뚜렷하게 높습니다"
                 elif many_high:
-                    rel = "이 노드만의 문제가 아니라 여러 노드가 동시에 높습니다 — 공용 스토리지를 함께 보세요"
+                    rel = "이 노드만의 문제가 아니라 여러 노드가 동시에 높습니다. 공용 스토리지를 함께 보세요"
                 else:
                     rel = "다른 노드들과 비슷한 수준입니다"
                 verdict = (verdict[0], verdict[1],
@@ -1661,7 +1661,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         m = re.match(r'(\d+)m([\d.]+)s', x)
         return int(m.group(1)) * 60 + float(m.group(2)) if m else 0.0
     cpu_s = sum(tsec(x) for x in ov)
-    # 이 진단이 서버에 실제로 준 부하 — 리포트에 그대로 고지한다
+    # 이 진단이 서버에 실제로 준 부하. 리포트에 그대로 고지한다
     eslog_b = num(meta.get("read_eslog_bytes"), 0) or 0
     sar_b = num(meta.get("read_sar_bytes"), 0) or 0
     out_kb = num(meta.get("output_kb"), 0) or 0
@@ -1801,7 +1801,7 @@ def render(R, out_path):
     meta = R["meta"]
     h = []
     h.append('<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">')
-    h.append('<title>ES Disk I/O 진단 — {}</title><style>{}</style></head><body><div class="wrap">'.format(E(meta.get("host")), CSS))
+    h.append('<title>ES Disk I/O 진단 · {}</title><style>{}</style></head><body><div class="wrap">'.format(E(meta.get("host")), CSS))
     h.append('<h1>Elasticsearch 디스크 I/O 진단 리포트</h1>')
     h.append('<div class="meta">{} · {} · kernel {} · vCPU {} · RAM {:.0f}GB · ES {} · {} · 측정 {} ~ {} ({:.0f}초, {}초 간격)</div>'.format(
         E(meta.get("host")), E(R["os"]), E(R["kernel"]), R["ncpu"], R["mem_gb"], E(R["es_version"]),
@@ -1902,7 +1902,7 @@ def render(R, out_path):
         h.append('</table>')
         sync = (R["bench"].get("fsync_4k") or {})
         if sync.get("sync_p99") or sync.get("w_p99"):
-            h.append('<p class="note">동기 쓰기(fdatasync) p99: {} — translog를 요청마다 fsync하는 기본 설정(durability: request)에서 인덱싱 요청 한 번이 최소로 기다리는 시간입니다.</p>'.format(
+            h.append('<p class="note">동기 쓰기(fdatasync) p99 {}. translog를 요청마다 fsync하는 기본 설정(durability: request)에서 인덱싱 요청 한 번이 최소로 기다리는 시간입니다.</p>'.format(
                 fmt(sync.get("sync_p99") or sync.get("w_p99"), 2, " ms")))
     else:
         h.append('<h2>한계 추정</h2><p class="lead">부하 테스트 없이 계산할 수 있는 것은 "가상 디스크 큐 기준 상한"까지입니다. 동시에 처리할 수 있는 요청 수(queue_depth 합계)를 1건 평균 처리 시간으로 나눈 값입니다. '
@@ -1919,7 +1919,7 @@ def render(R, out_path):
     # 클러스터 관점
     CL = R.get("CL")
     if CL:
-        h.append('<h2>클러스터 관점 — 이 노드만인가, 전체인가</h2>')
+        h.append('<h2>클러스터 관점: 이 노드만인가, 전체인가</h2>')
         h.append('<p class="lead">각 노드가 자기 커널에서 읽은 디스크 카운터를 ES 조회 API로 모아 비교한 것입니다. 노드에 접속하지 않고 얻은 값이라 커널 레벨 응답시간만큼 정밀하지는 않지만, 어느 노드가 유독 바쁜지 가려내는 데는 충분합니다.{}</p>'.format(
             "" if CL["io_ok"] else " 이 클러스터에서는 노드별 디스크 카운터(fs.io_stats)가 보고되지 않아 용량·인덱싱 지표로만 비교했습니다."))
         h.append('<div class="scroll"><table><tr><th>노드</th><th>역할</th><th>디스크 busy</th><th>읽기</th><th>쓰기</th><th>디스크 사용률</th>'
@@ -2054,9 +2054,9 @@ def render(R, out_path):
     for r in rows:
         h.append('<tr>' + "".join('<td>{}</td>'.format(E(c)) for c in r) + '</tr>')
     h.append('</table>')
-    h.append('<p><b>Elastic System/Linux integration 으로는 볼 수 없는 것</b> — 상시 수집 지표와 이 툴이 겹치지 않는 부분입니다. '
+    h.append('<p><b>Elastic System/Linux integration 으로는 볼 수 없는 것</b><br>상시 수집 지표와 이 도구가 겹치지 않는 부분입니다. '
              '상시 모니터링을 대체하려는 것이 아니라, 경보가 울린 뒤 원인을 좁힐 때 필요한 항목들입니다.</p>')
-    h.append('<table><tr><th>항목</th><th>상시 수집 지표</th><th>이 툴</th><th>왜 필요한가</th></tr>')
+    h.append('<table><tr><th>항목</th><th>상시 수집 지표</th><th>이 도구</th><th>왜 필요한가</th></tr>')
     gaps = [
         ("응답시간 백분위", "10~30초 평균값만 저장", "p95 + I/O 적은 구간 제외", "평균은 짧은 지연 급등을 지워 버립니다"),
         ("병목 위치 판정", "없음", "대기 I/O ÷ queue_depth 로 VM 안/밖 구분", "VMware 관리자에게 넘길지 서버에서 풀지가 갈립니다"),
@@ -2075,8 +2075,8 @@ def render(R, out_path):
         h.append('<tr>' + "".join('<td>{}</td>'.format(E(c)) for c in g) + '</tr>')
     h.append('</table>')
     h.append('<p class="note">반대로 상시 수집 지표가 더 나은 영역도 분명합니다. 장기 추세, 여러 노드 동시 시계열, 경보 자동화는 Elastic 쪽이 맞습니다. '
-             '이 툴은 그 경보가 울린 순간에 한 번 깊게 파는 용도입니다. 상시 경보 기준은 GUARDLINE.md 4장에 정리했습니다.</p>')
-    h.append('<p><b>Guest OS에서 원리상 볼 수 없는 것</b> — 아래 항목은 판정에 넣지 않았고, 필요하면 VMware 관리자에게 확인해야 합니다.</p>')
+             '이 도구는 그 경보가 울린 순간에 한 번 깊게 파는 용도입니다. 상시 경보 기준은 GUARDLINE.md 4장에 정리했습니다.</p>')
+    h.append('<p><b>Guest OS에서 원리상 볼 수 없는 것</b><br>아래 항목은 판정에 넣지 않았고, 필요하면 VMware 관리자에게 확인해야 합니다.</p>')
     h.append('<table><tr><th>항목</th><th>왜 중요한가</th><th>관리자 확인 방법</th></tr>')
     blind = [
         ("vSAN 스토리지 정책 (RAID·FTT·stripe·IOPS 제한)", "OSA에서 RAID-5/6은 쓰기마다 읽기-수정-쓰기가 생겨 RAID-1보다 쓰기 지연이 큽니다. 정책의 IOPS 제한은 그 이상을 막습니다.", "VM 스토리지 정책 확인"),
@@ -2129,7 +2129,7 @@ def render_cluster_only(cdir, out_path):
         v = ("good", "노드 간 디스크 사용이 고르고 경고 신호가 없습니다", "이 결과는 ES가 보고한 수치 기준입니다. 커널 레벨 응답시간은 노드 수집기로 확인하세요.")
     h = ['<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
          '<title>ES 클러스터 디스크 관점 리포트</title><style>{}</style></head><body><div class="wrap">'.format(CSS),
-         '<h1>Elasticsearch 클러스터 — 디스크 관점 리포트</h1>',
+         '<h1>Elasticsearch 클러스터 · 디스크 관점 리포트</h1>',
          '<div class="meta">{} · ES {} · 노드 {}개 · {} ~ {} (간격 {}초)</div>'.format(
              E(dig(root, "cluster_name") or "-"), E(dig(root, "version", "number") or "-"), len(CL["rows"]),
              E(CL["meta"].get("start_wall", "")), E(CL["meta"].get("end_wall", "")[11:19]), E(CL["meta"].get("gap", ""))),

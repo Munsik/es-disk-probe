@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_bench.sh  (v0.9.2, 선택 사항)
+# es_disk_bench.sh  (v0.9.3, 선택 사항)
 # ES data 디스크의 "최대 능력"을 fio로 측정합니다. → 리포트의 여유율 계산용
 #
 # ⚠ 이 스크립트는 디스크에 실제 부하를 겁니다. 반드시 아래 조건에서만 실행하세요.
@@ -15,6 +15,12 @@
 #   - drop_caches, sync 강제, 원시 장치 쓰기는 하지 않음 (direct I/O 파일 테스트만)
 #
 # 사용: sudo ./es_disk_bench.sh -t /var/lib/elasticsearch [-s 4G] [-r 30] [-o /tmp]
+#
+#   -t PATH           측정할 ES data 경로 (필수, 존재하는 디렉터리)
+#   -s SIZE           테스트 파일 크기 (기본 4G. 4G / 512M / 1048576 형식)
+#   -r SEC            테스트당 실행 시간 (기본 30, 최소 5)
+#   -o DIR            결과 저장 위치 (기본 /tmp)
+#   --force-with-es   ES 가 떠 있어도 실행 (영향을 감수할 때만)
 # 결과: <출력>/esbench_<host>_<ts>/*.json  →  es_disk_render.py --bench <이 디렉터리>
 #
 # 해석 주의: 테스트 파일이 vSAN 캐시 계층에 들어가면 결과가 실제보다 좋게 나옵니다.
@@ -74,7 +80,7 @@ echo "결과 → $OUT"
 COMMON=(--directory="$WORK" --filename=bench.dat --size="$SIZE" --direct=1 --time_based
         --runtime="$RT" --ramp_time=5 --group_reporting --output-format=json)
 
-run() { local name="$1"; shift; echo "  ▸ $name"; fio --name="$name" "${COMMON[@]}" "$@" > "$OUT/$name.json" 2>"$OUT/$name.err" || echo "    실패 — $OUT/$name.err 확인"; }
+run() { local name="$1"; shift; echo "  ▸ $name"; fio --name="$name" "${COMMON[@]}" "$@" > "$OUT/$name.json" 2>"$OUT/$name.err" || echo "    실패. $OUT/$name.err 확인"; }
 
 # 검색: 작은 무작위 읽기, 동시 요청 많음
 run randread_4k  --rw=randread  --bs=4k  --ioengine=libaio --iodepth=32 --numjobs=4

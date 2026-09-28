@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_collect.sh  (v0.9.2)
-# Elasticsearch 노드 Disk I/O 진단 — 데이터 수집기 (READ-ONLY)
+# es_disk_collect.sh  (v0.9.3)
+# Elasticsearch 노드 Disk I/O 진단: 데이터 수집기 (READ-ONLY)
 #
 #  - 시스템 설정을 바꾸지 않습니다. /proc, /sys 읽기와 ES 조회 API 호출만 합니다.
 #  - 외부 패키지 불필요 (bash, awk, coreutils). iostat/sysstat 없어도 동작합니다.
@@ -10,7 +10,7 @@
 #
 # 사용법:
 #   sudo ./es_disk_collect.sh [옵션]
-#     -d SEC        측정 시간 (기본 300초 — 피크 시간대에 실행 권장)
+#     -d SEC        측정 시간 (기본 300초. 피크 시간대에 실행 권장)
 #     -i SEC        샘플 간격 (기본 5초, 최소 1초)
 #     -p PATH       ES data 경로 (여러 번 지정 가능, 미지정 시 자동 탐지)
 #     -o DIR        결과 저장 위치 (기본 /tmp)
@@ -39,7 +39,7 @@ set -u
 umask 077
 export LC_ALL=C
 
-VERSION="0.9.2"
+VERSION="0.9.3"
 DUR=300; INT=5; OUT_BASE="/tmp"; STORAGE="allflash"
 ES_URL=""; ES_USER=""; NO_ES=0; NO_RENDER=0; NO_CLUSTER=0
 NO_ESLOG=0; NO_KLOG=0; NO_SAR=0; NO_MAPS=0; NO_IDXSTATS=0
@@ -69,7 +69,7 @@ ES_PASSWORD="${ES_PASSWORD:-}"; ES_API_KEY="${ES_API_KEY:-}"
 [[ "$INT" =~ ^[0-9]+$ && "$INT" -ge 1 ]] || { echo "-i 는 1 이상 정수"; exit 1; }
 [[ "$DUR" =~ ^[0-9]+$ && "$DUR" -ge $((INT*3)) ]] || { echo "-d 는 간격의 3배 이상"; exit 1; }
 case "$STORAGE" in allflash|hybrid) ;; *) echo "-s 는 allflash|hybrid"; exit 1 ;; esac
-ES_URL="${ES_URL%/}"        # 뒤 슬래시 제거 — 붙어 있으면 //_cluster/health 로 요청이 나감
+ES_URL="${ES_URL%/}"        # 뒤 슬래시 제거. 붙어 있으면 //_cluster/health 로 요청이 나감
 
 msg() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
@@ -86,7 +86,7 @@ OUT="$OUT_BASE/esdisk_${HOST}_${TS}"
 S="$OUT/static"
 mkdir -p "$S" || { echo "출력 디렉터리 생성 실패: $OUT"; exit 1; }
 
-# 출력 위치 여유 공간 (50MB 미만이면 중단 — 서비스 디스크를 채우지 않기 위함)
+# 출력 위치 여유 공간 (50MB 미만이면 중단. 서비스 디스크를 채우지 않으려고)
 AVAIL_KB=$(df -Pk "$OUT_BASE" | awk 'NR==2{print $4}')
 [[ "${AVAIL_KB:-0}" -lt 51200 ]] && { echo "출력 경로 여유 공간 부족 (<50MB): $OUT_BASE"; rm -rf "$OUT"; exit 1; }
 
@@ -194,7 +194,7 @@ cp /proc/interrupts "$S/interrupts_start" 2>/dev/null
 save dmsetup_table dmsetup table
 save udev_rules sh -c "grep -rhsE 'scheduler|read_ahead|queue/|timeout' /etc/udev/rules.d/ /usr/lib/udev/rules.d/ /lib/udev/rules.d/ 2>/dev/null | grep -v '^#' | head -100"
 
-# 커널 로그 — I/O 오류·SCSI 리셋·hung task (최근 7일, 가능한 범위)
+# 커널 로그: I/O 오류, SCSI 리셋, hung task (최근 7일, 가능한 범위)
 # -n 으로 상한을 둔다: 장애가 반복되는 노드는 커널 메시지가 수십만 줄이 될 수 있고,
 # 그만큼 journal 파일을 읽으면 그 자체가 디스크 부하가 된다. 최근 것부터 보므로 상한으로 충분.
 KLOG_MAX_LINES=${KLOG_MAX_LINES:-20000}
@@ -203,13 +203,13 @@ if [[ $NO_KLOG -eq 0 ]]; then
   {
     command -v journalctl >/dev/null 2>&1 && journalctl -k --since "7 days ago" -n "$KLOG_MAX_LINES" -o short-iso --no-pager 2>/dev/null
   } | grep -Ei "$KPAT" | grep -viE 'nmi|audit|usb|BogoMIPS|preset' | tail -300 > "$S/klog_io" 2>/dev/null
-  # journal 이 없거나 결과가 비면 dmesg (메모리 링버퍼 — 디스크를 읽지 않음)
+  # journal 이 없거나 결과가 비면 dmesg (메모리 ring buffer라 디스크를 읽지 않음)
   [[ -s "$S/klog_io" ]] || { dmesg -T 2>/dev/null | grep -Ei "$KPAT" | grep -viE 'nmi|audit|usb|BogoMIPS|preset' | tail -300 > "$S/klog_io"; }
 else
   : > "$S/klog_io"
 fi
 
-# 네트워크 (ES transport — 참고용)
+# 네트워크 (ES transport, 참고용)
 {
   for i in /sys/class/net/*; do
     n=${i##*/}; [[ "$n" == "lo" ]] && continue
@@ -221,7 +221,7 @@ fi
   done
 } > "$S/net" 2>/dev/null
 
-# sar 이력 — sysstat이 이미 기록해 둔 과거 데이터를 읽는다 (새로 수집하지 않음)
+# sar 이력: sysstat이 이미 기록해 둔 과거 데이터를 읽는다 (새로 수집하지 않음)
 # sa 파일을 한 번만 읽는다. 이전에는 -d 와 -u 로 같은 파일을 두 번 읽었는데
 # sar_u 는 리포트에서 쓰이지 않아 읽는 만큼이 그대로 낭비였다.
 SAR_BYTES=0
@@ -261,7 +261,7 @@ if [[ -n "$ES_PID" && -d /proc/$ES_PID ]]; then
       [[ -s "$f" ]] && sed "s|^|${f##*/}: |" "$f"
     done
   } > "$S/es_cgroup_io" 2>/dev/null
-  # elasticsearch.yml — 필요한 키만 추출 (비밀정보 제외)
+  # elasticsearch.yml: 필요한 키만 추출 (비밀정보 제외)
   CONF_DIR=$(grep -oE 'es\.path\.conf=[^ ]+' "$S/es_cmdline" 2>/dev/null | head -1 | cut -d= -f2)
   CONF_DIR=${CONF_DIR:-/etc/elasticsearch}
   if [[ -r "$CONF_DIR/elasticsearch.yml" ]]; then
@@ -270,7 +270,7 @@ if [[ -n "$ES_PID" && -d /proc/$ES_PID ]]; then
   fi
 fi
 
-# ── ES 로그 — 디스크와 직접 연결되는 메시지만 추출 ────────────────────────
+# ── ES 로그: 디스크와 직접 연결되는 메시지만 추출 ────────────────────────
 ES_LOG_DIR=$(grep -oE 'es\.path\.logs=[^ ]+' "$S/es_cmdline" 2>/dev/null | head -1 | cut -d= -f2)
 ES_LOG_DIR=${ES_LOG_DIR:-/var/log/elasticsearch}
 ESLOGPAT='now throttling indexing|stopped throttling|disk watermark|flood stage|failed to flush|Too many open files|failed to write|translog.*(error|corrupt|recover)|overhead, spent|\[gc\]\[|shard failed|failed to recover|Data too large|timed out after'
@@ -341,9 +341,9 @@ if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
     es_get "_cluster/settings?include_defaults=true&flat_settings=true&filter_path=**.cluster.routing.allocation.disk*,**.cluster.routing.allocation.awareness*" "$S/es_cluster_settings.json" >/dev/null
     es_get "_cluster/health?filter_path=status,number_of_nodes,relocating_shards,initializing_shards,unassigned_shards" "$S/es_health.json" >/dev/null
   elif [[ "$c" == "401" ]]; then
-    msg "⚠ ES 인증 필요 (401) — --es-user + ES_PASSWORD 또는 ES_API_KEY 지정 시 ES 지표 포함"
+    msg "⚠ ES 인증 필요 (401). --es-user + ES_PASSWORD 또는 ES_API_KEY 지정 시 ES 지표 포함"
   else
-    msg "⚠ ES API 접속 실패 (http=$c) — OS 레벨만 수집합니다"
+    msg "⚠ ES API 접속 실패 (http=$c). OS 레벨만 수집합니다"
   fi
 fi
 NODE_STATS_PATH="_nodes/_local/stats/indices,fs,thread_pool,jvm,indexing_pressure?filter_path=nodes.*.timestamp,nodes.*.name,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.store,nodes.*.indices.segments,nodes.*.indices.translog,nodes.*.fs,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.jvm.gc,nodes.*.indexing_pressure"
@@ -361,7 +361,7 @@ if [[ $ES_OK -eq 1 ]]; then
       echo "cluster=ok" >> "$OUT/meta"
     else
       echo "cluster=failed_$CC" >> "$OUT/meta"
-      msg "⚠ 클러스터 조회 실패 (http=$CC) — 이 노드 결과만으로 리포트를 만듭니다"
+      msg "⚠ 클러스터 조회 실패 (http=$CC). 이 노드 결과만으로 리포트를 만듭니다"
       msg "  필요 권한: cluster monitor. 권한이 없으면 --no-cluster 로 경고 없이 실행하세요."
       NO_CLUSTER=1
     fi
@@ -369,7 +369,7 @@ if [[ $ES_OK -eq 1 ]]; then
 fi
 
 # =============================================================================
-# 2. 샘플링 루프 — 틱당 awk 1회 (fork 1개)
+# 2. 샘플링 루프: 한 번에 awk 1회 (fork 1개)
 # =============================================================================
 msg "[2/4] 샘플링 ${DUR}초 (Ctrl+C 시 그때까지의 데이터로 진행)"
 STOP=0; trap 'STOP=1' INT TERM
@@ -451,7 +451,7 @@ awk -F'\t' '{n++; b+=$2} END{printf "es_api_calls=%d\nes_api_bytes=%d\n", n+0, b
                    [[ $NO_IDXSTATS -eq 1 ]] && printf 'index-stats ' )"
 } >> "$OUT/meta"
 
-# 결과를 ES data 와 같은 파일시스템에 쓰고 있으면 경고 —
+# 결과를 ES data 와 같은 파일시스템에 쓰고 있으면 경고.
 # 측정 대상 디스크에 쓰기를 더하는 셈이고 그만큼 측정값이 오염된다
 OUT_DEV=$(df -Pk "$OUT_BASE" 2>/dev/null | awk 'NR==2{print $1}')
 for dp in ${USER_PATHS[@]+"${USER_PATHS[@]}"} /var/lib/elasticsearch; do
