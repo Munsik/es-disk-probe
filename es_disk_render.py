@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-es_disk_render.py (v0.9.1)
+es_disk_render.py (v0.9.2)
 es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 지표 계산 → 판정 → HTML 리포트를 생성합니다.
 
@@ -14,7 +14,7 @@ es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 """
 import argparse, html, json, os, re, sys, tarfile, tempfile, datetime
 
-TOOL_VERSION = "0.9.1"
+TOOL_VERSION = "0.9.2"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 기준값 (출처를 함께 표기 — 리포트에도 그대로 노출)
@@ -1661,8 +1661,21 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         m = re.match(r'(\d+)m([\d.]+)s', x)
         return int(m.group(1)) * 60 + float(m.group(2)) if m else 0.0
     cpu_s = sum(tsec(x) for x in ov)
+    # 이 진단이 서버에 실제로 준 부하 — 리포트에 그대로 고지한다
+    eslog_b = num(meta.get("read_eslog_bytes"), 0) or 0
+    sar_b = num(meta.get("read_sar_bytes"), 0) or 0
+    out_kb = num(meta.get("output_kb"), 0) or 0
     overhead = {"cpu_s": cpu_s, "dur": dur, "pct_core": (100.0 * cpu_s / dur) if dur else None,
-                "out_kb": num(meta.get("output_kb"), 0), "samples": meta.get("samples")}
+                "out_kb": out_kb, "samples": meta.get("samples"),
+                "read_eslog_mb": eslog_b / 1048576.0, "read_sar_mb": sar_b / 1048576.0,
+                "read_total_mb": (eslog_b + sar_b) / 1048576.0,
+                "write_mb": out_kb / 1024.0,
+                "es_calls": int(num(meta.get("es_api_calls"), 0) or 0),
+                "es_bytes_mb": (num(meta.get("es_api_bytes"), 0) or 0) / 1048576.0,
+                "maps_ms": num(meta.get("maps_read_ms")),
+                "skipped": (meta.get("skipped") or "").strip(),
+                "light": meta.get("light_mode") == "1",
+                "out_on_data_fs": meta.get("out_on_data_fs") == "1"}
 
     return {
         "meta": meta, "storage": storage, "th": th, "es_version": es_version, "is_vmware": is_vmware,
@@ -1720,6 +1733,8 @@ code{font-family:Consolas,"D2Coding",monospace;font-size:13px;background:var(--p
 table{border-collapse:collapse;width:100%;font-size:13.5px;margin:8px 0}th,td{border-bottom:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
 th{background:var(--panel);font-weight:600;color:#3a4453}td.n{text-align:right}
 .scroll{overflow-x:auto}.note{font-size:13px;color:var(--mut)}
+ul.note{margin:12px 0 0;padding-left:20px}ul.note li{margin:5px 0}
+.kpi .v{word-break:keep-all}
 pre{background:var(--panel);padding:10px 12px;border-radius:5px;font-size:12px;overflow-x:auto;white-space:pre-wrap}
 @media(max-width:820px){.kpis{grid-template-columns:repeat(2,1fr)}.verdict b{font-size:24px}}
 @media print{.wrap{padding:0}details.f{break-inside:avoid}details.f .f-body{display:block}}
@@ -1981,9 +1996,40 @@ def render(R, out_path):
 
     # 측정 범위와 한계
     ov = R["overhead"]
+    h.append('<h2>이 진단이 서버에 준 부하</h2>')
+    h.append('<p class="lead">프로덕션에서 돌리는 도구이므로 이번 실행이 실제로 쓴 자원을 그대로 싣습니다. '
+             '아래는 이 노드에서 측정된 값이며, 설정 변경은 한 건도 하지 않았습니다.</p>')
+    h.append('<div class="kpis">')
+    load_kp = [
+        ("CPU 사용", fmt(ov["cpu_s"], 2, "초"), "측정 {:.0f}초 동안 · CPU 1개의 {}".format(ov["dur"] or 0, fmt(ov["pct_core"], 2, "%"))),
+        ("디스크 읽기", fmt(ov["read_total_mb"], 1, " MB"), "ES 로그 {} · sar {}".format(
+            fmt(ov["read_eslog_mb"], 1, "MB"), fmt(ov["read_sar_mb"], 1, "MB"))),
+        ("디스크 쓰기", fmt(ov["write_mb"], 2, " MB"), "결과 파일 (측정 대상 외 경로 권장)"),
+        ("ES 조회", "{}회".format(ov["es_calls"]) if ov["es_calls"] else "안 함",
+         "전부 GET · 응답 합계 {}".format(fmt(ov["es_bytes_mb"], 2, "MB")) if ov["es_calls"] else "--no-es 또는 접속 실패"),
+    ]
+    for l, val, d in load_kp:
+        h.append('<div class="kpi"><div class="l">{}</div><div class="v">{}</div><div class="d">{}</div></div>'.format(E(l), E(val), E(d)))
+    h.append('</div>')
+    notes = []
+    notes.append('샘플링 구간에서 읽은 <code>/proc</code>·<code>/sys</code> 는 커널이 메모리에서 만들어 주는 값이라 디스크 I/O가 발생하지 않습니다. '
+                 '위 디스크 읽기는 ES 서버 로그와 sar 기록을 읽은 양입니다.')
+    if ov["maps_ms"] is not None:
+        notes.append('ES 프로세스의 매핑 목록을 1회 읽었고 {}가 걸렸습니다. 이 동안 해당 프로세스의 mmap_lock 을 read 모드로 잡으므로 '
+                     'ES 의 segment 열기·닫기(mmap/munmap)와만 짧게 경합합니다.'.format(fmt(ov["maps_ms"], 0, "ms")))
+    if ov["light"]:
+        notes.append('<b>--light 모드로 실행</b>되어 디스크를 읽는 부가 수집(ES 로그·커널 로그·sar·매핑 목록)을 모두 생략했습니다. '
+                     '부하는 최소지만 그만큼 판정 근거도 줄어듭니다.')
+    elif ov["skipped"]:
+        notes.append('생략한 수집: <code>{}</code>'.format(E(ov["skipped"])))
+    if ov["out_on_data_fs"]:
+        notes.append('<b style="color:#bf4a10">결과 저장 위치가 ES data 와 같은 파일시스템입니다.</b> '
+                     '측정 대상 디스크에 쓰기를 더했으므로 이번 수치에는 그만큼의 오염이 섞여 있습니다. 다음 실행은 <code>-o</code> 로 다른 디스크를 지정하세요.')
+    notes.append('부하를 더 줄이려면 <code>--light</code>(디스크 읽기 1MB 미만), <code>--no-eslog</code>(로그 읽기만 생략), '
+                 '<code>--no-index-stats</code>(인덱스 수에 비례하는 ES 조회 2건 생략)를 쓸 수 있습니다.')
+    h.append('<ul class="note">' + "".join("<li>{}</li>".format(n) for n in notes) + '</ul>')
+
     h.append('<h2>무엇을 어떻게 쟀고, 무엇은 못 보는가</h2>')
-    h.append('<p class="lead">이 도구는 읽기만 합니다. 이번 수집에 쓴 CPU는 {}초 (측정 시간 대비 CPU 1개의 {}), 결과 파일은 {}입니다.</p>'.format(
-        fmt(ov["cpu_s"], 2), fmt(ov["pct_core"], 2, "%"), fmt((ov["out_kb"] or 0) / 1024.0, 1, "MB")))
     h.append('<table><tr><th>지표</th><th>출처</th><th>알 수 있는 것</th><th>판정에 쓰는 방식</th></tr>')
     rows = [
         ("응답시간 r_await / w_await", "/proc/diskstats (iostat과 같은 원본, 직접 계산)", "ES가 실제로 겪는 I/O 1건당 지연", "p95로 판정. I/O 적은 구간 제외"),

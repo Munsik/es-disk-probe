@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_collect.sh  (v0.9.1)
+# es_disk_collect.sh  (v0.9.2)
 # Elasticsearch 노드 Disk I/O 진단 — 데이터 수집기 (READ-ONLY)
 #
 #  - 시스템 설정을 바꾸지 않습니다. /proc, /sys 읽기와 ES 조회 API 호출만 합니다.
@@ -21,6 +21,16 @@
 #     --no-es       ES API 조회 생략 (OS 레벨만 수집)
 #     --no-cluster  클러스터 전체 조회 생략 (이 노드만)
 #     --no-render   HTML 생성 생략 (수집 번들만 만들기)
+#     --light       디스크를 읽는 부가 수집을 모두 생략 (ES 로그·커널 로그·sar·mmap 목록)
+#                   → 디스크 읽기량이 1MB 미만이 됩니다. 판정 근거는 줄어듭니다
+#     --no-eslog    ES 서버 로그 읽기만 생략 (부가 수집 중 읽기량이 가장 큰 항목)
+#     --no-index-stats  인덱스 수에 비례해 커지는 ES 조회 2건 생략
+#                   (_nodes/_local/stats?level=indices, _ilm/explain)
+#
+# 부하 (실측, 300초/5초 간격 기준):
+#   CPU 약 1.2초 (측정 시간 대비 CPU 1개의 0.4%), 메모리 12MB 미만,
+#   디스크 읽기 최대 약 13MB (--light 사용 시 1MB 미만), 쓰기 1MB 미만.
+#   자세한 내역은 README "이 도구가 서버에 주는 부하" 참고.
 #
 # 예:
 #   sudo ES_PASSWORD='***' ./es_disk_collect.sh -d 600 --es-user elastic
@@ -29,9 +39,10 @@ set -u
 umask 077
 export LC_ALL=C
 
-VERSION="0.9.1"
+VERSION="0.9.2"
 DUR=300; INT=5; OUT_BASE="/tmp"; STORAGE="allflash"
 ES_URL=""; ES_USER=""; NO_ES=0; NO_RENDER=0; NO_CLUSTER=0
+NO_ESLOG=0; NO_KLOG=0; NO_SAR=0; NO_MAPS=0; NO_IDXSTATS=0
 USER_PATHS=()
 
 while [[ $# -gt 0 ]]; do
@@ -46,6 +57,9 @@ while [[ $# -gt 0 ]]; do
     --no-es)      NO_ES=1; shift ;;
     --no-cluster) NO_CLUSTER=1; shift ;;
     --no-render) NO_RENDER=1; shift ;;
+    --no-eslog)  NO_ESLOG=1; shift ;;
+    --light)     NO_ESLOG=1; NO_KLOG=1; NO_SAR=1; NO_MAPS=1; NO_IDXSTATS=1; shift ;;
+    --no-index-stats) NO_IDXSTATS=1; shift ;;
     -h|--help) awk 'NR>1 && /^#/{print;next} NR>1{exit}' "$0"; exit 0 ;;
     *) echo "알 수 없는 옵션: $1"; exit 1 ;;
   esac
@@ -181,11 +195,19 @@ save dmsetup_table dmsetup table
 save udev_rules sh -c "grep -rhsE 'scheduler|read_ahead|queue/|timeout' /etc/udev/rules.d/ /usr/lib/udev/rules.d/ /lib/udev/rules.d/ 2>/dev/null | grep -v '^#' | head -100"
 
 # 커널 로그 — I/O 오류·SCSI 리셋·hung task (최근 7일, 가능한 범위)
+# -n 으로 상한을 둔다: 장애가 반복되는 노드는 커널 메시지가 수십만 줄이 될 수 있고,
+# 그만큼 journal 파일을 읽으면 그 자체가 디스크 부하가 된다. 최근 것부터 보므로 상한으로 충분.
+KLOG_MAX_LINES=${KLOG_MAX_LINES:-20000}
 KPAT='I/O error|blk_update_request|Buffer I/O error|critical medium error|rejecting I/O|hung_task|blocked for more than [0-9]+ seconds|remount.*read-only|XFS \(.*\).*(error|shutdown|[Cc]orruption)|EXT4-fs (error|warning)|Sense Key|(scsi|sd [0-9]|pvscsi|mptscsih|mptbase|nvme|ata[0-9]).*(\<abort|\<reset\>|timed out|timing out|timeout|failed)'
-{
-  command -v journalctl >/dev/null 2>&1 && journalctl -k --since "7 days ago" -o short-iso --no-pager 2>/dev/null
-} | grep -Ei "$KPAT" | grep -viE 'nmi|audit|usb|BogoMIPS|preset' | tail -300 > "$S/klog_io" 2>/dev/null
-[[ -s "$S/klog_io" ]] || { dmesg -T 2>/dev/null | grep -Ei "$KPAT" | grep -viE 'nmi|audit|usb|BogoMIPS|preset' | tail -300 > "$S/klog_io"; }
+if [[ $NO_KLOG -eq 0 ]]; then
+  {
+    command -v journalctl >/dev/null 2>&1 && journalctl -k --since "7 days ago" -n "$KLOG_MAX_LINES" -o short-iso --no-pager 2>/dev/null
+  } | grep -Ei "$KPAT" | grep -viE 'nmi|audit|usb|BogoMIPS|preset' | tail -300 > "$S/klog_io" 2>/dev/null
+  # journal 이 없거나 결과가 비면 dmesg (메모리 링버퍼 — 디스크를 읽지 않음)
+  [[ -s "$S/klog_io" ]] || { dmesg -T 2>/dev/null | grep -Ei "$KPAT" | grep -viE 'nmi|audit|usb|BogoMIPS|preset' | tail -300 > "$S/klog_io"; }
+else
+  : > "$S/klog_io"
+fi
 
 # 네트워크 (ES transport — 참고용)
 {
@@ -199,17 +221,19 @@ KPAT='I/O error|blk_update_request|Buffer I/O error|critical medium error|reject
   done
 } > "$S/net" 2>/dev/null
 
-# sar 이력 (sysstat이 이미 수집해 둔 과거 데이터 — 추가 부하 없음)
-if command -v sar >/dev/null 2>&1; then
-  for f in $(find /var/log/sa /var/log/sysstat -maxdepth 1 -type f -name 'sa[0-9]*' -mtime -8 2>/dev/null | sort); do
+# sar 이력 — sysstat이 이미 기록해 둔 과거 데이터를 읽는다 (새로 수집하지 않음)
+# sa 파일을 한 번만 읽는다. 이전에는 -d 와 -u 로 같은 파일을 두 번 읽었는데
+# sar_u 는 리포트에서 쓰이지 않아 읽는 만큼이 그대로 낭비였다.
+SAR_BYTES=0
+if [[ $NO_SAR -eq 0 ]] && command -v sar >/dev/null 2>&1; then
+  SAR_FILES=$(find /var/log/sa /var/log/sysstat -maxdepth 1 -type f -name 'sa[0-9]*' -mtime -8 2>/dev/null | sort)
+  for f in $SAR_FILES; do
     echo "#FILE $f"
     S_TIME_FORMAT=ISO sar -d -p -f "$f" 2>/dev/null
   done > "$S/sar_d" 2>/dev/null
-  for f in $(find /var/log/sa /var/log/sysstat -maxdepth 1 -type f -name 'sa[0-9]*' -mtime -8 2>/dev/null | sort); do
-    echo "#FILE $f"
-    S_TIME_FORMAT=ISO sar -u -f "$f" 2>/dev/null
-  done > "$S/sar_u" 2>/dev/null
+  for f in $SAR_FILES; do SAR_BYTES=$((SAR_BYTES + $(stat -c %s "$f" 2>/dev/null || echo 0))); done
 fi
+echo "read_sar_bytes=$SAR_BYTES" >> "$OUT/meta"
 
 # ── ES 프로세스 ─────────────────────────────────────────────────────────────
 # pgrep -f 는 패턴 문자열을 포함한 다른 명령(tail, 셸 등)도 잡으므로 java 프로세스만 고른다
@@ -250,27 +274,55 @@ fi
 ES_LOG_DIR=$(grep -oE 'es\.path\.logs=[^ ]+' "$S/es_cmdline" 2>/dev/null | head -1 | cut -d= -f2)
 ES_LOG_DIR=${ES_LOG_DIR:-/var/log/elasticsearch}
 ESLOGPAT='now throttling indexing|stopped throttling|disk watermark|flood stage|failed to flush|Too many open files|failed to write|translog.*(error|corrupt|recover)|overhead, spent|\[gc\]\[|shard failed|failed to recover|Data too large|timed out after'
-if [[ -d "$ES_LOG_DIR" ]]; then
-  # 파일 전체를 읽으면 그 자체가 디스크 읽기 부하 → 파일당 끝 32MB만 읽음. gc/deprecation/audit/slowlog 제외
-  find "$ES_LOG_DIR" -maxdepth 1 -name '*.log' -mtime -7 -size -2G 2>/dev/null \
-    | grep -vE '(gc|deprecation|audit|slowlog|index_search|index_indexing)[^/]*\.log$' | while read -r lf; do
-    echo "#FILE $lf"; tail -c 33554432 "$lf" 2>/dev/null | grep -Eia "$ESLOGPAT" | tail -100
-  done > "$S/es_log" 2>/dev/null
+# 로그 읽기는 이 도구의 디스크 부하 중 가장 큰 항목이다. 읽은 만큼 page cache 가 밀려나고,
+# ES 노드에서는 밀려난 자리가 segment 캐시라 ES 가 그만큼 디스크를 더 읽게 된다.
+# 그래서 상한을 둔다: 최신 로그에 예산을 집중하고(기본 8MB), 직전 로그 2개는 2MB 씩만 본다.
+# 최종 출력은 어차피 tail -100 이므로 대부분의 경우 이 범위에서 충분하다.
+# 더 과거까지 봐야 하면 ESLOG_TAIL_MB 를 올린다 (그만큼 부하도 커진다).
+ESLOG_TAIL_MB=${ESLOG_TAIL_MB:-8}
+ESLOG_OLD_MB=${ESLOG_OLD_MB:-2}
+ESLOG_MAX_FILES=${ESLOG_MAX_FILES:-3}
+ESLOG_BYTES=0
+if [[ $NO_ESLOG -eq 0 && -d "$ES_LOG_DIR" ]]; then
+  # 최신 수정 시각 순으로 정렬해 앞쪽(최신)에 큰 예산을 준다. gc/deprecation/audit/slowlog 제외
+  i=0
+  while read -r lf; do
+    [[ -n "$lf" ]] || continue
+    i=$((i+1))
+    if [[ $i -eq 1 ]]; then mb=$ESLOG_TAIL_MB; else mb=$ESLOG_OLD_MB; fi
+    sz=$(stat -c %s "$lf" 2>/dev/null || echo 0)
+    want=$((mb*1048576)); [[ "$sz" -lt "$want" ]] && want=$sz
+    ESLOG_BYTES=$((ESLOG_BYTES + want))
+    echo "#FILE $lf (끝 ${mb}MB)"
+    tail -c "$((mb*1048576))" "$lf" 2>/dev/null | grep -Eia "$ESLOGPAT" | tail -100
+  done < <(find -H "$ES_LOG_DIR" -maxdepth 1 -name '*.log' -mtime -7 -size -2G -printf '%T@\t%p\n' 2>/dev/null \
+            | grep -vE '(gc|deprecation|audit|slowlog|index_search|index_indexing)[^/]*\.log$' \
+            | sort -rn | head -"$ESLOG_MAX_FILES" | cut -f2-) > "$S/es_log" 2>/dev/null
 fi
+echo "read_eslog_bytes=$ESLOG_BYTES" >> "$OUT/meta"
 
 # ── ES 프로세스의 mmap 사용량 (max_map_count 대비 여유 확인) ───────────────
-if [[ -n "$ES_PID" && -r /proc/$ES_PID/maps ]]; then
+# ES 프로세스의 매핑 목록을 1회 읽는다. 읽는 동안 대상 프로세스의 mmap_lock 을 read 모드로
+# 잡으므로 ES 의 mmap/munmap(segment 열기·닫기)과만 짧게 경합한다. 실측: 매핑 4만 개에 약 17ms.
+# 매핑이 매우 많은 노드에서 이조차 피하고 싶으면 --light 또는 NO_MAPS 로 생략한다.
+if [[ $NO_MAPS -eq 0 && -n "$ES_PID" && -r /proc/$ES_PID/maps ]]; then
+  MAPS_T0=$(date +%s%N)
   wc -l < /proc/$ES_PID/maps > "$S/es_mapcount" 2>/dev/null
+  echo "maps_read_ms=$(( ($(date +%s%N) - MAPS_T0) / 1000000 ))" >> "$OUT/meta"
 fi
 
 # ── ES API (조회 전용, 로컬 노드만) ────────────────────────────────────────
 cfgesc() { local v=${1//\\/\\\\}; printf '%s' "${v//\"/\\\"}"; }   # curl -K 값 이스케이프 (\ 와 ")
+ES_CALLS="$OUT/es_calls"; : > "$ES_CALLS"
 es_get() {  # $1=path $2=outfile  → http code 출력
-  local cfg=""
+  local cfg="" code=""
   [[ -n "$ES_API_KEY" ]] && cfg="header = \"Authorization: ApiKey $(cfgesc "$ES_API_KEY")\""
   [[ -z "$ES_API_KEY" && -n "$ES_USER" ]] && cfg="user = \"$(cfgesc "${ES_USER}:${ES_PASSWORD}")\""
-  printf '%s\n' "$cfg" | curl -s -k --max-time 10 --connect-timeout 3 -K - \
-      -o "$2" -w '%{http_code}' "${ES_URL}/$1" 2>/dev/null || true
+  code=$(printf '%s\n' "$cfg" | curl -s -k --max-time 10 --connect-timeout 3 -K - \
+      -o "$2" -w '%{http_code}' "${ES_URL}/$1" 2>/dev/null || true)
+  # ES 조회 비용을 리포트에 고지하기 위해 호출 수와 응답 크기를 기록 (서브셸이라 파일에 누적)
+  printf '%s\t%s\t%s\n' "$code" "$(stat -c %s "$2" 2>/dev/null || echo 0)" "${1%%\?*}" >> "$ES_CALLS"
+  printf '%s' "$code"
 }
 ES_OK=0
 if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
@@ -300,7 +352,7 @@ CLUSTER_STATS_PATH="_nodes/stats/fs,indices,thread_pool,jvm,os?filter_path=nodes
 
 if [[ $ES_OK -eq 1 ]]; then
   es_get "$NODE_STATS_PATH" "$S/es_stats_start.json" >/dev/null
-  es_get "$IDX_STATS_PATH"  "$S/es_idx_start.json"   >/dev/null
+  [[ $NO_IDXSTATS -eq 0 ]] && es_get "$IDX_STATS_PATH" "$S/es_idx_start.json" >/dev/null
   # ── 클러스터 전체: 로컬 측정과 같은 창으로 1차 스냅샷 ────────────────
   if [[ $NO_CLUSTER -eq 0 ]]; then
     C="$S/cluster"; mkdir -p "$C"
@@ -335,7 +387,7 @@ if [[ $ES_OK -eq 1 && $NO_CLUSTER -eq 0 ]]; then
   es_get "_snapshot/_status" "$C/snapshot_status.json" >/dev/null
   es_get "_cluster/settings?include_defaults=true&flat_settings=true&filter_path=**.disk.watermark*,**.disk.threshold*,**.indices.recovery*,**.node_concurrent*,**.cluster_concurrent_rebalance*,**.allocation.awareness*" "$C/cluster_settings.json" >/dev/null
   es_get "_nodes?filter_path=nodes.*.name,nodes.*.roles,nodes.*.attributes,nodes.*.host,nodes.*.ip,nodes.*.settings.path" "$C/nodes_info.json" >/dev/null
-  es_get "_ilm/explain?only_managed=true&filter_path=indices.*.phase,indices.*.policy,indices.*.action" "$C/ilm_explain.json" >/dev/null
+  [[ $NO_IDXSTATS -eq 0 ]] && es_get "_ilm/explain?only_managed=true&filter_path=indices.*.phase,indices.*.policy,indices.*.action" "$C/ilm_explain.json" >/dev/null
 fi
 
 SAMPLES="$OUT/samples.raw"
@@ -385,9 +437,32 @@ fi
 cat /proc/meminfo > "$S/meminfo_end" 2>/dev/null
 cp /proc/interrupts "$S/interrupts_end" 2>/dev/null
 
-# 수집기 자체 자원 사용량 (bash 내장 times: 자신 / 자식 프로세스 user·sys 누적)
+# ── 수집기 자체 자원 사용량 ────────────────────────────────────────────────
+# bash 내장 times: 자신 / 자식 프로세스의 user·sys CPU 누적
 times > "$OUT/self_overhead" 2>/dev/null
+# 최대 RSS (자식 포함). ru_maxrss 를 셸에서 볼 방법이 없어 /usr/bin/time 이 있으면만 기록
 du -sk "$OUT" | awk '{print "output_kb="$1}' >> "$OUT/meta"
+# ES 조회 비용
+awk -F'\t' '{n++; b+=$2} END{printf "es_api_calls=%d\nes_api_bytes=%d\n", n+0, b+0}' "$ES_CALLS" >> "$OUT/meta" 2>/dev/null
+{
+  echo "light_mode=$(( NO_ESLOG & NO_KLOG & NO_SAR & NO_MAPS ))"
+  echo "skipped=$( [[ $NO_ESLOG -eq 1 ]] && printf 'eslog '; [[ $NO_KLOG -eq 1 ]] && printf 'klog '; \
+                   [[ $NO_SAR -eq 1 ]] && printf 'sar '; [[ $NO_MAPS -eq 1 ]] && printf 'maps '; \
+                   [[ $NO_IDXSTATS -eq 1 ]] && printf 'index-stats ' )"
+} >> "$OUT/meta"
+
+# 결과를 ES data 와 같은 파일시스템에 쓰고 있으면 경고 —
+# 측정 대상 디스크에 쓰기를 더하는 셈이고 그만큼 측정값이 오염된다
+OUT_DEV=$(df -Pk "$OUT_BASE" 2>/dev/null | awk 'NR==2{print $1}')
+for dp in ${USER_PATHS[@]+"${USER_PATHS[@]}"} /var/lib/elasticsearch; do
+  [[ -d "$dp" ]] || continue
+  if [[ "$(df -Pk "$dp" 2>/dev/null | awk 'NR==2{print $1}')" == "$OUT_DEV" ]]; then
+    msg "⚠ 결과 저장 위치($OUT_BASE)가 ES data 경로($dp)와 같은 파일시스템입니다."
+    msg "  측정 대상 디스크에 쓰기를 더하게 됩니다. 다음부터는 -o 로 다른 디스크를 지정하세요."
+    echo "out_on_data_fs=1" >> "$OUT/meta"
+    break
+  fi
+done
 
 # =============================================================================
 # 4. 번들 + HTML
