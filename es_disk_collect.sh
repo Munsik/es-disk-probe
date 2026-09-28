@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_collect.sh  (v0.9.0)
+# es_disk_collect.sh  (v0.9.1)
 # Elasticsearch 노드 Disk I/O 진단 — 데이터 수집기 (READ-ONLY)
 #
 #  - 시스템 설정을 바꾸지 않습니다. /proc, /sys 읽기와 ES 조회 API 호출만 합니다.
@@ -29,7 +29,7 @@ set -u
 umask 077
 export LC_ALL=C
 
-VERSION="0.9.0"
+VERSION="0.9.1"
 DUR=300; INT=5; OUT_BASE="/tmp"; STORAGE="allflash"
 ES_URL=""; ES_USER=""; NO_ES=0; NO_RENDER=0; NO_CLUSTER=0
 USER_PATHS=()
@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
     --no-es)      NO_ES=1; shift ;;
     --no-cluster) NO_CLUSTER=1; shift ;;
     --no-render) NO_RENDER=1; shift ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR>1 && /^#/{print;next} NR>1{exit}' "$0"; exit 0 ;;
     *) echo "알 수 없는 옵션: $1"; exit 1 ;;
   esac
 done
@@ -55,6 +55,7 @@ ES_PASSWORD="${ES_PASSWORD:-}"; ES_API_KEY="${ES_API_KEY:-}"
 [[ "$INT" =~ ^[0-9]+$ && "$INT" -ge 1 ]] || { echo "-i 는 1 이상 정수"; exit 1; }
 [[ "$DUR" =~ ^[0-9]+$ && "$DUR" -ge $((INT*3)) ]] || { echo "-d 는 간격의 3배 이상"; exit 1; }
 case "$STORAGE" in allflash|hybrid) ;; *) echo "-s 는 allflash|hybrid"; exit 1 ;; esac
+ES_URL="${ES_URL%/}"        # 뒤 슬래시 제거 — 붙어 있으면 //_cluster/health 로 요청이 나감
 
 msg() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
@@ -87,6 +88,9 @@ is_root=$IS_ROOT
 user_paths=${USER_PATHS[*]:-}
 EOF
 read -r UP0 _ < /proc/uptime; echo "start_uptime=$UP0" >> "$OUT/meta"
+# -p 로 준 경로는 공백이 들어갈 수 있으므로 한 줄에 하나씩 따로 저장 (meta 는 호환용)
+: > "$OUT/user_paths"
+for p in ${USER_PATHS[@]+"${USER_PATHS[@]}"}; do printf '%s\n' "$p" >> "$OUT/user_paths"; done
 
 msg "수집 시작 → $OUT  (측정 ${DUR}s / 간격 ${INT}s)"
 
@@ -270,13 +274,14 @@ es_get() {  # $1=path $2=outfile  → http code 출력
 }
 ES_OK=0
 if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
+  c=""
   if [[ -z "$ES_URL" ]]; then
     for u in http://localhost:9200 https://localhost:9200; do
       ES_URL=$u; c=$(es_get "" "$S/es_root.json")
       [[ "$c" == "200" || "$c" == "401" ]] && break
     done
   fi
-  c=$(es_get "" "$S/es_root.json")
+  [[ -n "$c" ]] || c=$(es_get "" "$S/es_root.json")
   echo "es_url=$ES_URL" >> "$OUT/meta"; echo "es_http=$c" >> "$OUT/meta"
   if [[ "$c" == "200" ]]; then
     ES_OK=1

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_cluster_probe.sh  (v0.9.0)
+# es_cluster_probe.sh  (v0.9.1)
 # Elasticsearch 클러스터를 "디스크 관점"에서 조회합니다. (READ-ONLY)
 #
 #  - ES 조회 API(GET)만 호출합니다. 설정 변경, 인덱스 쓰기 없음.
@@ -12,10 +12,15 @@
 #   ES_PASSWORD='***' ./es_cluster_probe.sh --es-url https://es:9200 --es-user elastic
 #   ES_API_KEY='...'  ./es_cluster_probe.sh --es-url https://es:9200 -g 120
 #
-#   -g SEC      두 스냅샷 사이 간격 (기본 60초, 길수록 안정적)
-#   -o DIR      결과 위치 (기본 /tmp)
-#   --deep      인덱스별 용량까지 수집 (인덱스가 많으면 응답이 커짐)
-#   --insecure  자체 서명 인증서 허용 (기본 활성)
+#   -g SEC        두 스냅샷 사이 간격 (기본 60초, 길수록 안정적)
+#   -o DIR        결과 위치 (기본 /tmp)
+#   --deep        인덱스별 용량까지 수집 (인덱스가 많으면 응답이 커짐)
+#   --insecure    자체 서명 인증서 허용 (기본값)
+#   --strict-tls  인증서를 검증합니다. --cacert 와 함께 쓰거나 CA가 OS 신뢰 저장소에 있을 때
+#   --cacert F    CA 인증서 파일 지정 (지정하면 --strict-tls 자동 적용)
+#
+# ⚠ 기본 동작은 curl -k (인증서 검증 생략)입니다. 사내 보안 정책상 검증이 필요하면
+#   --strict-tls 또는 --cacert 를 쓰세요.
 #
 # 결과: <출력>/escluster_<ts>/  →  es_disk_render.py <노드번들> --cluster <이 디렉터리>
 #       노드 번들 없이 클러스터만 볼 때:  es_disk_render.py --cluster-only <이 디렉터리>
@@ -25,6 +30,7 @@ umask 077
 export LC_ALL=C
 
 ES_URL="http://localhost:9200"; ES_USER=""; GAP=60; OUT_BASE="/tmp"; DEEP=0
+STRICT=0; CACERT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --es-url) ES_URL="$2"; shift 2 ;;
@@ -32,13 +38,20 @@ while [[ $# -gt 0 ]]; do
     -g) GAP="$2"; shift 2 ;;
     -o) OUT_BASE="$2"; shift 2 ;;
     --deep) DEEP=1; shift ;;
-    --insecure) shift ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    --insecure) STRICT=0; shift ;;
+    --strict-tls) STRICT=1; shift ;;
+    --cacert) CACERT="$2"; STRICT=1; shift 2 ;;
+    -h|--help) awk 'NR>1 && /^#/{print;next} NR>1{exit}' "$0"; exit 0 ;;
     *) echo "알 수 없는 옵션: $1"; exit 1 ;;
   esac
 done
 ES_PASSWORD="${ES_PASSWORD:-}"; ES_API_KEY="${ES_API_KEY:-}"
+ES_URL="${ES_URL%/}"
+[[ "$GAP" =~ ^[0-9]+$ && "$GAP" -ge 10 ]] || { echo "-g 는 10 이상 정수(초)"; exit 1; }
 command -v curl >/dev/null 2>&1 || { echo "curl이 필요합니다"; exit 1; }
+[[ -z "$CACERT" || -r "$CACERT" ]] || { echo "--cacert 파일을 읽을 수 없습니다: $CACERT"; exit 1; }
+TLS=(-k); [[ $STRICT -eq 1 ]] && TLS=()
+[[ -n "$CACERT" ]] && TLS+=(--cacert "$CACERT")
 
 TS=$(date +%Y%m%d_%H%M%S); OUT="$OUT_BASE/escluster_$TS"; mkdir -p "$OUT" || exit 1
 msg() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
@@ -48,13 +61,15 @@ es_get() {  # $1=path $2=outfile
   local cfg=""
   [[ -n "$ES_API_KEY" ]] && cfg="header = \"Authorization: ApiKey $(cfgesc "$ES_API_KEY")\""
   [[ -z "$ES_API_KEY" && -n "$ES_USER" ]] && cfg="user = \"$(cfgesc "${ES_USER}:${ES_PASSWORD}")\""
-  printf '%s\n' "$cfg" | curl -s -k --max-time 30 --connect-timeout 5 -K - \
+  printf '%s\n' "$cfg" | curl -s "${TLS[@]}" --max-time 30 --connect-timeout 5 -K - \
       -o "$2" -w '%{http_code}' "${ES_URL}/$1" 2>/dev/null || true
 }
 
 CODE=$(es_get "" "$OUT/root.json")
 if [[ "$CODE" != "200" ]]; then
-  echo "ES 접속 실패 (http=$CODE). --es-url / 인증 정보를 확인하세요."; rm -rf "$OUT"; exit 2
+  echo "ES 접속 실패 (http=$CODE). --es-url / 인증 정보를 확인하세요."
+  [[ $STRICT -eq 1 ]] && echo "  인증서 검증 모드입니다. 자체 서명 인증서라면 --cacert 로 CA를 지정하세요."
+  rm -rf "$OUT"; exit 2
 fi
 echo "es_url=$ES_URL"$'\n'"gap=$GAP"$'\n'"start_wall=$(date '+%Y-%m-%d %H:%M:%S %z')" > "$OUT/meta"
 
@@ -74,6 +89,8 @@ es_get "_cat/pending_tasks?format=json" "$OUT/pending_tasks.json" >/dev/null
 es_get "_snapshot/_status" "$OUT/snapshot_status.json" >/dev/null
 es_get "_cluster/settings?include_defaults=true&flat_settings=true&filter_path=**.disk.watermark*,**.disk.threshold*,**.indices.recovery*,**.node_concurrent*,**.cluster_concurrent_rebalance*,**.allocation.awareness*,**.max_shards_per_node*" "$OUT/cluster_settings.json" >/dev/null
 es_get "_nodes?filter_path=nodes.*.name,nodes.*.roles,nodes.*.attributes,nodes.*.settings.path,nodes.*.process.mlockall,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.os.available_processors,nodes.*.os.name,nodes.*.host,nodes.*.ip" "$OUT/nodes_info.json" >/dev/null
+# ILM phase — 인덱스별 분포 리포트에서 hot/warm 구분에 사용. read_ilm 권한이 없으면 건너뜀
+es_get "_ilm/explain?only_managed=true&filter_path=indices.*.phase,indices.*.policy,indices.*.action" "$OUT/ilm_explain.json" >/dev/null
 [[ $DEEP -eq 1 ]] && es_get "_cat/indices?format=json&bytes=b&h=index,health,pri,rep,docs.count,store.size,pri.store.size&s=store.size:desc" "$OUT/cat_indices.json" >/dev/null
 
 sleep "$GAP"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-es_disk_render.py (v0.9.0)
+es_disk_render.py (v0.9.1)
 es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 지표 계산 → 판정 → HTML 리포트를 생성합니다.
 
@@ -14,7 +14,7 @@ es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 """
 import argparse, html, json, os, re, sys, tarfile, tempfile, datetime
 
-TOOL_VERSION = "0.9.0"
+TOOL_VERSION = "0.9.1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 기준값 (출처를 함께 표기 — 리포트에도 그대로 노출)
@@ -41,12 +41,23 @@ def open_bundle(path):
     if tarfile.is_tarfile(path):
         tmp = tempfile.mkdtemp(prefix="esdisk_")
         with tarfile.open(path) as t:
-            for m in t.getmembers():               # 경로 탈출 방지
+            for m in t.getmembers():
+                # 경로 탈출 방지: 절대경로·상위참조·심볼릭/하드링크는 건너뛴다
                 if m.name.startswith("/") or ".." in m.name.split("/"):
                     continue
+                if m.issym() or m.islnk():
+                    continue
+                if not (m.isfile() or m.isdir()):
+                    continue
                 t.extract(m, tmp)
-        subs = [os.path.join(tmp, d) for d in os.listdir(tmp)]
+        subs = sorted(os.path.join(tmp, d) for d in os.listdir(tmp))
         subs = [d for d in subs if os.path.isdir(d)]
+        # 번들 루트는 meta 파일이 있는 디렉터리 — 여러 개면 그것으로 고른다
+        for d in subs:
+            if os.path.isfile(os.path.join(d, "meta")):
+                return d
+        if os.path.isfile(os.path.join(tmp, "meta")):
+            return tmp
         return subs[0] if subs else tmp
     sys.exit("번들을 찾을 수 없습니다: " + path)
 
@@ -338,6 +349,7 @@ def aggregate(per_dev):
             "w_await": (sum(r["wtk"] for r in rs) / float(wio)) if wio else None,
             "rtk": sum(r["rtk"] for r in rs), "wtk": sum(r["wtk"] for r in rs),
             "aqu": sum(r["aqu"] for r in rs), "util": max(r["util"] for r in rs),
+            "inflight": sum(r["inflight"] for r in rs),
         })
     return out
 
@@ -445,7 +457,8 @@ def load_bench(d):
         if not f.endswith(".json"):
             continue
         try:
-            j = json.load(open(os.path.join(d, f)))
+            with open(os.path.join(d, f)) as fh:
+                j = json.load(fh)
             job = j["jobs"][0]
             name = f[:-5]
             def lat99(side):
@@ -520,18 +533,32 @@ def analyze_cluster(cdir, add, th):
     data_rows = [r for r in rows if "data" in (r["roles"] or "")] or rows
 
     # ── 노드 간 쏠림 ─────────────────────────────────────────────────────
+    # data tier 가 다른 노드(hot vs warm vs cold)는 보관 용량·부하 특성이 원래 달라
+    # 섞어서 비교하면 오탐이 난다. 같은 tier 안에서만 비교한다.
+    def tier_of(r):
+        for t in ("data_hot", "data_warm", "data_cold", "data_frozen", "data_content"):
+            if t in (r["roles"] or ""):
+                return t
+        return "data"
+    tiers = {}
+    for r in data_rows:
+        tiers.setdefault(tier_of(r), []).append(r)
+
     def outlier(key, label, unit, floor, factor=2.0):
-        vals = [r[key] for r in data_rows if r[key] is not None]
-        if len(vals) < 3:
-            return
-        med = pctl(vals, 0.5)
-        top = max(data_rows, key=lambda r: r[key] if r[key] is not None else -1)
-        if med and top[key] and top[key] >= floor and top[key] >= med * factor:
-            add("caution", "클러스터", "원인 분리 필요", "{} 쏠림 — {} 노드만 유독 높음".format(label, top["name"]),
-                "{} {} vs 클러스터 중앙값 {}".format(top["name"], fmt(top[key], 1, unit), fmt(med, 1, unit)),
-                "전체가 아니라 특정 노드만 높다면 그 노드의 스토리지나 샤드 배치가 원인일 가능성이 큽니다. "
-                "클러스터 전체가 비슷하게 높다면 스토리지 공통 구간이나 워크로드 자체를 봐야 합니다.",
-                "해당 노드에서 es_disk_collect.sh 를 실행해 커널 레벨로 확인하세요.", "_nodes/stats (노드 간 비교)")
+        for tname, group in sorted(tiers.items()):
+            vals = [r[key] for r in group if r[key] is not None]
+            if len(vals) < 3:      # 같은 tier 노드가 3개 미만이면 중앙값이 의미 없음
+                continue
+            med = pctl(vals, 0.5)
+            top = max(group, key=lambda r: r[key] if r[key] is not None else -1)
+            if med and top[key] and top[key] >= floor and top[key] >= med * factor:
+                scope = "" if len(tiers) == 1 else " ({} tier 내 비교)".format(tname)
+                add("caution", "클러스터", "원인 분리 필요", "{} 쏠림 — {} 노드만 유독 높음".format(label, top["name"]),
+                    "{} {} vs 같은 tier 중앙값 {}{} · 비교 대상 {}개 노드".format(
+                        top["name"], fmt(top[key], 1, unit), fmt(med, 1, unit), scope, len(vals)),
+                    "전체가 아니라 특정 노드만 높다면 그 노드의 스토리지나 샤드 배치가 원인일 가능성이 큽니다. "
+                    "클러스터 전체가 비슷하게 높다면 스토리지 공통 구간이나 워크로드 자체를 봐야 합니다.",
+                    "해당 노드에서 es_disk_collect.sh 를 실행해 커널 레벨로 확인하세요.", "_nodes/stats (같은 tier 노드 간 비교)")
     outlier("busy", "디스크 사용 시간(busy)", "%", 40)
     outlier("wmb", "쓰기 처리량", " MB/s", 30)
     outlier("store_gb", "샤드 보관 용량", " GB", 100, factor=1.6)
@@ -668,7 +695,10 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     add = lambda *a: F.append(Finding(*a))
 
     # ── ES data path → 디바이스 ─────────────────────────────────────────────
-    cand = [p for p in meta.get("user_paths", "").split() if p]
+    # -p 로 지정한 경로: 공백 포함 경로를 위해 한 줄에 하나씩 적힌 파일을 먼저 본다
+    cand = [l.strip() for l in rd(base, "user_paths").splitlines() if l.strip()]
+    if not cand:
+        cand = [p for p in meta.get("user_paths", "").split() if p]
     npd = dig(node_i, "settings", "path", "data")
     if npd:
         cand += npd if isinstance(npd, list) else [npd]
@@ -722,6 +752,9 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             "rmb_p95": pctl([r["rmb"] for r in rows], 0.95), "wmb_p95": pctl([r["wmb"] for r in rows], 0.95),
             "aqu_p95": pctl([r["aqu"] for r in rows], 0.95), "aqu_max": vmax([r["aqu"] for r in rows]),
             "util_p95": pctl([r["util"] for r in rows], 0.95),
+            # inflight: 장치에 넘겨졌으나 아직 끝나지 않은 I/O 수 (queue_depth와 직접 비교 가능)
+            "inflight_p95": pctl([r.get("inflight") for r in rows], 0.95),
+            "inflight_max": vmax([r.get("inflight") for r in rows]),
         }
     A = dstats(agg)
     dev_stats = {d: dstats(r) for d, r in per_dev.items()}
@@ -760,25 +793,46 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     qd = [q for q in qd if q]
     qd_total = sum(qd) if qd else None
     qratio = (A["aqu_p95"] / qd_total) if (qd_total and A["aqu_p95"] is not None) else None
+    # inflight(장치에 넘겨져 처리 중인 I/O)는 queue_depth와 직접 비교 가능한 값이라 교차 확인에 쓴다.
+    # aqu-sz 는 블록 계층 큐(nr_requests)에서 대기 중인 요청까지 포함하므로 queue_depth 를 넘을 수 있다.
+    iratio = (A["inflight_p95"] / qd_total) if (qd_total and A["inflight_p95"] is not None) else None
+    q_ev = "평균 대기 I/O(aqu-sz) p95 {}{} / 디바이스 queue_depth 합계 {}".format(
+        fmt(A["aqu_p95"], 1),
+        " · 장치 처리 중(inflight) p95 {}".format(fmt(A["inflight_p95"], 1)) if A["inflight_p95"] is not None else "",
+        int(qd_total) if qd_total else "미확인")
+    QSRC = ("[VMware 공식] KB 2053145 — PVSCSI 기본 큐 64(device)/254(adapter), ring_pages 8→32 및 cmd_per_lun 254 권장. "
+            "게스트 내부 지연과 VM/VMDK 레벨 지연의 차이가 큐 깊이 낮은 컨트롤러의 큐 고갈에서 비롯될 수 있다는 서술은 "
+            "Broadcom 'Troubleshooting vSAN Performance'. 큐 사용률 구간(40%·80%)은 실무 기준")
     if SEV_ORDER.get(lat_sev, 0) >= SEV_ORDER["caution"]:
-        if qratio is not None and qratio >= 0.8:
+        if qratio is None:
+            add("caution", "지연", "원인 분리 필요", "병목 위치: 판정 보류 — queue_depth를 읽지 못함",
+                q_ev, "queue_depth를 모르면 지연이 VM 안의 큐에서 생긴 것인지 밖에서 생긴 것인지 가를 수 없습니다.",
+                "/sys/block/<장치>/device/queue_depth 를 읽을 수 있는 권한(root)으로 재측정하세요. "
+                "그 전까지는 VM 안·밖 양쪽을 함께 확인해야 합니다.", QSRC)
+        elif qratio >= 0.8 or (iratio is not None and iratio >= 0.8):
             add("warn", "포화", "서버 담당자",
                 "병목 위치: Guest 쪽 큐가 가득 참 (큐 사용률 {:.0f}%)".format(qratio * 100),
-                "평균 대기 I/O p95 {} / 디바이스 queue_depth 합계 {}".format(fmt(A["aqu_p95"], 1), int(qd_total)),
+                q_ev,
                 "가상 디스크가 동시에 받을 수 있는 I/O 수가 한계에 닿아, 요청이 VM 안에서 줄을 서고 있습니다. 백엔드가 빨라도 이 구간은 느려집니다.",
                 "ES data용 VMDK를 여러 개로 나눠 별도 PVSCSI 컨트롤러에 붙이고 LVM stripe로 묶는 방법이 가장 효과적입니다. "
-                "그다음 PVSCSI queue depth 상향(cmd_per_lun=254, ring_pages=32, 재부팅 필요)을 검토하세요.",
-                "[VMware 공식] KB 2053145 — PVSCSI 기본 큐 64(device)/254(adapter), ring_pages 8→32 및 cmd_per_lun 254 권장")
+                "그다음 PVSCSI queue depth 상향(cmd_per_lun=254, ring_pages=32, 재부팅 필요)을 검토하세요.", QSRC)
+        elif qratio >= 0.4:
+            # 큐도 깊고 지연도 높다 → 한쪽으로 단정할 수 없는 구간
+            add("warn" if lat_sev in ("warn", "crit") else "caution", "지연", "원인 분리 필요",
+                "병목 위치: 큐도 깊고 지연도 높음 — VM 안·밖을 함께 확인 (큐 사용률 {:.0f}%)".format(qratio * 100),
+                q_ev,
+                "큐가 절반 이상 차 있으면서 응답시간도 높습니다. 백엔드가 느려서 요청이 밀려 큐가 쌓인 것일 수도 있고, "
+                "큐가 좁아서 대기가 길어진 것일 수도 있어 한쪽으로 단정할 수 없습니다. 두 원인은 함께 나타나는 경우가 많습니다.",
+                "VMware 관리자에게 같은 시각의 esxtop DAVG(백엔드)와 KAVG(커널·큐 대기) 분리 확인을 요청하세요. "
+                "DAVG가 크면 VM 바깥, KAVG가 크면 큐 쪽입니다. 동시에 Guest에서는 VMDK 분할 + 별도 PVSCSI 컨트롤러로 큐를 넓히는 방안을 검토합니다.", QSRC)
         else:
             add("warn" if lat_sev in ("warn", "crit") else "caution", "지연", "VMware 관리자",
                 "병목 위치: VM 바깥(하이퍼바이저·vSAN) 가능성 높음",
-                "응답시간은 높은데 대기 I/O는 적음 (aqu-sz p95 {} / queue_depth {})".format(
-                    fmt(A["aqu_p95"], 2), int(qd_total) if qd_total else "미확인"),
+                q_ev + " → 큐 사용률 {:.0f}%".format(qratio * 100),
                 "VM 안에서 기다리는 요청이 적은데도 한 건 한 건이 느리다는 뜻입니다. vSAN resync, 캐시 계층 포화, 같은 호스트 다른 VM의 I/O 경합, "
                 "vSAN 네트워크 지연이 전형적인 원인입니다. Guest 설정 변경으로는 개선되지 않습니다.",
                 "측정 시각과 이 리포트를 VMware 관리자에게 전달하고 esxtop의 DAVG/KAVG/GAVG, vSAN 성능 서비스의 VM·디스크 그룹 지연, "
-                "resync 진행 여부를 같은 시각으로 확인 요청하세요.",
-                "[VMware 공식] Broadcom 'Troubleshooting vSAN Performance' — 게스트 내부 지연과 VM/VMDK 레벨 지연의 차이는 큐 깊이가 낮은 컨트롤러의 큐 고갈에서 비롯될 수 있다고 서술")
+                "resync 진행 여부를 같은 시각으로 확인 요청하세요.", QSRC)
     # 쓰기만 느림 → vSAN 쓰기 경로 힌트
     if (A["w_await_p95"] and A["r_await_p95"] and A["valid_w"] >= 3 and A["valid_r"] >= 3
             and A["w_await_p95"] >= th["caution"] and A["w_await_p95"] > 3 * A["r_await_p95"]):
@@ -1544,7 +1598,9 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     runtime = sev_max(disk_rt, es_sev)
     latent = sev_max(mem_sev, cfg_sev, vm_sev)
     n_act = sum(1 for f in F if SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["caution"])
-    disk_clean = SEV_ORDER.get(lat_sev, 0) <= SEV_ORDER["ok"] and not low_load
+    # "디스크는 정상" 이라고 말하려면 실제로 재서 정상이어야 한다.
+    # lat_sev=="na" 는 I/O가 적어 못 잰 경우이므로 정상 판정 근거가 될 수 없다.
+    disk_clean = lat_sev == "ok" and not low_load
     if disk_clean:
         for f in F:
             if f.dim == "ES 영향" and SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["caution"]:
@@ -1567,10 +1623,18 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                    "측정 구간의 응답시간·포화·오류가 모두 기준 안이고, ES 운영에 불리한 설정도 발견되지 않았습니다.")
 
     if CL and CL["data_rows"]:
-        busy = [r["busy"] for r in CL["data_rows"] if r["busy"] is not None]
+        # 비교는 같은 data tier 안에서만 — hot 노드를 warm/cold 노드와 섞으면 중앙값이 왜곡된다
+        my_row = next((r for r in CL["data_rows"] if r["name"] == me_name), None)
+        def _tier(r):
+            for t in ("data_hot", "data_warm", "data_cold", "data_frozen", "data_content"):
+                if t in (r["roles"] or ""):
+                    return t
+            return "data"
+        peers = [r for r in CL["data_rows"] if my_row is None or _tier(r) == _tier(my_row)]
+        busy = [r["busy"] for r in peers if r["busy"] is not None]
         if len(busy) >= 3:
             med = pctl(busy, 0.5)
-            me = next((r["busy"] for r in CL["data_rows"] if r["name"] == dig(node_i, "name")), None)
+            me = (my_row or {}).get("busy")
             if me is not None and med:
                 many_high = sum(1 for b in busy if b >= 70) >= max(2, len(busy) // 2)
                 if me > med * 1.5:
@@ -1602,7 +1666,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
 
     return {
         "meta": meta, "storage": storage, "th": th, "es_version": es_version, "is_vmware": is_vmware,
-        "os": kv(rd(S, "os-release")).get("PRETTY_NAME", "").strip('"'), "kernel": rd(S, "uname").split()[2] if rd(S, "uname") else "",
+        "os": kv(rd(S, "os-release")).get("PRETTY_NAME", "").strip('"'), "kernel": (rd(S, "uname").split() + ["", "", ""])[2],
         "ncpu": ncpu, "mem_gb": mem_total_mb / 1024.0, "path_map": path_map, "phys": phys, "logical": logical,
         "dev_guess": dev_guess, "A": A, "dev_stats": dev_stats, "log_stats": log_stats, "topo": topo,
         "agg": agg, "sysr": sysr, "findings": F, "dims": dims, "verdict": verdict, "n_act": n_act,
@@ -1889,7 +1953,7 @@ def render(R, out_path):
     h.append('</table></div>')
     topo = R["topo"]
     h.append('<div class="scroll"><table><tr><th>디스크</th><th>컨트롤러</th><th>queue_depth</th><th>scheduler</th><th>readahead</th><th>timeout</th><th>섹터(논리/물리)</th>'
-             '<th>읽기 p95</th><th>쓰기 p95</th><th>IOPS p95</th><th>aqu p95</th><th>%util p95</th></tr>')
+             '<th>읽기 p95</th><th>쓰기 p95</th><th>IOPS p95</th><th>aqu p95</th><th>inflight p95</th><th>%util p95</th></tr>')
     for d in R["phys"] + [x for x in R["logical"] if x not in R["phys"]]:
         a = topo.attr.get(topo.whole(d), {})
         st = R["dev_stats"].get(d) or R["log_stats"].get(d) or {}
@@ -1901,8 +1965,10 @@ def render(R, out_path):
                      E(a.get("queue/scheduler", "-")), E(a.get("queue/read_ahead_kb", "-")), E(a.get("device/timeout", "-")),
                      E(a.get("queue/logical_block_size", "-")), E(a.get("queue/physical_block_size", "-")),
                      fmt(st.get("r_await_p95"), 2, "ms"), fmt(st.get("w_await_p95"), 2, "ms"), fmt(st.get("iops_p95"), 0),
-                     fmt(st.get("aqu_p95"), 2), fmt(st.get("util_p95"), 0, "%")))
-    h.append('</table></div><p class="note">%util은 참고용입니다. vSAN·SSD처럼 요청을 병렬로 처리하는 장치는 %util이 100%여도 여유가 있을 수 있어 판정에 쓰지 않았습니다.</p>')
+                     fmt(st.get("aqu_p95"), 2), fmt(st.get("inflight_p95"), 1), fmt(st.get("util_p95"), 0, "%")))
+    h.append('</table></div><p class="note">%util은 참고용입니다. vSAN·SSD처럼 요청을 병렬로 처리하는 장치는 %util이 100%여도 여유가 있을 수 있어 판정에 쓰지 않았습니다. '
+             'aqu p95는 블록 계층에서 대기 중인 요청까지 포함한 시간 평균이라 queue_depth를 넘을 수 있고, inflight p95는 장치에 넘겨져 처리 중인 I/O 수라 queue_depth와 직접 비교됩니다. '
+             '병목 위치 판정은 두 값을 함께 봅니다.</p>')
 
     # 이력
     if R["hist"]:

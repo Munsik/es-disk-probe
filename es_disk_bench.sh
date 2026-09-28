@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_bench.sh  (v0.9.0, 선택 사항)
+# es_disk_bench.sh  (v0.9.1, 선택 사항)
 # ES data 디스크의 "최대 능력"을 fio로 측정합니다. → 리포트의 여유율 계산용
 #
 # ⚠ 이 스크립트는 디스크에 실제 부하를 겁니다. 반드시 아래 조건에서만 실행하세요.
@@ -29,7 +29,7 @@ while [[ $# -gt 0 ]]; do
     -r) RT="$2"; shift 2 ;;
     -o) OUT_BASE="$2"; shift 2 ;;
     --force-with-es) FORCE=1; shift ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR>1 && /^#/{print;next} NR>1{exit}' "$0"; exit 0 ;;
     *) echo "알 수 없는 옵션: $1"; exit 1 ;;
   esac
 done
@@ -42,9 +42,22 @@ if pgrep -f 'org\.elasticsearch\.bootstrap\.Elasticsearch' >/dev/null 2>&1 && [[
   exit 2
 fi
 
-to_kb() { local v=${1^^}; case "$v" in *G) echo $(( ${v%G} * 1048576 ));; *M) echo $(( ${v%M} * 1024 ));; *) echo $(( v / 1024 ));; esac; }
+[[ "$RT" =~ ^[0-9]+$ && "$RT" -ge 5 ]] || { echo "-r 은 5 이상 정수(초)"; exit 1; }
+# 크기 표기 검증: 숫자 + 선택적 G/M/K (fio 가 받는 형식). GB·4g 같은 표기는 여기서 걸러낸다
+[[ "$SIZE" =~ ^[0-9]+[gGmMkK]?$ ]] || { echo "-s 는 4G / 512M / 1048576 같은 형식으로 지정하세요 (현재: $SIZE)"; exit 1; }
+to_kb() {
+  local v=${1^^}
+  case "$v" in
+    *G) echo $(( ${v%G} * 1048576 )) ;;
+    *M) echo $(( ${v%M} * 1024 )) ;;
+    *K) echo $(( ${v%K} )) ;;
+    *)  echo $(( v / 1024 )) ;;
+  esac
+}
 NEED_KB=$(to_kb "$SIZE")
 read -r TOT_KB USED_KB AVL_KB <<< "$(df -Pk "$TARGET" | awk 'NR==2{print $2,$3,$4}')"
+[[ "${TOT_KB:-0}" =~ ^[0-9]+$ && "${TOT_KB:-0}" -gt 0 ]] || { echo "df 로 $TARGET 의 용량을 읽지 못했습니다"; exit 1; }
+[[ "$NEED_KB" -gt 0 ]] || { echo "-s 값이 너무 작습니다 (최소 1MB)"; exit 1; }
 AFTER_PCT=$(( (USED_KB + NEED_KB) * 100 / TOT_KB ))
 if [[ $NEED_KB -ge $AVL_KB || $AFTER_PCT -gt 80 ]]; then
   echo "공간 부족: 테스트 후 사용률 ${AFTER_PCT}% 예상 (기준 80%). -s 로 크기를 줄이세요."; exit 3
