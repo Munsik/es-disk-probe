@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_cluster_probe.sh  (v0.9.3)
+# es_cluster_probe.sh  (v0.9.4)
 # Elasticsearch 클러스터를 "디스크 관점"에서 조회합니다. (READ-ONLY)
 #
 #  - ES 조회 API(GET)만 호출합니다. 설정 변경, 인덱스 쓰기 없음.

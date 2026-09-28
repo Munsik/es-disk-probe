@@ -5,7 +5,7 @@ Read-only disk I/O diagnostics for Elasticsearch nodes on VMware vSAN (guest OS 
 Elasticsearch 노드의 디스크가 지금 정상인지, 문제라면 원인이 VM 안인지 밖인지를 Guest OS에서 판정합니다.
 측정 결과를 Elastic·VMware 공식 권장값과 대조해 담당자별 조치 항목까지 HTML 리포트로 냅니다.
 
-v0.9.3 · 비공식 도구 · 읽기 전용 · 한 시점을 보는 진단 도구 (상시 모니터링 도구가 아닙니다)
+v0.9.4 · 비공식 도구 · 읽기 전용 · 한 시점을 보는 진단 도구 (상시 모니터링 도구가 아닙니다)
 
 ---
 
@@ -13,13 +13,12 @@ v0.9.3 · 비공식 도구 · 읽기 전용 · 한 시점을 보는 진단 도�
 
 ### 이 도구의 성격
 
-Elastic이나 VMware의 공식 제품이 아닙니다. 개인이 만든 진단 스크립트라서 두 회사의 지원을 받을 수 없습니다.
-실행 결과로 문제가 생겨도 기술지원 대상이 아닙니다.
+Elastic이나 VMware의 공식 제품이 아닙니다. 현장에서 필요해서 직접 만든 진단 스크립트입니다.
 
 리포트가 인용하는 기준값은 Elastic, VMware, Red Hat 공식 문서에서 가져왔고 항목마다 출처를 적었습니다.
-다만 그 기준값을 조합해 내리는 판정과 조치 안내는 이 도구의 해석이고, 공식 권고가 아닙니다.
+다만 그 기준값을 조합해 내리는 판정과 조치 안내는 이 도구의 해석입니다.
 리포트의 모든 항목에는 `[Elastic 공식]`, `[VMware 공식]`, `[Red Hat 공식]`, `[실무 기준]`, `[참고]` 중
-하나가 붙어 있습니다. 고객에게 전달할 때는 공식 표기가 있는 항목만 권고로 쓰고 나머지는 검토 의견으로 다뤄 주세요.
+하나가 붙어 있습니다. 고객에게 전달할 때는 공식 표기가 있는 항목을 권고로 쓰고, 나머지는 검토 의견으로 다루시면 됩니다.
 
 ### 한 시점을 보는 도구입니다
 
@@ -133,7 +132,7 @@ ES가 segment를 열거나 닫을 때(`mmap`, `munmap`) 잠깐 경합하는 정�
 실행할 때마다 그 실행의 실측 부하가 리포트의 "이 진단이 서버에 준 부하" 섹션에 찍힙니다.
 리포트를 받은 사람이 직접 확인할 수 있게 넣었습니다.
 
-그래도 운영 시간대에 처음 돌리기 전에는 사내 노드나 개발 노드에서 한 번 실행해 보시기를 권합니다.
+처음 쓰실 때는 사내 노드나 개발 노드에서 한 번 돌려 보고 출력을 확인하시면 좋습니다.
 
 ### 부하를 거는 도구는 따로 있습니다
 
@@ -148,13 +147,12 @@ ES가 segment를 열거나 닫을 때(`mmap`, `munmap`) 잠깐 경합하는 정�
 번들(`.tar.gz`)에는 호스트명, OS·커널 버전, mount 경로, 인덱스 이름, ES 노드 이름과 IP,
 커널 로그와 ES 로그 발췌가 들어갑니다.
 `elasticsearch.yml`은 `password`, `secret`, `token`, `key`가 들어간 줄을 빼고 필요한 키만 추출합니다.
-그래도 자동 마스킹은 완전하지 않으니 사외로 내보내기 전에 번들 내용을 직접 확인하세요.
+사외로 내보낼 일이 있으면 번들을 한 번 열어 보시는 편이 안전합니다.
 
 ### 검증 수준
 
 컨테이너와 합성 데이터로 검증했습니다. `/proc/diskstats` 계산은 iostat 12.6과 교차 검증했고
-계산식 단위 테스트를 통과했습니다.
-실제 vSphere Guest와 운영 클러스터에서는 아직 검증하지 않았습니다.
+계산식 단위 테스트를 통과했습니다. 실제 vSphere Guest와 운영 클러스터 검증은 아직 남아 있습니다.
 상세 내역은 아래 [검증 현황](#검증-현황) 표에 있습니다.
 
 ---
@@ -349,16 +347,28 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | 파일 핸들 | 65535 이상 | [Elastic 공식] File descriptors |
 | disk watermark | 기본 85/90/95% | [Elastic 공식] Disk-based shard allocation |
 | 스토리지 종류 | 로컬 block device, 원격 파일시스템 회피 | [Elastic 공식] Hardware |
-| vSAN 지연 | All-Flash 5ms / Hybrid 20ms 미만을 정상으로 제시 | [VMware 공식] Broadcom KB 389082 |
+| translog durability | 기본 request는 요청마다 fsync, async는 sync_interval(기본 5s) 단위 | [Elastic 공식] Translog settings |
+| merge 스레드 수 | 기본은 프로세서 수의 절반, 회전 디스크면 1로 낮춤 | [Elastic 공식] Merge settings |
+| index.store.type | 기본 hybridfs | [Elastic 공식] Store |
+| 인덱싱용 스토리지 | SSD 권장, RAID 0 stripe, 원격 스토리지 회피 | [Elastic 공식] Tune for indexing speed |
+| vSAN 지연 (VM 관점) | All-Flash 5ms / Hybrid 20ms 미만을 정상으로 제시 | [VMware 공식] Broadcom KB 389082 |
+| vSAN 지연 (장치 관점) | NVMe 0.5ms 미만, SAS/SATA SSD 1ms 내외, HDD 10~20ms | [VMware 공식] Broadcom KB 424485 |
 | Guest와 VMDK 지연 차이 | queue depth 낮은 컨트롤러의 큐 고갈 가능성 | [VMware 공식] Troubleshooting vSAN Performance |
 | PVSCSI 큐 | 기본 64(device) / 254(adapter), ring_pages 8에서 32로 | [VMware 공식] KB 2053145 |
+| 가상 SCSI 컨트롤러 | 레거시 어댑터는 queue depth 32, PVSCSI는 64 | [VMware 공식] Troubleshooting vSAN Performance |
 | NIC | VMXNET3 | [VMware 공식] KB 1001805 |
 | vSAN 네트워크 | 패킷 손실 2%면 스토리지 성능 32% 저하 | [VMware 공식] Troubleshooting vSAN Performance |
 | I/O scheduler | mq-deadline 또는 none | [Red Hat 공식] Setting the disk scheduler |
+| tuned profile | VM은 virtual-guest. throughput-performance 기반이고 dirty_ratio를 올림 | [Red Hat 공식] TuneD profiles |
 | 응답시간 3단계 구분 | 주의 / 경고 / 위험 | [실무 기준] KB 389082를 기준으로 단계화. Elastic 공식 수치 없음 |
 | 큐 사용률 구간 | 40% / 80% | [실무 기준] 공식 수치 없음 |
 | PSI 단계 | 5% / 20% | [실무 기준] 커널 문서에 임계값 제시 없음 |
 | THP | madvise 또는 never | [참고] DB 벤더 운영 관행. Elastic 필수 항목 아님 |
+
+vSAN 지연 기준이 둘인 이유가 있습니다. 이 도구가 재는 것은 Guest OS에서 본 지연이고, 여기에는
+vSAN 백엔드와 hypervisor, 가상 SCSI를 지나온 시간이 모두 들어 있습니다. 그래서 판정 기준은
+VM 관점 수치(KB 389082)를 씁니다. 장치 관점 수치(KB 424485)는 VMware 관리자에게 백엔드 확인을
+요청할 때 "어느 정도가 정상인지" 함께 전달하려고 실었습니다.
 
 ---
 
@@ -435,14 +445,11 @@ VM snapshot, ES 노드의 호스트 배치(anti-affinity), vSAN 네트워크와 
 
 ---
 
-## 면책
+## 참고사항
 
-- Elastic이나 VMware의 공식 제품이 아니고 두 회사의 지원 대상도 아닙니다. 개인이 만든 도구입니다.
-- 진단 결과와 조치 안내만 제공하고 설정은 변경하지 않습니다.
-- 리포트가 인용하는 기준값에는 공식 문서 출처를 적었지만, 그 기준값을 조합한 판정과 조치 안내는 이 도구의 해석입니다.
-- 조치 적용은 담당자 검토와 테스트를 거쳐야 하고, 적용 결과에 대한 책임은 사용자에게 있습니다.
-- 실제 vSphere Guest와 운영 클러스터 검증 전 단계(v0.9.x)입니다. 운영 환경에서 처음 돌리기 전에 사내 노드에서 확인하세요.
-- `es_disk_bench.sh`는 실제 부하를 걸고, vSAN 공유 스토리지 특성상 같은 클러스터의 다른 VM에 영향이 갈 수 있습니다.
+- Elastic이나 VMware의 공식 제품이 아닙니다.
+- 진단 결과와 조치 안내만 제공하고 설정은 바꾸지 않습니다. 조치는 담당자가 검토하고 적용합니다.
+- `es_disk_bench.sh`만 예외로 실제 부하를 겁니다. vSAN은 공유 스토리지라 같은 클러스터의 다른 VM에도 영향이 갈 수 있습니다.
 
 ## 라이선스
 

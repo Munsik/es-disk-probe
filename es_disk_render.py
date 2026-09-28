@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-es_disk_render.py (v0.9.3)
+es_disk_render.py (v0.9.4)
 es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 지표 계산 → 판정 → HTML 리포트를 생성합니다.
 
@@ -14,7 +14,7 @@ es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 """
 import argparse, html, json, os, re, sys, tarfile, tempfile, datetime
 
-TOOL_VERSION = "0.9.3"
+TOOL_VERSION = "0.9.4"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 기준값 (출처를 함께 표기. 리포트에도 그대로 노출)
@@ -824,7 +824,9 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                 "큐가 절반 이상 차 있으면서 응답시간도 높습니다. 백엔드가 느려서 요청이 밀려 큐가 쌓인 것일 수도 있고, "
                 "큐가 좁아서 대기가 길어진 것일 수도 있어 한쪽으로 단정할 수 없습니다. 두 원인은 함께 나타나는 경우가 많습니다.",
                 "VMware 관리자에게 같은 시각의 esxtop DAVG(백엔드)와 KAVG(커널·큐 대기) 분리 확인을 요청하세요. "
-                "DAVG가 크면 VM 바깥, KAVG가 크면 큐 쪽입니다. 동시에 Guest에서는 VMDK 분할 + 별도 PVSCSI 컨트롤러로 큐를 넓히는 방안을 검토합니다.", QSRC)
+                "DAVG가 크면 VM 바깥, KAVG가 크면 큐 쪽입니다. 장치 레벨 기대치는 Broadcom KB 424485 기준으로 "
+                "NVMe 0.5ms 미만, SAS/SATA SSD 1ms 내외, HDD 10~20ms 입니다. "
+                "동시에 Guest에서는 VMDK 분할 + 별도 PVSCSI 컨트롤러로 큐를 넓히는 방안을 검토합니다.", QSRC)
         else:
             add("warn" if lat_sev in ("warn", "crit") else "caution", "지연", "VMware 관리자",
                 "병목 위치: VM 바깥(하이퍼바이저·vSAN) 가능성 높음",
@@ -832,7 +834,8 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                 "VM 안에서 기다리는 요청이 적은데도 한 건 한 건이 느리다는 뜻입니다. vSAN resync, 캐시 계층 포화, 같은 호스트 다른 VM의 I/O 경합, "
                 "vSAN 네트워크 지연이 전형적인 원인입니다. Guest 설정 변경으로는 개선되지 않습니다.",
                 "측정 시각과 이 리포트를 VMware 관리자에게 전달하고 esxtop의 DAVG/KAVG/GAVG, vSAN 성능 서비스의 VM·디스크 그룹 지연, "
-                "resync 진행 여부를 같은 시각으로 확인 요청하세요.", QSRC)
+                "resync 진행 여부를 같은 시각으로 확인 요청하세요. 장치 레벨 기대치는 Broadcom KB 424485 기준으로 "
+                "NVMe 0.5ms 미만, SAS/SATA SSD 1ms 내외, HDD 10~20ms 입니다. 이 범위를 넘으면 백엔드 쪽을 먼저 봅니다.", QSRC)
     # 쓰기만 느림 → vSAN 쓰기 경로 힌트
     if (A["w_await_p95"] and A["r_await_p95"] and A["valid_w"] >= 3 and A["valid_r"] >= 3
             and A["w_await_p95"] >= th["caution"] and A["w_await_p95"] > 3 * A["r_await_p95"]):
@@ -1051,6 +1054,15 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
 
     # ═════════════ 6. 설정 ═════════════
     cfg_sevs = []
+    # readahead 가 큰 원인은 대개 tuned profile 이나 udev 규칙이다. 둘 다 이미 수집하고 있으니 원인 후보로 붙인다.
+    tuned_prof = rd(S, "tuned").strip().split(":")[-1].strip()
+    udev_ra = "read_ahead" in rd(S, "udev_rules")
+    tuned_hint = ""
+    if tuned_prof and tuned_prof.lower() not in ("", "none", "no current active profile"):
+        tuned_hint += " 활성 tuned profile은 '{}' 입니다. tuned의 disk 플러그인이 readahead를 바꿀 수 있으니 값이 되돌아오면 profile을 함께 확인하세요.".format(tuned_prof)
+    if udev_ra:
+        tuned_hint += " /etc/udev/rules.d 에 read_ahead를 설정하는 규칙이 이미 있습니다."
+
     # readahead: Elastic 공식 권고 128KiB
     ra_bad = []
     for d in sorted(set(phys + logical)):
@@ -1062,7 +1074,8 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         cfg_sevs.append(s)
         add(s, "설정", "서버 담당자", "readahead가 Elastic 권고값(128KiB)보다 큼", ", ".join(ra_bad),
             "검색은 무작위 읽기가 많아 readahead가 크면 필요 없는 데이터까지 읽어 page cache를 밀어냅니다. LVM·dm 장치는 수 MB로 잡히는 경우가 있습니다.",
-            "blockdev --setra 256 /dev/<장치> (512B 섹터 단위 → 128KiB) 로 즉시 적용 가능, udev 규칙으로 영구화. LVM이면 dm 장치에도 적용하세요.",
+            "blockdev --setra 256 /dev/<장치> (512B 섹터 단위 → 128KiB) 로 즉시 적용 가능, udev 규칙으로 영구화. LVM이면 dm 장치에도 적용하세요."
+            + tuned_hint,
             "[Elastic 공식] Tune for search speed. LVM, software RAID, dm-crypt에서 readahead가 수 MiB로 커질 수 있으며 128KiB 권장 (blockdev --setra 256)")
     # scheduler
     sch_bad = []
@@ -1284,6 +1297,71 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                 "리포트 부록의 로그 원문에서 발생 시각을 확인하고, 같은 시각의 디스크 지표와 대조하세요.",
                 "Elasticsearch 서버 로그 (최근 7일)")
 
+    # ── 디스크와 직결되는 인덱스 설정 (명시적으로 바꾼 인덱스만 응답에 들어온다) ──
+    idx_set = rjson(S, "es_idx_settings.json") or {}
+    def idx_vals(key):
+        """key 를 명시적으로 설정한 인덱스를 {인덱스: 값} 으로"""
+        out = {}
+        for name, blk in idx_set.items():
+            v = dig(blk, "settings", key)
+            if v is not None:
+                out[name] = str(v)
+        return out
+
+    # translog durability: 디스크 지연이 인덱싱 지연으로 이어지는 경로를 설명하는 핵심 설정
+    dur_async = {k: v for k, v in idx_vals("index.translog.durability").items() if str(v).lower() == "async"}
+    if dur_async:
+        add("info", "ES 설정", "참고", "일부 인덱스가 translog를 비동기로 fsync 중 (durability: async)",
+            "{}개 인덱스: {}".format(len(dur_async), ", ".join(sorted(dur_async)[:6])),
+            "기본값 request는 bulk 요청마다 fsync를 합니다. async는 sync_interval(기본 5초)마다 묶어서 하므로 "
+            "디스크 쓰기 지연의 영향을 훨씬 덜 받습니다. 대신 장애 시 마지막 commit 이후 확인된 쓰기가 사라질 수 있습니다.",
+            "의도한 설정이면 그대로 두세요. 디스크 쓰기 지연 때문에 임시로 바꾼 것이라면 데이터 유실 범위를 확인하고 "
+            "스토리지를 개선한 뒤 request로 되돌리는 쪽을 검토하세요.",
+            "[Elastic 공식] Translog settings (durability: request가 기본, async는 sync_interval 단위)")
+    else:
+        add("info", "ES 설정", "참고", "translog durability가 기본값(request). 쓰기 요청마다 fsync",
+            "durability를 async로 바꾼 인덱스 없음" if idx_set else "인덱스 설정 미수집",
+            "기본 설정에서는 bulk 요청 하나가 끝나려면 translog fsync가 끝나야 합니다. 그래서 디스크 쓰기 지연이 "
+            "그대로 인덱싱 응답 시간이 됩니다. 이 리포트가 쓰기 지연을 중요하게 보는 이유입니다.",
+            "조치 불필요. 쓰기 지연이 문제인데 스토리지를 바로 개선할 수 없는 상황이라면 async가 선택지이지만 "
+            "데이터 유실 범위를 먼저 합의해야 합니다.",
+            "[Elastic 공식] Translog settings")
+
+    # merge scheduler: Elastic은 spinning platter 에 max_thread_count=1 을 권고
+    # 주의. VMware 가상 디스크는 백엔드가 all-flash 여도 rotational=1 로 보고하는 경우가 많다.
+    # 그래서 rotational 값만으로 판정하지 않고, 사용자가 -s hybrid 로 선언한 경우에만 본다.
+    mtc = idx_vals("index.merge.scheduler.max_thread_count")
+    rot = [d for d in phys if topo.attr.get(d, {}).get("queue/rotational") == "1"]
+    if storage == "hybrid":
+        not_one = [k for k, v in mtc.items() if str(v) != "1"]
+        if not mtc or not_one:
+            cfg_sevs.append("caution")
+            add("caution", "ES 설정", "ES 설정", "Hybrid vSAN인데 merge 스레드 수가 Elastic 권고(1)가 아님",
+                "max_thread_count를 1로 설정한 인덱스 {}개{} · Guest가 rotational로 보고한 장치: {}".format(
+                    len([k for k, v in mtc.items() if str(v) == "1"]),
+                    " (1이 아닌 인덱스: " + ", ".join(sorted(not_one)[:4]) + ")" if not_one else "",
+                    ", ".join(rot) or "없음"),
+                "기본값은 프로세서 수의 절반입니다. SSD에는 맞지만 회전 디스크에서는 동시 merge가 헤드를 흩어 놓아 "
+                "오히려 느려집니다. Elastic은 이 경우 1로 낮추라고 명시합니다.",
+                "Hybrid 구성이 맞다면 index.merge.scheduler.max_thread_count를 1로 낮추는 것을 검토하세요. "
+                "인덱스 단위 동적 설정이라 재시작은 필요 없습니다. All-Flash인데 -s hybrid로 실행했다면 -s allflash로 다시 측정하세요.",
+                "[Elastic 공식] Merge settings (기본값은 프로세서 수의 절반, 회전 디스크면 1로 낮출 것)")
+    elif mtc:
+        add("info", "ES 설정", "참고", "merge 스레드 수를 기본값과 다르게 설정한 인덱스 있음",
+            ", ".join("{}={}".format(k, v) for k, v in sorted(mtc.items())[:6]),
+            "기본값은 프로세서 수의 절반입니다. All-Flash에서는 기본값이 적절합니다.",
+            "의도한 설정인지 확인하세요.", "[Elastic 공식] Merge settings")
+
+    # store type / preload
+    st_type = idx_vals("index.store.type")
+    if st_type:
+        add("info", "ES 설정", "참고", "index.store.type을 명시적으로 지정한 인덱스 있음",
+            ", ".join("{}={}".format(k, v) for k, v in sorted(st_type.items())[:6]),
+            "기본값 hybridfs는 파일 종류에 따라 mmap과 nio를 골라 씁니다. niofs로 바꾸면 mmap을 쓰지 않아 "
+            "max_map_count 부담은 줄지만 읽기 성능이 떨어질 수 있습니다.",
+            "의도한 설정인지 확인하세요. 특별한 이유가 없으면 기본값이 낫습니다.",
+            "[Elastic 공식] Store (기본 hybridfs)")
+
     cfg_sev = sev_max(*cfg_sevs) if cfg_sevs else "ok"
 
     # ═════════════ 7. VMware 자원 ═════════════
@@ -1471,6 +1549,10 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     bp("커널", "dirty page 기준", "기본값 유지, 쓰기 지연 급등 시 바이트 단위 검토",
        "ratio {}/{} · bytes {}/{}".format(sysctl.get("vm.dirty_background_ratio", "-"), sysctl.get("vm.dirty_ratio", "-"),
                                          sysctl.get("vm.dirty_background_bytes", "-"), sysctl.get("vm.dirty_bytes", "-")), "info", "커널 문서")
+    bp("OS·블록 장치", "tuned profile", "virtual-guest (VM 권고). readahead·dirty_ratio를 바꿀 수 있어 함께 확인",
+       tuned_prof or "미확인",
+       "ok" if tuned_prof.lower().endswith("virtual-guest") else ("na" if not tuned_prof else "info"),
+       "[Red Hat 공식] TuneD profiles (virtual-guest는 throughput-performance 기반, swappiness를 낮추고 dirty_ratio를 올림)")
     bp("커널", "PSI(I/O 압박 지표)", "사용 가능 (RHEL 8은 psi=1)", sysctl.get("psi", "-"), "ok" if sysctl.get("psi") == "available" else "info", "커널 문서")
     bp("ES 프로세스", "파일 핸들 한도", "65535 이상", nofile or "-", ("ok" if (nofile == "unlimited" or num(nofile, 0) >= 65535) else "crit") if nofile else "na", "Elastic 공식")
     if heap_mb and mem_total_mb:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_collect.sh  (v0.9.3)
+# es_disk_collect.sh  (v0.9.4)
 # Elasticsearch 노드 Disk I/O 진단: 데이터 수집기 (READ-ONLY)
 #
 #  - 시스템 설정을 바꾸지 않습니다. /proc, /sys 읽기와 ES 조회 API 호출만 합니다.
@@ -39,7 +39,7 @@ set -u
 umask 077
 export LC_ALL=C
 
-VERSION="0.9.3"
+VERSION="0.9.4"
 DUR=300; INT=5; OUT_BASE="/tmp"; STORAGE="allflash"
 ES_URL=""; ES_USER=""; NO_ES=0; NO_RENDER=0; NO_CLUSTER=0
 NO_ESLOG=0; NO_KLOG=0; NO_SAR=0; NO_MAPS=0; NO_IDXSTATS=0
@@ -347,12 +347,15 @@ if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
   fi
 fi
 NODE_STATS_PATH="_nodes/_local/stats/indices,fs,thread_pool,jvm,indexing_pressure?filter_path=nodes.*.timestamp,nodes.*.name,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.store,nodes.*.indices.segments,nodes.*.indices.translog,nodes.*.fs,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.jvm.gc,nodes.*.indexing_pressure"
+# 디스크와 직결되는 인덱스 설정. include_defaults 를 쓰지 않으므로 "명시적으로 바꾼 인덱스"만 응답에 들어온다
+IDX_SETTINGS_PATH="_all/_settings?flat_settings=true&filter_path=**.index.translog.durability,**.index.translog.sync_interval,**.index.translog.flush_threshold_size,**.index.merge.scheduler.max_thread_count,**.index.store.type,**.index.store.preload,**.index.refresh_interval"
 IDX_STATS_PATH="_nodes/_local/stats/indices?level=indices&filter_path=nodes.*.indices.*.indexing.index_total,nodes.*.indices.*.indexing.index_time_in_millis,nodes.*.indices.*.merges.total_time_in_millis,nodes.*.indices.*.merges.total_size_in_bytes,nodes.*.indices.*.refresh.total,nodes.*.indices.*.store.size_in_bytes,nodes.*.indices.*.segments.count,nodes.*.indices.*.search.query_total"
 CLUSTER_STATS_PATH="_nodes/stats/fs,indices,thread_pool,jvm,os?filter_path=nodes.*.name,nodes.*.roles,nodes.*.host,nodes.*.timestamp,nodes.*.fs.total,nodes.*.fs.io_stats,nodes.*.indices.store,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.segments.count,nodes.*.indices.translog,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.thread_pool.flush,nodes.*.jvm.mem.heap_used_percent,nodes.*.os.cpu.percent"
 
 if [[ $ES_OK -eq 1 ]]; then
   es_get "$NODE_STATS_PATH" "$S/es_stats_start.json" >/dev/null
   [[ $NO_IDXSTATS -eq 0 ]] && es_get "$IDX_STATS_PATH" "$S/es_idx_start.json" >/dev/null
+  [[ $NO_IDXSTATS -eq 0 ]] && es_get "$IDX_SETTINGS_PATH" "$S/es_idx_settings.json" >/dev/null
   # ── 클러스터 전체: 로컬 측정과 같은 창으로 1차 스냅샷 ────────────────
   if [[ $NO_CLUSTER -eq 0 ]]; then
     C="$S/cluster"; mkdir -p "$C"

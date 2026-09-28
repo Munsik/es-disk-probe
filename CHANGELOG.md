@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.9.4] - 2026-09-29
+
+벤더 문서 커버리지를 제로베이스로 다시 점검해 빠진 항목을 채우고, 과하게 방어적인 문구를 정리.
+
+### 새로 점검하는 항목 (모두 공식 문서 근거)
+- `index.translog.durability`. 기본 request 에서는 bulk 요청마다 fsync 를 기다리므로
+  디스크 쓰기 지연이 그대로 인덱싱 응답 시간이 된다. 이 리포트가 쓰기 지연을 중요하게 보는 이유를
+  리포트 안에서 설명하게 됨. async 로 바꾼 인덱스가 있으면 데이터 유실 범위와 함께 안내
+  [Elastic 공식] Translog settings
+- `index.merge.scheduler.max_thread_count`. Elastic 은 회전 디스크에 1 을 권고한다.
+  Hybrid vSAN(`-s hybrid`)에서 1 이 아니면 안내. VMware 가상 디스크는 백엔드가 all-flash 여도
+  `rotational=1` 로 보고하는 경우가 많아, rotational 값만으로 판정하면 전부 오탐이 된다.
+  그래서 사용자가 선언한 스토리지 유형을 기준으로 삼고 rotational 은 보조 근거로만 표시
+  [Elastic 공식] Merge settings
+- `index.store.type`. 기본 hybridfs 와 다르게 지정한 인덱스 표시 [Elastic 공식] Store
+- tuned profile. 지금까지 수집만 하고 쓰지 않았다. readahead 판정에 원인 후보로 연결해,
+  값을 바꿔도 되돌아오는 경우를 설명할 수 있게 함. udev 규칙 존재 여부도 함께 표시
+  [Red Hat 공식] TuneD profiles
+
+### 기준값 출처 보강
+- Broadcom KB 424485 추가. 장치 레벨 기대 지연(NVMe 0.5ms 미만, SAS/SATA SSD 1ms 내외,
+  HDD 10~20ms)을 VMware 관리자에게 백엔드 확인을 요청할 때 함께 전달하도록 병목 위치 안내에 넣음.
+  판정 기준은 그대로 VM 관점 수치(KB 389082)를 쓴다. 이 도구가 재는 것은 Guest 에서 본 지연이라
+  백엔드·hypervisor·가상 SCSI 를 지나온 시간이 모두 포함되기 때문
+- Elastic "Tune for indexing speed"(SSD, RAID 0, 원격 스토리지 회피)와
+  레거시 가상 어댑터 queue depth 32 대 PVSCSI 64 를 출처 표에 명시
+
+### 수집
+- `_all/_settings` 1회 추가. `include_defaults` 를 쓰지 않아 명시적으로 바꾼 인덱스만 응답에 들어온다.
+  `--no-index-stats` 와 `--light` 에서 함께 생략
+
+### 문서 톤
+- 과하게 방어적인 문구 정리. "지원 대상이 아닙니다", "실행 결과로 문제가 생겨도",
+  "적용 결과에 대한 책임은 사용자에게 있습니다" 같은 표현을 덜어내고 면책 6줄을 참고사항 3줄로 줄임
+
 ## [0.9.3] - 2026-09-29
 
 문서와 리포트 본문이 기계가 쓴 것처럼 읽힌다는 지적을 받아 문체를 손질. 기능 변경 없음.
