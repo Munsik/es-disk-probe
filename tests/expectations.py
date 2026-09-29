@@ -115,3 +115,41 @@ EXPECT += [
      [("info", None, "결과 형식을 해석하지 못함")],
      [(None, None, "도구가 없어")]),
 ]
+
+_STORCLI_MUST = [("warn", "하드웨어 담당자", "배터리·캐시 보호 모듈"), ("warn", "하드웨어 담당자", "write-through로 동작 중 (설정은 write-back)"),
+                 (None, "하드웨어 담당자", "패리티 RAID"), ("warn", "하드웨어 담당자", "RAID 구성 디스크에 이상 징후"),
+                 (None, None, "HDD 기준")]
+EXPECT += [
+    ("bm_raid_storcli2", "baremetal", "성능 저하", _STORCLI_MUST,
+     [(None, None, "추정으로 판정"), (None, None, "도구가 없어"), (None, None, "해석하지 못함")]),
+    ("bm_raid_storcli_cnt", "baremetal", "성능 저하", _STORCLI_MUST,
+     [(None, None, "추정으로 판정"), (None, None, "해석하지 못함")]),
+]
+
+EXPECT += [(n, "vm", "",
+            [("warn", "가상화·클라우드 관리자", "EBS 볼륨 성능 한도를 넘긴 시간이 있음")],
+            [(None, None, "EC2 인스턴스의 EBS 성능 한도")]) for n in ("aws_ebs_v2", "aws_ebs_v3")]
+
+EXPECT += [
+    ("predeploy_ok", "baremetal", "부하 전 점검: 스토리지가 ES 기준을 충족합니다", [], [(None, None, "한 건 지연이 기준보다 큼")]),
+    ("predeploy_slow_fsync", "baremetal", "부하 전 점검: 스토리지가 ES 기준보다 느립니다",
+     [("warn", "하드웨어 담당자", "동기 쓰기(fsync) 한 건 지연이 기준보다 큼")], []),
+    ("predeploy_dd", "baremetal", "부하 전 점검: 대체로 충족하지만 확인할 항목이 있습니다",
+     [("caution", None, "동기 쓰기(fsync) 한 건 지연이 기준보다 큼 (벤치 평균")], []),
+    ("idle_nobench", "baremetal", "성능 판정은 보류", [], []),
+]
+
+EXPECT += [
+    ("bm_raid_storcli2_snake", "baremetal", "정상",
+     [],
+     [(None, None, "추정으로 판정"), (None, None, "해석하지 못함"), (None, "하드웨어 담당자", "RAID")]),
+]
+
+EXPECT += [
+    ("bm_es_merge_vector", "baremetal", "정상",
+     [("info", None, "merge 가 대기열에 쌓여 있음"), ("info", None, "direct IO")],
+     [(None, None, "ES 지표 미수집")]),
+    ("vmware_hybrid", "vmware", "",
+     [("info", "VMware 관리자", "vSAN Hybrid(OSA) 는 향후 VCF 릴리스에서 중단 예정")],
+     []),
+]

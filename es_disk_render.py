@@ -372,17 +372,109 @@ def _walk(o):
             for x in _walk(v):
                 yield x
 
+# storcli2·perccli2(MegaRAID 96xx, PERC 12 이후)는 명령 문법은 storcli 와 같지만 JSON 키 이름과 값 표기가
+# 공개 문서로 확정되지 않았다. 키·값을 storcli 표기로 맞춘 뒤 같은 파서로 읽는다.
+# 모르는 키는 그대로 두므로, 끝까지 못 읽으면 "해석 불가"로 알리고 원문을 남긴다
+_SC_KEY = {
+    "controllers": "Controllers", "responsedata": "Response Data", "basics": "Basics",
+    "model": "Model", "productname": "Model", "controllermodel": "Model",
+    "status": "Status", "controllerstatus": "Controller Status",
+    "bbuinfo": "BBU_Info", "bbu": "BBU_Info", "batteryinfo": "BBU_Info",
+    "cachevaultinfo": "Cachevault_Info", "cachevault": "Cachevault_Info", "cvinfo": "Cachevault_Info",
+    "energypackinfo": "Cachevault_Info", "energypack": "Cachevault_Info", "supercapinfo": "Cachevault_Info",
+    "vdlist": "VD LIST", "virtualdrives": "VD LIST", "virtualdrivelist": "VD LIST", "virtualdriveslist": "VD LIST",
+    "logicaldrives": "VD LIST", "logicaldrivelist": "VD LIST", "ldlist": "VD LIST",
+    "pdlist": "PD LIST", "physicaldrives": "PD LIST", "physicaldrivelist": "PD LIST", "drivelist": "PD LIST",
+    "drives": "PD LIST", "physicaldriveslist": "PD LIST",
+    "dgvd": "DG/VD", "vd": "VD", "vdid": "VD", "virtualdrive": "VD", "virtualdriveid": "VD", "ld": "VD", "ldid": "VD",
+    "dg": "DG", "drivegroup": "DG", "diskgroup": "DG", "dgid": "DG", "arrayid": "DG",
+    "type": "TYPE", "raidlevel": "TYPE", "raidtype": "TYPE",
+    "state": "State", "vdstate": "State", "drivestate": "State", "pdstate": "State",
+    "cache": "Cache", "writecache": "Cache", "cachepolicy": "Cache", "writepolicy": "Cache", "currentwritepolicy": "Cache",
+    "eidslt": "EID:Slt", "eidslot": "EID:Slt", "enclosureslot": "EID:Slt", "drive": "EID:Slt",
+    "med": "Med", "media": "Med", "mediatype": "Med", "drivetype": "Med",
+    "osdrivename": "OS Drive Name", "osdevicename": "OS Drive Name", "osname": "OS Drive Name", "devicename": "OS Drive Name",
+    "writecacheinitialsetting": "Write Cache(initial setting)", "initialwritecache": "Write Cache(initial setting)",
+    "mediaerrorcount": "Media Error Count", "predictivefailurecount": "Predictive Failure Count",
+    "smartalertflaggedbydrive": "S.M.A.R.T alert flagged by drive", "smartalert": "S.M.A.R.T alert flagged by drive",
+}
+_VD_STATE = {"optimal": "Optl", "optl": "Optl", "partiallydegraded": "Pdgd", "pdgd": "Pdgd", "degraded": "Dgrd",
+             "dgrd": "Dgrd", "offline": "OfLn", "ofln": "OfLn", "recovery": "Rec", "rebuild": "Rec"}
+_PD_STATE = {"online": "Onln", "onln": "Onln", "offline": "Offln", "offln": "Offln", "unconfiguredgood": "UGood",
+             "ugood": "UGood", "unconfiguredbad": "UBad", "ubad": "UBad", "rebuild": "Rbld", "rebuilding": "Rbld",
+             "rbld": "Rbld", "failed": "Failed", "globalhotspare": "GHS", "dedicatedhotspare": "DHS", "jbod": "JBOD",
+             "unconfiguredshielded": "UBad", "shielded": "UBad", "copyback": "Rbld"}
+
+_SC_LIST = ("VD LIST", "PD LIST", "BBU_Info", "Cachevault_Info")
+_SC_NEST = ("Controllers", "Response Data", "Basics", "Status")
+
+def _nk(k):
+    return re.sub(r'[^a-z0-9]', '', str(k).lower())
+
+def _canon_storcli(o, ctx=None):
+    """storcli2 계열 JSON 을 storcli 표기로. ctx: 'vd' 또는 'pd' (상태 값 약어가 서로 다르다)"""
+    if isinstance(o, list):
+        return [_canon_storcli(x, ctx) for x in o]
+    if not isinstance(o, dict):
+        return o
+    out, aliased = {}, set()
+    for k, v in o.items():
+        ks = str(k)
+        m = re.match(r'^(?:pds|drives|physical[ _]drives|pd[ _]list)[ _]for[ _](?:vd|virtual[ _]drive|ld)[ _]?(\d+)$', ks, re.I)
+        if m:
+            out["PDs for VD " + m.group(1)] = _canon_storcli(v, "pd"); continue
+        m = re.match(r'^(?:vd|virtual[ _]drive|ld)[ _]?(\d+)[ _]properties$', ks, re.I)
+        if m:
+            out["VD{} Properties".format(m.group(1))] = _canon_storcli(v, "vd"); continue
+        m = re.match(r'^(?:drive[ _])?(/c\d+(?:/e\d+)?/s\d+)(?:[ _]-)?[ _]detailed[ _]information$', ks, re.I)
+        if m:
+            out["Drive {} - Detailed Information".format(m.group(1))] = _canon_storcli(v, "pd"); continue
+        if re.match(r'^/c\d+/v\d+$', ks):
+            out[ks] = _canon_storcli(v, "vd"); continue
+        ck = _SC_KEY.get(_nk(ks), ks)
+        # 목록 키로 바꾸는 것은 값이 목록일 때만 ("Virtual Drives": 2 같은 개수 필드와 구분)
+        if ck in _SC_LIST and ck != ks and not isinstance(v, (list, dict)):
+            ck = ks
+        elif ck not in _SC_LIST and ck not in _SC_NEST and ck != ks and isinstance(v, (list, dict)):
+            ck = ks          # 값 하나여야 하는 키(State, Med 등)는 값이 목록·객체면 바꾸지 않는다
+        sub = "vd" if ck == "VD LIST" else ("pd" if ck == "PD LIST" else ctx)
+        cv = _canon_storcli(v, sub)
+        if isinstance(cv, str):
+            n = _nk(cv)
+            if ck == "State" and ctx == "vd":
+                cv = _VD_STATE.get(n, cv)
+            elif ck == "State" and ctx == "pd":
+                cv = _PD_STATE.get(n, cv)
+            elif ck == "Med":
+                cv = "SSD" if re.search(r'ssd|solidstate|nvme|flash', n) else ("HDD" if re.search(r'hdd|harddisk|rotational|spinning|sas$|sata$', n) and "ssd" not in n else cv)
+            elif ck == "Cache" and not re.search(r'\b(A?WB|WT)\b', cv):
+                cv = re.sub(r'(?i)always\s*write\s*-?\s*back', 'AWB', cv)
+                cv = re.sub(r'(?i)write\s*-?\s*back', 'WB', cv)
+                cv = re.sub(r'(?i)write\s*-?\s*through', 'WT', cv)
+        # 원래 이름(storcli 표기)이 별칭보다 우선
+        if ck not in out or (ck == ks and ck in aliased):
+            out[ck] = cv
+            if ck != ks:
+                aliased.add(ck)
+            else:
+                aliased.discard(ck)
+    if ctx == "vd" and "DG/VD" not in out and "VD" in out:
+        out["DG/VD"] = "{}/{}".format(out.get("DG", ""), out["VD"])
+    return out
+
+
 def parse_storcli(text):
     R = {"tool": "storcli", "ctrl": [], "vds": [], "pds_bad": [], "bg": [], "pd_all": []}
     vd_map, pd_by_dg = {}, {}
     for cmd, body in _cmd_blocks(text):
         i = body.find("{")
         try:
-            j = json.loads(body[i:]) if i >= 0 else None
+            j = json.JSONDecoder().raw_decode(body[i:])[0] if i >= 0 else None   # 뒤에 붙은 텍스트는 무시
         except ValueError:
             j = None
         if not j:
             continue
+        j = _canon_storcli(j)
         for c in j.get("Controllers", []):
             rd_ = c.get("Response Data") or {}
             if not isinstance(rd_, dict):
@@ -592,7 +684,7 @@ def load_hwraid(S, topo):
             r = fn(t)
         except Exception:
             r = None
-        if r is None or (not r.get("vds") and not r.get("ctrl") and fname == "raid_storcli"):
+        if r is None or (not r.get("vds") and fname == "raid_storcli"):
             # storcli2·perccli2 JSON 은 키 이름이 공개 문서로 확정되지 않았다. 해석을 못 하면 원문만 번들에 남긴다
             absent.append("#UNPARSED " + ("storcli2" if "#TOOL storcli2" in t else fname.replace("raid_", "")))
             continue
@@ -655,47 +747,59 @@ def parse_bytes(v):
 
 def parse_ebs_stats(text):
     """nvme amzn stats / ebsnvme stats 결과. 장치별 한도 초과 누적 시간(us).
-    JSON(키 이름)과 사람이 읽는 형식(섹션 제목 + IOPS/Throughput 줄) 둘 다 읽는다"""
-    out, dev, sect = {}, None, None
-    keys = (("vol_iops", r'volume.*exceeded.*iops'), ("vol_tp", r'volume.*exceeded.*(tp|throughput)'),
-            ("inst_iops", r'instance.*exceeded.*iops'), ("inst_tp", r'instance.*exceeded.*(tp|throughput)'))
-    def put(k, v):
-        try:
-            out.setdefault(dev, {})[k] = int(float(v))
-        except (TypeError, ValueError):
-            pass
-    def walk(o, pre=""):
-        if isinstance(o, dict):
-            for k, v in o.items():
-                walk(v, pre + "_" + str(k).lower())
-        elif isinstance(o, (int, float)):
-            for name, pat in keys:
-                if re.search(pat, pre):
-                    put(name, o); break
+    출력 형식이 도구·버전마다 다를 수 있어 JSON(한 줄이든 여러 줄이든)과 텍스트를 모두 읽는다.
+    텍스트는 'EBS Volume Performance Exceeded (us)' 같은 제목 아래 'IOPS: n' 줄, 또는 한 줄에
+    'ebs_volume_performance_exceeded_iops : n' 처럼 이름과 값이 같이 오는 형식을 본다"""
+    out, blocks, dev = {}, {}, None
     for l in (text or "").splitlines():
         if l.startswith("#DEV "):
-            dev, sect = l.split()[1], None; continue
-        if dev is None:
-            continue
-        st = l.strip()
-        if st.startswith("{"):
+            dev = l.split()[1]; blocks.setdefault(dev, []); continue
+        if dev is not None:
+            blocks[dev].append(l)
+    def metric(low):
+        if "iops" in low:
+            return "iops"
+        if re.search(r'throughput|(^|[^a-z])tp([^a-z]|$)', low):
+            return "tp"
+        return None
+    def scope(low, default=None):
+        return "inst" if "instance" in low else ("vol" if "volume" in low else default)
+    for dev, lines in blocks.items():
+        body, got = "\n".join(lines), {}
+        i = body.find("{")
+        if i >= 0:
             try:
-                walk(json.loads(st))
+                j = json.JSONDecoder().raw_decode(body[i:])[0]
+                def walk(o, pre=""):
+                    if isinstance(o, dict):
+                        for k, v in o.items():
+                            walk(v, pre + "_" + str(k).lower())
+                    elif isinstance(o, (int, float)) and "exceeded" in pre:
+                        sc, mt = scope(pre, "vol"), metric(pre)
+                        if mt:
+                            got[sc + "_" + mt] = int(o)
+                walk(j)
             except ValueError:
                 pass
-            continue
-        low = st.lower()
-        if "performance exceeded" in low:
-            sect = "inst" if "instance" in low else "vol"; continue
-        m = re.match(r'^"?([a-z0-9_]+)"?\s*[:=]\s*(\d+)', low)
-        if m and "exceeded" in m.group(1):
-            for name, pat in keys:
-                if re.search(pat, m.group(1)):
-                    put(name, m.group(2)); break
-            continue
-        m = re.match(r'^(iops|throughput)\s*:\s*(\d+)', low)
-        if m and sect:
-            put(sect + ("_iops" if m.group(1) == "iops" else "_tp"), m.group(2))
+        if not got:
+            sect = None
+            for l in lines:
+                low = l.strip().lower()
+                m = re.search(r'[:=]\s*(\d+)\s*(us|µs)?\s*,?\s*$', low)
+                if "exceeded" in low:
+                    sc, mt = scope(low, sect), metric(low)
+                    if m and mt and sc:
+                        got[sc + "_" + mt] = int(m.group(1))
+                    elif not m:
+                        sect = sc or "vol"
+                    continue
+                m2 = re.match(r'^(iops|throughput|tp)\s*[:=]\s*(\d+)', low)
+                if m2 and sect:
+                    got[sect + ("_iops" if m2.group(1) == "iops" else "_tp")] = int(m2.group(2))
+                elif low and not m2 and not low.startswith(("read", "write")) and ":" not in low:
+                    sect = None       # 다른 제목이 나오면 구역이 끝난 것
+        if got:
+            out[dev] = got
     return out
 
 
@@ -1949,6 +2053,18 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
             ("write / search 거절", "{} / {}".format(fmt(wr_rej, 0), fmt(se_rej, 0)), "thread pool 큐 초과"),
             ("indexing pressure 거절", fmt(ip_rej, 0), ""),
         ]
+        # merge 스레드 풀 (9.1+, 8.19+): 대기 중인 merge 가 시작·끝 두 시점 모두 쌓여 있으면 디스크가 merge 를 못 따라가는 신호
+        mq0, mq1 = dig(n0, "thread_pool", "merge", "queue"), dig(n1, "thread_pool", "merge", "queue")
+        mthr = dig(n1, "thread_pool", "merge", "threads")
+        if isinstance(mq0, (int, float)) and isinstance(mq1, (int, float)):
+            es_rows.append(("merge 스레드 풀 대기 (시작 / 끝)", "{} / {}".format(int(mq0), int(mq1)),
+                            "스레드 {}. 두 시점 모두 쌓여 있으면 merge 가 밀리는 중".format(fmt(mthr, 0))))
+            if min(mq0, mq1) >= max(2, mthr or 0):
+                add("info", "ES 영향", "원인 분리 필요", "merge 가 대기열에 쌓여 있음 (merge 스레드 풀)",
+                    "대기 merge 시작 {} · 끝 {} · 스레드 {}".format(int(mq0), int(mq1), fmt(mthr, 0)),
+                    "측정 시작과 끝 모두 merge 가 줄 서 있었습니다. 지금은 인덱싱이 늦춰지지 않았더라도 쓰기가 늘면 인덱싱 스로틀로 이어집니다.",
+                    "쓰기 지연·처리량 판정과 함께 보세요. 디스크가 원인이 아니면 refresh_interval 연장, 샤드 수, bulk 크기를 검토합니다.",
+                    "[Elastic 공식] Thread pools (merge, 9.1+ · 8.19+)")
         if thr:
             es_sev = sev_max(es_sev, "warn")
             add("warn", "ES 영향", "원인 분리 필요", "ES가 인덱싱을 스스로 늦추고 있음 (merge 적체)",
@@ -1977,6 +2093,24 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         add("info", "ES 영향", "참고", "ES 지표 미수집", "ES API 접속 실패 또는 --no-es",
             "OS 지표만으로도 디스크 판정은 가능하지만, ES 쪽 영향(스로틀·거절·지연)을 확인하지 못했습니다.",
             "--es-user 와 ES_PASSWORD(또는 ES_API_KEY)를 지정해 재실행하면 ES 영향까지 판정합니다.", "-")
+
+    # vSAN OSA hybrid 는 VCF 9.0 에서 향후 중단 예정으로 공지됐다
+    if storage == "hybrid":
+        add("info", RES_DIM, "VMware 관리자", "vSAN Hybrid(OSA) 는 향후 VCF 릴리스에서 중단 예정",
+            "판정 기준 vSAN Hybrid (-s hybrid)",
+            "Broadcom 은 VCF 9.0 제품 지원 공지에서 vSAN OSA 의 hybrid 구성을 향후 릴리스에서 중단한다고 밝혔습니다. "
+            "회전 디스크 캐시 계층은 쓰기가 몰릴 때 지연이 크게 흔들려 ES hot 노드와 잘 맞지 않습니다.",
+            "ES hot 데이터는 All-Flash 또는 ESA 로 옮기는 계획을 VMware 관리자와 검토하세요. warm·cold 데이터는 유지해도 됩니다.",
+            "[VMware 공식] VCF 9.0 Product Support Notes (vSAN)")
+
+    # 벡터 검색의 direct IO: page cache 를 거치지 않고 디스크를 직접 읽는다 (9.1 tech preview)
+    if re.search(r'-Dvector\.rescoring\.directio=true', rd(S, "es_cmdline")):
+        add("info", "ES 영향", "참고", "벡터 rescoring 이 page cache 를 거치지 않고 디스크를 직접 읽음 (direct IO)",
+            "JVM 옵션 -Dvector.rescoring.directio=true",
+            "벡터가 메모리에 다 들어가지 않을 때 지연 급등을 막는 기능입니다. 대신 이 노드의 읽기는 캐시 적중 없이 디스크로 가므로, "
+            "읽기 IOPS·지연이 다른 노드보다 높게 나오는 것이 정상일 수 있습니다. 벡터가 모두 메모리에 들어가는 노드에서는 오히려 느려질 수 있습니다.",
+            "벡터 데이터가 page cache 에 들어가는 크기라면 이 옵션을 끄는 것을 검토하세요. 읽기 지연 판정은 이 점을 감안해 해석합니다.",
+            "[Elastic 공식] Elasticsearch 9.1 release notes, known issues (vector.rescoring.directio)")
 
     # ═════════════ 5. 메모리·캐시 ═════════════
     mem_sevs = []
@@ -3034,6 +3168,12 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         bench_dir = os.path.join(base, "bench")
     bench = load_bench(bench_dir)
     headroom = []
+    # 구축 전 적합성: 부하와 무관하게 스토리지 자체가 ES 의 두 가지 기본 동작을 기준 안에서 처리하는지.
+    # translog fsync(요청마다 동기 쓰기)와 page cache 에 없는 데이터 한 건 읽기. 둘 다 동시성 1 의 단건 지연이라
+    # 장치 기대 지연(KB 424485 등)과 같은 판정 기준(th)을 그대로 쓸 수 있다
+    PRE, bench_sev = [], "na"
+    def bsev(v):
+        return "warn" if v >= th["warn"] else ("caution" if v >= th["caution"] else "ok")
     if bench:
         def hr(label, obs, cap, unit):
             if obs is not None and cap:
@@ -3045,6 +3185,30 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         hr("혼합 쓰기 IOPS", A["ws_p95"], (b.get("randrw_16k") or {}).get("w_iops"), "IOPS")
         fs_ = b.get("fsync_4k") or {}
         sync_v = fs_.get("sync_p99") or fs_.get("sync_avg")
+        if sync_v:
+            PRE.append(("동기 쓰기 4KiB 한 건 (translog fsync)", "{} {}".format("p99" if fs_.get("sync_p99") else "평균(dd)", fmt(sync_v, 2, " ms")),
+                        "주의 {} / 경고 {} ms".format(th["caution"], th["warn"]), bsev(sync_v),
+                        "bulk 요청 한 번이 최소로 기다리는 시간"))
+        rr1 = (b.get("randread_4k_qd1") or {}).get("r_p99")
+        if rr1:
+            PRE.append(("무작위 읽기 4KiB 한 건 (cache miss 검색)", "p99 " + fmt(rr1, 2, " ms"),
+                        "주의 {} / 경고 {} ms".format(th["caution"], th["warn"]), bsev(rr1),
+                        "page cache 에 없는 segment 를 읽을 때 한 번 기다리는 시간"))
+            if rr1 >= th["caution"]:
+                add(bsev(rr1), "지연", OUT if kind == "baremetal" else "원인 분리 필요",
+                    "무작위 읽기 한 건 지연이 기준보다 큼 (벤치 p99 {})".format(fmt(rr1, 2, "ms")),
+                    "4KiB 무작위 읽기, 동시성 1, p99 {} · 판정 기준 주의 {}ms".format(fmt(rr1, 2, "ms"), th["caution"]),
+                    "검색이 page cache 에 없는 데이터를 읽을 때마다 이 시간을 기다립니다. 부하와 상관없는 장치·경로 자체의 지연입니다.",
+                    "매체(HDD 여부), RAID·스토리지 경로, 공유 스토리지의 다른 부하를 확인하세요. 검색 위주 노드라면 더 빠른 매체를 검토합니다.",
+                    "es_disk_bench.sh (fio randread psync iodepth 1). 기준은 이 리포트의 판정 기준과 같음 [실무 기준]")
+        if (b.get("randread_4k") or {}).get("r_iops"):
+            PRE.append(("무작위 읽기 최대 IOPS (동시 128)", fmt(b["randread_4k"]["r_iops"], 0), "참고값", "info", "여러 검색이 동시에 디스크를 읽을 때의 상한"))
+        if (b.get("seqwrite_1m") or {}).get("w_mbs"):
+            PRE.append(("순차 쓰기 처리량", fmt(b["seqwrite_1m"]["w_mbs"], 0, " MB/s"), "참고값", "info", "segment flush·merge·복구 쓰기의 상한"))
+        if (b.get("seqread_1m") or {}).get("r_mbs"):
+            PRE.append(("순차 읽기 처리량", fmt(b["seqread_1m"]["r_mbs"], 0, " MB/s"), "참고값", "info", "merge·샤드 복구 읽기의 상한"))
+        judged = [r_[3] for r_ in PRE if r_[3] in ("ok", "caution", "warn")]
+        bench_sev = sev_max(*judged) if judged else "na"
         if sync_v and sync_v >= th["caution"]:
             add("warn" if sync_v >= th["warn"] else "caution", "지연", OUT if kind == "baremetal" else "원인 분리 필요",
                 "동기 쓰기(fsync) 한 건 지연이 기준보다 큼 (벤치 {} {})".format("p99" if fs_.get("sync_p99") else "평균", fmt(sync_v, 2, "ms")),
@@ -3366,10 +3530,24 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
     elif SEV_ORDER.get(es_sev, 0) >= SEV_ORDER["warn"] and disk_clean:
         verdict = ("risk", "ES에 처리 지연 신호가 있지만, 디스크 응답은 정상입니다",
                    "인덱싱 스로틀이나 요청 거절이 관측됐지만 같은 시간 디스크 응답시간은 기준 안이었습니다. 디스크보다는 CPU·heap·bulk 크기·샤드 설계 쪽 원인일 가능성이 큽니다.")
+    elif low_load and SEV_ORDER.get(runtime, 0) <= SEV_ORDER["caution"] and bench_sev != "na":
+        # 부하가 없는 상태(구축 전, 점검 시간) + 벤치 결과: 스토리지 자체가 ES 기준을 충족하는지로 판정
+        if bench_sev == "warn":
+            verdict = ("risk", "부하 전 점검: 스토리지가 ES 기준보다 느립니다",
+                       "ES 를 올리기 전 벤치에서 동기 쓰기 또는 무작위 읽기 한 건 지연이 판정 기준의 경고 수준이었습니다. "
+                       "부하가 붙으면 인덱싱·검색 지연으로 바로 드러납니다. 아래 'ES 운영 기준 대조'와 조치를 먼저 확인하세요.")
+        elif bench_sev == "caution" or SEV_ORDER.get(latent, 0) >= SEV_ORDER["warn"]:
+            verdict = ("risk", "부하 전 점검: 대체로 충족하지만 확인할 항목이 있습니다",
+                       "벤치로 잰 단건 지연이 기준 근처이거나, 운영 전에 바로잡을 설정·구성이 있습니다. 아래 항목을 확인하세요.")
+        else:
+            verdict = ("good", "부하 전 점검: 스토리지가 ES 기준을 충족합니다",
+                       "벤치로 잰 동기 쓰기·무작위 읽기 한 건 지연이 기준 안이고 구성상 위험도 없습니다. "
+                       "벤치 파일이 캐시에 들어가면 실제보다 좋게 나오므로, 운영 투입 후 피크 시간대에 한 번 더 수집하세요.")
     elif low_load and SEV_ORDER.get(runtime, 0) <= SEV_ORDER["caution"]:
         verdict = ("hold", "설정 점검은 완료, 성능 판정은 보류합니다",
                    "측정 시간대의 디스크 부하가 낮아(p95 {} IOPS, {} MB/s) 디스크가 부하를 견디는지 판단할 근거가 부족합니다. "
-                   "인덱싱·검색 피크 시간대에 다시 측정하세요.".format(fmt(A["iops_p95"], 0), fmt(A["mb_p95"], 1)))
+                   "인덱싱·검색 피크 시간대에 다시 측정하세요. 구축 전이라면 es_disk_bench.sh 를 먼저 돌린 뒤 다시 수집하면 "
+                   "ES 기준 충족 여부를 판정합니다.".format(fmt(A["iops_p95"], 0), fmt(A["mb_p95"], 1)))
     elif SEV_ORDER.get(latent, 0) >= SEV_ORDER["warn"] or SEV_ORDER.get(runtime, 0) == SEV_ORDER["caution"]:
         verdict = ("risk", "지금은 버티고 있지만 위험 요인이 있습니다",
                    "측정 구간의 디스크 응답은 심각하지 않지만, 부하가 늘거나 호스트 자원이 부족해지면 문제가 될 설정·구성이 있습니다.")
@@ -3442,7 +3620,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         "dev_guess": dev_guess, "A": A, "dev_stats": dev_stats, "log_stats": log_stats, "topo": topo,
         "agg": agg, "sysr": sysr, "findings": F, "dims": dims, "verdict": verdict, "n_act": n_act,
         "low_load": low_load, "klog": klog, "hist": hist, "es_rows": es_rows, "headroom": headroom,
-        "bench": bench, "overhead": overhead, "sysctl": sysctl, "virt": virt, "drivers": drivers,
+        "bench": bench, "PRE": PRE, "bench_sev": bench_sev, "overhead": overhead, "sysctl": sysctl, "virt": virt, "drivers": drivers,
         "CL": CL, "IDX": IDX, "BP": BP, "top": top, "q_ceiling": q_ceiling, "net_sev": net_sev, "nets": nets, "netinfo": netinfo, "dur": dur, "qd_total": qd_total, "qratio": qratio,
     }
 
@@ -3733,6 +3911,17 @@ def render(R, out_path):
             h.append('<tr><td>{}</td><td class="n">{}</td><td class="note">{}</td></tr>'.format(E(a), E(b), E(c)))
         h.append('</table>')
 
+    # 구축 전 적합성 (벤치가 있을 때)
+    if R.get("PRE"):
+        h.append('<h2>ES 운영 기준 대조 (벤치)</h2><p class="lead">es_disk_bench.sh 로 잰 스토리지 자체의 능력입니다. '
+                 '위 두 줄은 동시성 1 의 한 건 지연이라 부하와 상관없이 ES 의 기본 동작(요청마다 translog 동기 쓰기, '
+                 'page cache 에 없는 데이터 읽기)이 최소로 기다리는 시간이고, 이 리포트의 판정 기준({})으로 판정합니다. '
+                 '벤치 파일이 컨트롤러·스토리지 캐시에 들어가면 실제보다 좋게 나옵니다.</p>'.format(E(STORAGE_LABEL.get(R.get("storage"), ""))))
+        h.append('<table><tr><th>항목</th><th>측정값</th><th>기준</th><th>판정</th><th>의미</th></tr>')
+        for it, val, crit, st, why in R["PRE"]:
+            h.append('<tr><td>{}</td><td class="n">{}</td><td>{}</td><td class="s-{}"><b>{}</b></td><td class="note">{}</td></tr>'.format(
+                E(it), E(val), E(crit), st, SEV_LABEL.get(st, st), E(why)))
+        h.append('</table>')
     # 여유율
     if R["headroom"]:
         h.append('<h2>최대 능력 대비 사용률</h2><p class="lead">es_disk_bench.sh로 잰 최대 능력{}과 이번 측정의 p95를 비교했습니다. {}</p>'.format(

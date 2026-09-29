@@ -115,6 +115,18 @@ VMware 판정은 그대로다 (합성 번들 3종에서 0.9.5 와 판정 목록 
 - 셸 요약의 thin pool 파싱을 컬럼 위치 고정 대신 thin-pool 다음 칸 기준으로
 - 남은 업데이트 항목과 버전별 재확인 기준을 `docs/UPDATE_NOTES.md` 로 정리
 
+### 구축 전 점검과 형식 변형 대응
+- 구축 전 점검: ES 부하가 없을 때 `es_disk_bench.sh` 결과로 "부하 전 점검" 판정(충족 / 확인할 항목 있음 / 기준보다 느림).
+  동기 쓰기(translog fsync) 한 건, 무작위 읽기(cache miss 검색) 한 건 지연을 매체별 응답시간 기준으로 판정. 셸 요약·HTML 모두
+- 벤치에 무작위 읽기 동시성 1 측정(randread_4k_qd1) 추가. 벤치가 끝나면 구축 전이면 바로 `--no-es` 수집을 안내
+- 부하가 낮고 벤치도 없을 때의 보류 판정 문구를 HTML 과 셸에서 같게 맞추고, 구축 전이면 벤치를 먼저 돌리라고 안내
+- storcli2·perccli2: 키 이름(공백·snake_case)과 값 표기(Optimal·OPTIMAL·Write Back 등) 변형을 storcli 표기로 맞춰 읽음. 셸 요약도 같은 변형을 읽음
+- nvme amzn stats: JSON(한 줄·여러 줄), 텍스트 표, 단위 붙은 텍스트까지 읽음
+- merge 스레드 풀 대기가 측정 시작·끝 모두 쌓여 있으면 참고 판정
+- 벡터 rescoring direct IO(-Dvector.rescoring.directio=true)가 켜진 노드는 읽기가 page cache 를 거치지 않는다고 안내
+- vSAN Hybrid(OSA) 기준으로 분석하면 VCF 9.0 공지(향후 중단 예정)를 안내
+- 테스트: 33개 시나리오. 셸·HTML 판정 일치에 더해 매체 추정 여부 일치, EBS 형식 변형별 값 일치까지 검사
+
 ### SMART
 - bare-metal 에서는 기본으로 조회 (`--no-hw` 로 끔). VM 에서는 가상 장치라 건너뜀. RAID 컨트롤러 뒤 디스크는 컨트롤러 도구가 대신 봄
 

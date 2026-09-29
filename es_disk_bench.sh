@@ -2,7 +2,7 @@
 # =============================================================================
 # es_disk_bench.sh  (v0.10.0, 선택 사항)
 # ES data 디스크의 "최대 능력"을 측정합니다. → 리포트의 여유율 계산용
-# fio 가 있으면 fio 로 5가지(무작위 읽기, 순차 쓰기·읽기, 혼합, 동기 쓰기)를 재고,
+# fio 가 있으면 fio 로 6가지(무작위 읽기 최대·단건 지연, 순차 쓰기·읽기, 혼합, 동기 쓰기)를 재고,
 # 없으면 OS 기본 도구 dd 로 3가지(순차 쓰기·읽기, 동기 쓰기 지연)만 잽니다. 무작위 I/O 는 dd 로 잴 수 없습니다.
 #
 # ⚠ 이 스크립트는 디스크에 실제 부하를 겁니다. 반드시 아래 조건에서만 실행하세요.
@@ -27,6 +27,9 @@
 #   --force-with-es   ES 가 떠 있어도 실행 (영향을 감수할 때만)
 # 결과: <출력>/esbench_<host>_<ts>/*.json
 #       같은 서버에서 es_disk_collect.sh 를 실행하면 최근 결과를 자동으로 찾아 리포트에 넣습니다
+#
+# 구축 전 점검: ES 를 올리기 전에 이 스크립트를 돌리고 es_disk_collect.sh --no-es 로 수집하면
+#   리포트와 셸 요약이 "ES 운영 기준 충족 여부"를 판정합니다 (동기 쓰기·무작위 읽기 단건 지연 기준).
 #
 # 해석 주의: 테스트 파일이 vSAN 캐시 계층이나 RAID 컨트롤러·어레이 캐시에 들어가면
 #            결과가 실제보다 좋게 나옵니다.
@@ -144,11 +147,14 @@ if [[ $ENGINE == dd ]]; then
   }' > "$OUT/fsync_4k.json"
   echo "완료: $OUT"
   echo "ES 를 다시 올린 뒤 같은 서버에서 es_disk_collect.sh 를 실행하면 이 결과가 리포트에 자동으로 들어갑니다."
+echo "구축 전(ES 설치 전)이라면 지금 바로 es_disk_collect.sh --no-es -d 60 을 실행하세요. ES 운영 기준 충족 여부를 판정합니다."
   exit 0
 fi
 
 # 검색: 작은 무작위 읽기, 동시 요청 많음
 run randread_4k  --rw=randread  --bs=4k  --ioengine=libaio --iodepth=32 --numjobs=4
+# 검색이 page cache 에 없는 데이터를 읽을 때 한 건이 기다리는 시간: 동시성 1
+run randread_4k_qd1 --rw=randread --bs=4k --ioengine=psync --iodepth=1 --numjobs=1
 # segment flush·merge 쓰기: 큰 순차 쓰기
 run seqwrite_1m  --rw=write     --bs=1m  --ioengine=libaio --iodepth=8  --numjobs=1
 # merge 읽기·샤드 복구: 큰 순차 읽기
@@ -160,4 +166,5 @@ run fsync_4k     --rw=write     --bs=4k  --ioengine=psync  --iodepth=1  --numjob
 
 echo "완료: $OUT"
 echo "ES 를 다시 올린 뒤 같은 서버에서 es_disk_collect.sh 를 실행하면 이 결과가 리포트에 자동으로 들어갑니다."
+echo "구축 전(ES 설치 전)이라면 지금 바로 es_disk_collect.sh --no-es -d 60 을 실행하세요. ES 운영 기준 충족 여부를 판정합니다."
 echo "이미 만든 번들에 넣으려면: python3 es_disk_render.py <수집 번들> --bench $OUT"

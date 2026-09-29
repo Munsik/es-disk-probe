@@ -21,16 +21,19 @@ function sortn(a, n,   i, j, t) { for (i = 2; i <= n; i++) { t = a[i]; j = i - 1
 function pct(a, n, p,   k) { if (n < 1) return -1; sortn(a, n); k = int(p * (n - 1) + 0.5) + 1; return a[k] }
 function f1(x) { return (x < 0) ? "-" : sprintf("%.1f", x) }
 function f2(x) { return (x < 0) ? "-" : sprintf("%.2f", x) }
-# kind: run = 측정 결과(지연·포화·오류), cfg = 설정·구성 위험. 판정 문장은 HTML 리포트와 같은 규칙으로 고른다
+# kind: run = 측정 결과(지연·포화·오류), cfg = 설정·구성 위험, bench = es_disk_bench.sh 로 잰 스토리지 자체 능력.
+# 판정 문장은 HTML 리포트와 같은 규칙으로 고른다
 function add(sev, title, act, kind) { nf++; FS_[nf] = sev; FT[nf] = title; FA[nf] = act
-  if (kind == "run") { if (rank[sev] > wrun) wrun = rank[sev] } else if (rank[sev] > wcfg) wcfg = rank[sev] }
+  if (kind == "run") { if (rank[sev] > wrun) wrun = rank[sev] }
+  else if (kind == "bench") { if (rank[sev] > wbench) wbench = rank[sev] }
+  else if (rank[sev] > wcfg) wcfg = rank[sev] }
 function phys(k, depth,   s, out, i, n, arr) {
   if (depth > 8 || k == "") return ""
   if (k in part_parent) return phys(part_parent[k], depth + 1)
   if (k in slaves) { n = split(slaves[k], arr, " "); out = ""; for (i = 1; i <= n; i++) if (arr[i] != "") out = out " " phys(arr[i], depth + 1); return out }
   return " " k
 }
-BEGIN { rank["참고"] = 1; rank["주의"] = 2; rank["경고"] = 3; rank["위험"] = 4; wrun = 0; wcfg = 0 }
+BEGIN { rank["참고"] = 1; rank["주의"] = 2; rank["경고"] = 3; rank["위험"] = 4; wrun = 0; wcfg = 0; wbench = 0; nbj = 0 }
 FILENAME ~ /\/meta$/ { split($0, m, "="); meta[m[1]] = kv($0); next }
 FILENAME ~ /\/static\/virt$/ { split($0, m, "="); virt[m[1]] = kv($0); next }
 FILENAME ~ /\/static\/sysctl$/ { split($0, m, "="); sysctl[m[1]] = kv($0); next }
@@ -66,19 +69,30 @@ FILENAME ~ /\/static\/mdstat$/ { if ($0 ~ /\[[U_]*_[U_]*\]/) mddeg++; if ($0 ~ /
 FILENAME ~ /\/static\/raid_(storcli|ssacli|arcconf)$/ {
   # 벤더 RAID 도구 결과 (있을 때만). 상세 판정은 HTML 리포트, 여기서는 상태 이상만 잡는다
   l = $0
-  if (l ~ /"State" *: *"(Dgrd|Pdgd|OfLn)"/) raid_vd++
-  if (l ~ /"State" *: *"(Offln|UBad|Failed|Rbld)"/) raid_pd++
-  if (FILENAME ~ /storcli/ && l ~ /"Cache" *: *"[^"]*WT[^"]*"/) raid_wt++
-  if (l ~ /(Cachevault|BBU)/) inbb = 1
-  if (inbb && l ~ /"State" *: *"(Degraded|Failed|Learning)"/) raid_bat++
+  # storcli·perccli JSON 은 한 줄에 키 하나. 어느 목록 안인지(rctx)로 상태 값을 해석한다.
+  # storcli2·perccli2 는 키 이름·값 표기가 다를 수 있어 흔한 변형을 함께 본다
+  if (FILENAME ~ /storcli/) {
+    ll = tolower(l); gsub(/_/, " ", ll)
+    if (ll ~ /"(vd list|virtual drives?( list)?|logical drives?( list)?|ld list)" *: *\[/ || ll ~ /"\/c[0-9]+\/v[0-9]+" *: *\[/) rctx = "vd"
+    else if (ll ~ /"(pd list|physical drives?( list)?|drives?( list)?|pds for vd [0-9]+|drives for vd [0-9]+)" *: *\[/) rctx = "pd"
+    else if (ll ~ /(cachevault|bbu|energy ?pack|supercap)/ && ll ~ /[\[{] *$/) rctx = "bb"
+    if (ll ~ /"(state|vd state|drive state)" *: *"/) {
+      v = ll; sub(/.*: *"/, "", v); sub(/".*/, "", v)
+      if (rctx == "vd" && v ~ /^(dgrd|pdgd|ofln|degraded|partially degraded|offline)$/) raid_vd++
+      else if (rctx == "pd" && v ~ /^(offln|ubad|failed|rbld|offline|unconfigured bad|rebuild|rebuilding)$/) raid_pd++
+      else if (rctx == "bb" && v ~ /^(degraded|failed|learning|missing)$/) raid_bat++
+    }
+    if (rctx == "vd" && ll ~ /"(cache|write cache|cache policy|write policy)" *: *"[^"]*(wt|write ?-?through)[^"]*"/) raid_wt++
+  }
   if (l ~ /Status of [Ll]ogical [Dd]evice *: *(Degraded|Failed|Offline|Impacted)/ || l ~ /^ +Status: (Failed|Interim Recovery Mode|Recovering)/) raid_vd++
   if (l ~ /Battery\/Capacitor Status: *(Failed|Recharging|Not Fully Charged)/ || l ~ /Overall Backup Unit Status *: *(Failed|Degraded)/) raid_bat++
   if (l ~ /Cache Status: *(Temporarily|Permanently) Disabled/) raid_wt++
   if (l ~ /^ +State +: *(Failed|Offline)/) raid_pd++
   if (l !~ /^#TOOL_ABSENT/ && l != "") raid_tool = 1
   # 구성 디스크 매체: 컨트롤러가 알려 주면 rotational 추정 대신 이것을 쓴다
-  if (l ~ /"Med" *: *"SSD"/ || l ~ /Interface Type: Solid State/ || l ~ /(, SSD,|Device Type +: SSD)/) raid_ssd++
-  if (l ~ /"Med" *: *"HDD"/ || l ~ /Rotational Speed:/ || l ~ /(, HDD,|Device Type +: HDD)/) raid_hdd++
+  ln = tolower(l); gsub(/_/, " ", ln)
+  if (ln ~ /"(med|media|media type)" *: *"(ssd|nvme|solid state)/ || l ~ /Interface Type: Solid State/ || l ~ /(, SSD,|Device Type +: SSD)/) raid_ssd++
+  if (ln ~ /"(med|media|media type)" *: *"(hdd|hard disk)/ || l ~ /Rotational Speed:/ || l ~ /(, HDD,|Device Type +: HDD)/) raid_hdd++
   next }
 FILENAME ~ /\/static\/storage$/ {
   split($0, p, "|"); if (p[1] == "NVME") nv[p[2], p[3]] = p[4]; next }
@@ -89,28 +103,31 @@ FILENAME ~ /\/static\/procio_(start|end)$/ {
   } else if ($0 ~ /^\/proc\/[0-9]+\/comm:/) { split($0, a, "/"); pid = a[3]; c = $0; sub(/^[^:]*:/, "", c); comm[pid] = c }
   next }
 FILENAME ~ /\/static\/ebs_stats_(start|end)$/ {
-  # AWS EBS: 한도 초과 누적 시간(us). JSON 한 줄 또는 사람이 읽는 형식(섹션 제목 + IOPS/Throughput 줄)
+  # AWS EBS: 한도 초과 누적 시간(us). JSON(한 줄·여러 줄)과 텍스트(제목 + IOPS/Throughput 줄, 또는 이름: 값) 모두 읽는다
   es_ = (FILENAME ~ /start$/) ? 0 : 1
   if ($1 == "#DEV") { edev = $2; esec = ""; next }
-  l = tolower($0)
-  if (l ~ /^ *\{/) {
-    n_ = split(l, kv_, ",")
-    for (i = 1; i <= n_; i++) {
-      x = kv_[i]; v = x; sub(/.*: */, "", v); gsub(/[^0-9]/, "", v)
-      if (x ~ /volume[a-z_]*exceeded[a-z_]*iops/) ebs[es_, edev, "vol"] += v
-      else if (x ~ /volume[a-z_]*exceeded[a-z_]*(tp|throughput)/) ebs[es_, edev, "vol"] += v
-      else if (x ~ /instance[a-z_]*exceeded[a-z_]*iops/) ebs[es_, edev, "inst"] += v
-      else if (x ~ /instance[a-z_]*exceeded[a-z_]*(tp|throughput)/) ebs[es_, edev, "inst"] += v
-    }
-    ebsdev[edev] = 1; next
+  n_ = split(tolower($0), part_, ",")
+  for (i = 1; i <= n_; i++) {
+    x = part_[i]; hasn = (x ~ /[:=] *[0-9]+ *(us)? *[}]* *$/)
+    v = x; sub(/.*[:=] */, "", v); gsub(/[^0-9]/, "", v)
+    if (x ~ /exceeded/) {
+      sc = (x ~ /instance/) ? "inst" : ((x ~ /volume/) ? "vol" : esec)
+      mt = (x ~ /iops/) ? 1 : ((x ~ /throughput|(^|[^a-z])tp([^a-z]|$)/) ? 1 : 0)
+      if (hasn && mt && sc != "") { ebsv[es_, edev, sc, (x ~ /iops/) ? "i" : "t"] = v + 0; ebsdev[edev] = 1 }
+      else if (!hasn) esec = (sc != "") ? sc : "vol"
+    } else if (esec != "" && x ~ /^ *(iops|throughput|tp) *[:=] *[0-9]+/) {
+      ebsv[es_, edev, esec, (x ~ /iops/) ? "i" : "t"] = v + 0; ebsdev[edev] = 1
+    } else if (x !~ /:/ && x ~ /[a-z]/) esec = ""
   }
-  if (l ~ /performance exceeded/) { esec = (l ~ /instance/) ? "inst" : "vol"; next }
-  if (esec != "" && l ~ /^ *(iops|throughput) *: *[0-9]+/) { v = l; sub(/.*: */, "", v); ebs[es_, edev, esec] += v + 0; ebsdev[edev] = 1; next }
-  if (l ~ /exceeded/ && l ~ /: *[0-9]+/) {
-    v = l; sub(/.*: */, "", v); gsub(/[^0-9]/, "", v)
-    if (l ~ /volume/) ebs[es_, edev, "vol"] += v; else if (l ~ /instance/) ebs[es_, edev, "inst"] += v
-    ebsdev[edev] = 1
-  }
+  next }
+FILENAME ~ /\/bench\/[^\/]+\.json$/ {
+  # es_disk_bench.sh 결과. fio JSON 은 read·write·sync 절마다 percentile 이 있고, dd 결과는 sync_avg_ms 한 줄
+  bn = FILENAME; sub(/.*\//, "", bn); sub(/\.json$/, "", bn); if (!(bn in benchseen)) { benchseen[bn] = 1; nbf++ }
+  if ($0 ~ /^ *"(read|write|sync|trim)" *: *\{/) { bsec = $0; sub(/^ *"/, "", bsec); sub(/".*/, "", bsec) }
+  if ($0 ~ /"99\.000000" *: *[0-9]/ && !((bn, bsec) in bp99)) { v = $0; sub(/.*: */, "", v); gsub(/[^0-9.]/, "", v); bp99[bn, bsec] = v / 1e6 }
+  if ($0 ~ /"sync_avg_ms" *: *[0-9]/) { v = $0; sub(/.*"sync_avg_ms" *: */, "", v); sub(/[^0-9.].*/, "", v); bavg[bn] = v + 0 }
+  if ($0 ~ /^ *"iops" *: *[0-9]/ && bsec != "" && !((bn, bsec, "iops") in biops)) { v = $0; sub(/.*: */, "", v); gsub(/[^0-9.]/, "", v); biops[bn, bsec, "iops"] = v + 0 }
+  if ($0 ~ /^ *"bw" *: *[0-9]/ && bsec != "" && !((bn, bsec, "bw") in biops)) { v = $0; sub(/.*: */, "", v); gsub(/[^0-9.]/, "", v); biops[bn, bsec, "bw"] = v + 0 }
   next }
 FILENAME ~ /samples\.raw$/ {
   if ($1 == "#T") { ns++; t[ns] = $2; sec = ""; next }
@@ -236,7 +253,10 @@ END {
   }
   win = (ns >= 2) ? t[ns] - t[1] : 0
   for (d in ebsdev) if (win > 0) {
-    ev = (ebs[1, d, "vol"] - ebs[0, d, "vol"]) / 1e6; ei = (ebs[1, d, "inst"] - ebs[0, d, "inst"]) / 1e6
+    # IOPS·처리량 중 큰 쪽 (Python 판정과 같다)
+    ev = ebsv[1, d, "vol", "i"] - ebsv[0, d, "vol", "i"]; x = ebsv[1, d, "vol", "t"] - ebsv[0, d, "vol", "t"]; if (x > ev) ev = x
+    ei = ebsv[1, d, "inst", "i"] - ebsv[0, d, "inst", "i"]; x = ebsv[1, d, "inst", "t"] - ebsv[0, d, "inst", "t"]; if (x > ei) ei = x
+    ev /= 1e6; ei /= 1e6
     if (ev >= 0.01 * win) add((ev >= 0.1 * win) ? "경고" : "주의", "AWS EBS 볼륨 성능 한도 초과 " f1(ev) "초 (" d ", 측정 " int(win) "초 중)", "볼륨 IOPS·처리량 설정 상향 또는 볼륨 분산 (가상화·클라우드 관리자)", "run")
     if (ei >= 0.01 * win) add((ei >= 0.1 * win) ? "경고" : "주의", "EC2 인스턴스 EBS 한도 초과 " f1(ei) "초 (" d ", 측정 " int(win) "초 중)", "EBS 대역폭이 더 큰 인스턴스 유형으로 변경 (가상화·클라우드 관리자)", "run")
   }
@@ -276,9 +296,26 @@ END {
   for (pid in seen) { v = pio[1, pid] - pio[0, pid]; if (v <= 0 || !((0, pid) in pio)) continue; tot += v; if (pid == esp) esv = v; else if (v > topv) { topv = v; top1 = comm[pid] "(pid " pid ")" } }
   if (tot >= 52428800 && esp != "" && (tot - esv) / tot >= 0.3 && !lowload) add("주의", "ES 가 아닌 프로세스의 디스크 I/O 비중 " int(100 * (tot - esv) / tot) "% (상위: " top1 " " int(topv / 1048576) "MB)", "그 프로세스가 ES data 디스크를 쓰는지 확인")
 
+  # ── 구축 전 적합성 (벤치): translog fsync 한 건, page cache 에 없는 데이터 한 건 읽기. 판정 기준은 응답시간 기준과 같다
+  sv_ = -1; svl = ""
+  if (("fsync_4k", "sync") in bp99) { sv_ = bp99["fsync_4k", "sync"]; svl = "p99" }
+  else if ("fsync_4k" in bavg) { sv_ = bavg["fsync_4k"]; svl = "평균(dd)" }
+  rr1 = (("randread_4k_qd1", "read") in bp99) ? bp99["randread_4k_qd1", "read"] : -1
+  if (sv_ >= 0) { nbj++
+    if (sv_ >= c1) add((sv_ >= c2) ? "경고" : "주의", "벤치: 동기 쓰기(fsync) 한 건 " svl " " f2(sv_) " ms (기준 주의 " c1 " / 경고 " c2 " ms)", "쓰기 캐시 보호(전원 차단 보호 SSD, 배터리 보호 RAID 캐시)와 매체를 확인. bulk 요청마다 이 시간을 기다림", "bench")
+  }
+  if (rr1 >= 0) { nbj++
+    if (rr1 >= c1) add((rr1 >= c2) ? "경고" : "주의", "벤치: 무작위 읽기 한 건 p99 " f2(rr1) " ms (기준 주의 " c1 " / 경고 " c2 " ms)", "매체(HDD 여부), RAID·스토리지 경로, 공유 스토리지의 다른 부하를 확인", "bench")
+  }
+
   # ── 출력 ────────────────────────────────────────────────────────────
   if (wrun >= 3) verdict = "디스크 성능 저하 징후가 있습니다"
-  else if (lowload && wrun <= 2) verdict = "설정 점검은 완료, 성능 판정은 보류합니다 (측정 시간대 부하가 낮음. 피크 때 다시 실행)"
+  else if (lowload && wrun <= 2 && nbj > 0) {
+    if (wbench >= 3) verdict = "부하 전 점검: 스토리지가 ES 기준보다 느립니다"
+    else if (wbench == 2 || wcfg >= 3) verdict = "부하 전 점검: 대체로 충족하지만 확인할 항목이 있습니다"
+    else verdict = "부하 전 점검: 스토리지가 ES 기준을 충족합니다"
+  }
+  else if (lowload && wrun <= 2) { verdict = "설정 점검은 완료, 성능 판정은 보류합니다"; vnote = "측정 시간대 부하가 낮습니다. 피크 때 다시 실행하거나, 구축 전이라면 es_disk_bench.sh 를 먼저 돌린 뒤 다시 수집하세요" }
   else if (wcfg >= 3 || wrun == 2) verdict = "지금은 버티고 있지만 위험 요인이 있습니다"
   else verdict = "디스크는 정상입니다"
   mlab["nvme"] = "NVMe"; mlab["ssd"] = "SSD"; mlab["hdd"] = "HDD"; mlab["vmware"] = "VMware 공유 스토리지"; mlab["allflash"] = "vSAN All-Flash"
@@ -288,11 +325,19 @@ END {
   cont = virt["detect_virt_container"]; if (cont == "" && virt["detect_virt"] ~ /^(docker|podman|lxc|lxc-libvirt|systemd-nspawn|openvz|rkt|wsl|proot|pouch|container-other)$/) cont = virt["detect_virt"]
   if (cont != "" && cont != "none") printf "주의: 컨테이너(%s) 안에서 실행한 결과입니다. 가능하면 호스트에서 다시 실행하세요\n", cont
   printf "판정 기준 %s%s · 응답시간 주의 %s / 경고 %s / 위험 %s ms\n", (media in mlab) ? mlab[media] : media, (unsure ? " (추정)" : ""), c1, c2, c3
-  printf "\n판정: %s\n\n", verdict
+  printf "\n판정: %s\n", verdict
+  if (vnote != "") printf "      %s\n", vnote
+  printf "\n"
   printf "응답시간 p95  읽기 %s ms · 쓰기 %s ms  → %s\n", f2(rp), f2(wp), latj
   printf "부하 p95      IOPS %s · %s MB/s · aqu-sz %s%s · %%util %s\n", f1(ip), f1(mp_), f1(qp), (qd > 0 ? " / queue_depth " qd : ""), f1(up)
   if (hasf && tf > 0) printf "flush         초당 %s회 · 평균 %s ms\n", f1(tf / tdt), f2(tft / tf)
   printf "포화          PSI io full p95 %s%% · ES D 상태 스레드 p95 %s\n", (np_ ? f1(pp) : "-"), (nds ? dp : "-")
+  if (nbf > 0) {
+    printf "벤치          동기 쓰기 한 건 %s · 무작위 읽기 한 건 %s", (sv_ >= 0 ? svl " " f2(sv_) " ms" : "-"), (rr1 >= 0 ? "p99 " f2(rr1) " ms" : "-")
+    if (("randread_4k", "read", "iops") in biops) printf " · 무작위 읽기 최대 %s IOPS", int(biops["randread_4k", "read", "iops"])
+    if (("seqwrite_1m", "write", "bw") in biops) printf " · 순차 쓰기 %s MB/s", int(biops["seqwrite_1m", "write", "bw"] / 1024)
+    printf "\n"
+  }
   if (nf) {
     printf "\n확인할 항목 (심각한 순)\n"
     for (r = 4; r >= 1; r--) for (i = 1; i <= nf; i++) if (rank[FS_[i]] == r) printf "  [%s] %s\n         → %s\n", FS_[i], FT[i], FA[i]
@@ -306,4 +351,5 @@ END {
    $( for r in raid_storcli raid_ssacli raid_arcconf; do [[ -r "$S/$r" ]] && echo "$S/$r"; done ) \
    $( [[ -r "$S/procio_start" ]] && echo "$S/procio_start" "$S/procio_end" ) \
    $( [[ -s "$S/ebs_stats_start" && -s "$S/ebs_stats_end" ]] && echo "$S/ebs_stats_start" "$S/ebs_stats_end" ) \
+   $( ls "$B"/bench/*.json 2>/dev/null ) \
    "$B/samples.raw" 2>/dev/null | tee "$B/summary.txt"

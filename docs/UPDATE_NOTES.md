@@ -4,17 +4,43 @@
 대조 기준: Elasticsearch 9.5.4, VMware Cloud Foundation·vSphere 9.1, RHEL 10, Linux kernel master 문서
 
 이 문서는 두 가지를 정리합니다.
-하나는 아직 끝나지 않은 업데이트 항목이고, 다른 하나는 새 버전이 나올 때 다시 확인해야 할 기준값과 그 출처입니다.
+하나는 업데이트 항목(반영 완료와 남은 것)이고, 다른 하나는 새 버전이 나올 때 다시 확인해야 할 기준값과 그 출처입니다.
 이미 반영한 변경은 `CHANGELOG.md` 0.10.0 의 "최신 공식 문서 대조" 항목에 있습니다.
 
 ---
 
 ## 1. 남은 업데이트 항목
 
-우선순위 순서입니다. "필요한 것"이 갖춰지면 바로 반영할 수 있습니다.
+실제 장비 출력 없이 할 수 있는 것은 모두 반영했습니다. 반영 방식은 "예상 형식 여러 개로 만든 입력을 돌려, 형식이 조금 달라도 같은 결론이 나오는지" 확인하는 것입니다.
+이 방식은 파서가 깨지지 않고, 못 읽으면 못 읽었다고 알리는지까지 보장합니다. 실제 키 이름이 맞는지는 보장하지 않습니다.
 
-| # | 항목 | 현재 상태 | 필요한 것 | 반영 위치 |
-|---|---|---|---|---|
+### 반영 완료 (2026-09-29)
+
+| 항목 | 반영 내용 | 검증 |
+|---|---|---|
+| storcli2·perccli2 JSON | 키 이름(공백, snake_case, 목록 옆 개수 필드)과 값 표기(Optimal·OPTIMAL, Write Back·WB 등)를 storcli 표기로 맞춰 읽음. 셸 요약도 같음 | 변형 3종 + 해석 불가 1종 |
+| AWS `nvme amzn stats` | JSON 한 줄·여러 줄, ebsnvme 텍스트, "이름 : 값" 표, 단위 붙은 텍스트 | 4종 모두 같은 값으로 읽히는지 Python·셸 각각 검사 |
+| merge 스레드 풀 | 시작·끝 두 시점 모두 대기가 쌓여 있으면 참고 판정 | 시나리오 1종 |
+| ES 벡터 direct IO | `-Dvector.rescoring.directio=true` 노드는 읽기가 page cache 를 거치지 않는다고 안내 | 시나리오 1종 |
+| vSAN OSA hybrid 중단 예정 | `-s hybrid` 로 분석하면 VCF 9.0 공지 안내 | 시나리오 1종 |
+| 구축 전 점검 | 벤치 결과로 ES 운영 기준 충족 여부 판정 | 시나리오 4종 + 실제 dd 벤치 실행 |
+
+### 실제 장비나 문서가 있어야 끝나는 것
+
+| # | 항목 | 지금 상태 | 끝내려면 |
+|---|---|---|---|
+| 1 | storcli2·perccli2 실제 키 이름 | 변형 대응으로 대부분 읽겠지만 확정은 아님. 못 읽으면 원문 보존 후 알림 | MegaRAID 96xx 또는 PERC 12 의 `show all J` 출력 1건 |
+| 2 | storcli·ssacli·arcconf 실제 출력 | 공개 레이블로 만든 합성 출력으로만 검증 | 각 도구 실제 출력 (정상 1건, 이상 1건) |
+| 3 | nvme-cli `amzn stats` 실제 텍스트 | 가능한 형식 4종 대응 | EC2 에서 출력 1건 |
+| 4 | HPE Gen11·Gen12 도구 매핑 | SR 은 ssacli, MR 은 storcli 로 봄 | HPE 문서 또는 서버의 `proc_name` |
+| 5 | Lenovo·Supermicro RAID | Broadcom 기반이라 storcli 로 봄 | 벤더 문서 |
+| 6 | Microchip arcconf + smartpqi | SmartRAID 3100·3200 은 arcconf 로 봄 | Microchip 사용자 가이드 |
+| 7 | GCP Hyperdisk 모델명 | `nvme_card-pd` 로 봄 | C3·H3 인스턴스의 모델명 |
+| 8 | Azure·GCP 한도 초과 지표 | VM 안에서 볼 지표가 없어 모양 판정만 | 게스트 도구나 문서가 나오면 반영 |
+| 9 | vSAN ESA 전용 지연 기준 | flash 기준(5ms) 사용 | Broadcom 이 ESA 기준을 내면 교체 |
+| 10 | ES `on_disk_rescore` (9.3 preview) | 매핑 옵션이라 수집하지 않음 | 벡터 노드 진단이 필요해지면 매핑 조회 추가 |
+
+---|---|---|---|---|
 | 1 | storcli2·perccli2 JSON 해석 | 조회는 하지만 키 이름이 공개 문서로 확정되지 않았습니다. 해석을 못 하면 원문을 번들에 남기고 리포트에 알립니다 | MegaRAID 96xx 또는 Dell PERC 12(H965i 등) 장비에서 받은 `storcli2 /call show all J`, `/call/vall show all J`, `/c0/eall/sall show all J` 출력 | `es_disk_render.py` parse_storcli, `es_disk_summary.sh` raid 블록, `tests/make_bundle.py` |
 | 2 | 실제 장비 출력으로 RAID 파서 검증 | storcli·ssacli·arcconf 파서는 공개 레이블로 만든 합성 출력으로만 검증했습니다 | 각 도구의 실제 출력 (정상 1건, 캐시·배터리 이상 1건이면 충분) | 같은 위치, 테스트 시나리오 교체 |
 | 3 | AWS `nvme amzn stats` 출력 형식 | JSON(`-o json`)과 ebsnvme 사람이 읽는 형식을 모두 읽게 만들었습니다. nvme-cli 텍스트 형식은 실물을 보지 못했습니다 | EBS 를 쓰는 EC2 에서 `nvme amzn stats /dev/nvme1n1` 과 `-o json` 출력 | `parse_ebs_stats`, 셸 요약의 ebs 블록 |

@@ -47,7 +47,7 @@ cron이나 systemd timer로 반복 실행하도록 만들지 마세요. 측정 �
 - SAN을 쓰는 노드에서 서버 쪽(HBA 큐, 경로) 문제인지 스토리지 어레이 문제인지 갈라야 할 때
 - 인덱싱 지연이나 검색 지연의 원인이 디스크인지 확인해야 할 때
 - VMware·스토리지 관리자나 하드웨어 유지보수 쪽에 "느리다"가 아니라 측정 근거를 들고 가야 할 때
-- 신규 구축이나 증설 직전에 OS 설정과 서버·VM 구성이 권고에 맞는지 한 번 훑을 때
+- 신규 구축이나 증설 직전에 스토리지가 ES 운영 기준을 충족하는지, OS 설정과 서버·VM 구성이 권고에 맞는지 확인할 때 (아래 "구축 전 점검")
 - 폐쇄망이라 외부 도구를 들이기 어려울 때
 
 이럴 때는 쓰지 마세요.
@@ -304,6 +304,27 @@ flush         초당 40.0회 · 평균 9.00 ms
 같은 내용이 번들 안 `summary.txt` 로 남습니다. 서버에 Python 3.6+ 가 있으면 HTML 리포트도 같이 만듭니다.
 HTML 리포트에는 병목 위치 판정, 클러스터 비교, 인덱스별 분포, 항목마다 근거와 출처가 더 들어 있습니다.
 
+### 구축 전 점검 (ES 를 올리기 전)
+
+ES 가 없거나 부하가 없으면 기본 수집은 "성능 판정 보류"를 냅니다. 이때는 벤치를 먼저 돌린 뒤 수집합니다.
+
+```bash
+sudo ./es_disk_bench.sh -t /data/es     # ES data 로 쓸 경로. 실제 부하를 겁니다 (fio 없으면 dd)
+sudo ./es_disk_collect.sh --no-es -d 60  # 방금 잰 벤치 결과를 자동으로 넣어 판정
+```
+
+ES 가 스토리지에서 가장 자주 기다리는 두 가지를 봅니다. 기준은 운영 중 응답시간 판정과 같은 매체별 기준입니다.
+
+| 항목 | 측정 | 의미 |
+|---|---|---|
+| 동기 쓰기 한 건 | fio 4KiB fsync p99 (dd 는 평균) | translog fsync. bulk 요청마다 기다리는 시간 |
+| 무작위 읽기 한 건 | fio 4KiB randread 동시성 1 p99 (fio 가 있을 때만) | page cache 에 없는 segment 를 읽는 검색이 기다리는 시간 |
+| 무작위 읽기 최대, 순차 쓰기·읽기 | fio | 참고값. 운영 후 여유율 계산에 씀 |
+
+판정은 "스토리지가 ES 기준을 충족합니다", "대체로 충족하지만 확인할 항목이 있습니다", "ES 기준보다 느립니다" 셋 중 하나입니다.
+설정·구성 점검(readahead, 스케줄러, max_map_count, RAID 캐시 등)도 함께 나옵니다.
+벤치 파일이 RAID·어레이 캐시에 들어가면 실제보다 좋게 나오므로, 운영 투입 후 피크 시간대에 한 번 더 수집하세요.
+
 ### 알아서 판단하는 것
 
 사용자가 정할 필요가 없도록 아래는 도구가 자동으로 정합니다. 자동 판단이 틀렸을 때만 옵션으로 바꾸세요.
@@ -488,7 +509,8 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | 지금은 버티지만 위험 요인이 있습니다 | 측정값은 괜찮으나 부하가 늘거나 호스트가 경합하면 문제 될 설정이 있음 |
 | ES에 처리 지연 신호가 있지만 디스크 응답은 정상 | 원인이 디스크 밖(CPU, heap, bulk, 샤드)일 가능성 |
 | 성능 저하 징후 | 측정 중에 디스크 지연, 포화, 오류를 관측 |
-| 성능 판정 보류 | 측정한 시간대의 부하가 낮아 판단 근거가 부족. 피크 때 다시 측정 |
+| 성능 판정 보류 | 측정한 시간대의 부하가 낮아 판단 근거가 부족. 피크 때 다시 측정하거나, 구축 전이면 벤치 후 수집 |
+| 부하 전 점검: 충족 / 확인할 항목 있음 / 기준보다 느림 | 부하 없이 벤치 결과로 낸 판정. 위 "구축 전 점검" 참고 |
 
 병목 위치는 응답시간이 기준을 넘었을 때만 판정합니다.
 큐 사용률(aqu-sz ÷ queue_depth 합계)로 세 구간으로 나눕니다. 구간은 같고, 각 구간의 뜻과 담당자는 플랫폼마다 다릅니다.
@@ -600,7 +622,7 @@ RAID 컨트롤러 캐시는 커널의 `queue/write_cache` 값으로 판단하지
 실제 서버 없이 플랫폼·매체·부하 조합별 판정을 확인할 수 있습니다. Python 표준 라이브러리만 씁니다.
 
 ```bash
-python3 tests/run_tests.py                 # 22개 시나리오 기대 판정 검사
+python3 tests/run_tests.py                 # 33개 시나리오 기대 판정 + 셸·HTML 판정 일치 검사
 ./es_disk_summary.sh <번들 디렉터리>         # 셸 요약 판정만 따로
 python3 tests/run_tests.py --dump /tmp/t   # 시나리오별 HTML 리포트와 판정 목록(JSON) 저장
 python3 tests/make_bundle.py --list        # 시나리오 목록
@@ -618,9 +640,11 @@ python3 tests/make_bundle.py --list        # 시나리오 목록
 | `path.data` 표기 5종 파싱 | 통과 |
 | HTML과 차트 | 태그 검증 + 가짜 DOM 실행 검증 통과 |
 | 호환성 | Python 3.6 문법, bash 4.2, mawk 검사 통과 |
-| 셸 요약 판정 | 합성 번들 22종 모두 HTML 판정과 결론 일치. `tests/run_tests.py` 가 매번 비교 (gawk 없는 mawk 환경에서도 확인) |
-| 플랫폼별 판정 | 합성 번들 22종 통과 (`python3 tests/run_tests.py`): VMware 5(vSAN·기본·VMFS), bare-metal NVMe 2, HDD RAID, md SSD stripe, FC SAN, Ceph RBD, RAID 도구 5(perccli·ssacli·arcconf·도구 없음·perccli2 해석 불가), KVM, AWS EBS 2(한도 모양·Nitro 보고), ECK, 컨테이너, OS 기본 점검 |
-| RAID 도구 출력 해석 | storcli JSON 키는 Prometheus storcli exporter 가 쓰는 키, ssacli·arcconf 는 공개된 출력 레이블을 기준으로 만든 합성 출력으로만 검증. 실제 장비 출력 확인 필요 |
+| 셸 요약 판정 | 합성 번들 33종 모두 HTML 판정과 결론 일치, 매체 추정 여부도 일치. `tests/run_tests.py` 가 매번 비교 (mawk·gawk 모두 확인) |
+| 플랫폼별 판정 | 합성 번들 33종 통과: VMware 6(vSAN All-Flash·Hybrid·기본·VMFS), bare-metal NVMe 2, HDD RAID, md SSD stripe, FC SAN, Ceph RBD, RAID 도구 8, KVM, AWS EBS 4, ECK, 컨테이너, OS 기본 점검, 구축 전 4, ES merge·벡터 direct IO |
+| RAID 도구 출력 해석 | storcli JSON 키는 Prometheus storcli exporter 가 쓰는 키, ssacli·arcconf 는 공개된 출력 레이블로 만든 합성 출력으로 검증. storcli2·perccli2 는 키 이름·값 표기를 바꾼 변형 3종(공백·snake_case·개수 필드 동반)과 해석 불가 1종으로 검증. 실제 장비 출력은 미확인 |
+| AWS EBS 통계 해석 | JSON(한 줄·여러 줄), ebsnvme 텍스트, "이름 : 값" 표, 단위(us) 붙은 텍스트 4종으로 검증. 실제 nvme-cli 출력은 미확인 |
+| 구축 전 판정 | fio JSON(동기 쓰기·단건 읽기)과 dd 결과로 검증. 이 컨테이너에서 dd 벤치 → `--no-es` 수집 실제 실행으로 셸·HTML 판정 일치 확인 |
 | 0.9.x → 0.10 회귀 | VMware 합성 번들 3종의 판정 목록이 0.9.5와 동일 |
 | 실제 vSphere Guest | 미검증 |
 | 실제 bare-metal (NVMe, RAID, SAN), 클라우드, Kubernetes | 미검증 |
@@ -659,8 +683,9 @@ RAID 컨트롤러가 논리 디스크의 `rotational` 을 1로 보고하는 경�
 ## 로드맵
 
 - [ ] 실제 vSphere 환경과 bare-metal(NVMe, 하드웨어 RAID, FC SAN) 검증 후 v1.0.0
-- [ ] 클라우드 볼륨(EBS, Azure Disk, PD)의 IOPS·처리량 한도 대비 사용률 판정
-- [ ] RAID 컨트롤러 벤더 도구(storcli, perccli, ssacli) 출력이 있으면 캐시·배터리 상태 판정
+- [x] AWS EBS 한도 초과 시간 판정 (nvme amzn stats). Azure·GCP 는 VM 안에서 볼 지표가 없어 모양 판정만
+- [x] RAID 컨트롤러 벤더 도구(storcli·perccli·storcli2·perccli2, ssacli, arcconf) 캐시·배터리·구성 디스크 판정
+- [x] 구축 전 점검: 벤치 결과로 ES 운영 기준 충족 여부 판정
 - [ ] esxtop 출력 대조 가이드
 - [ ] baseline 비교 모드. 이전 번들과의 차이 표시
 - [ ] 리포트 영문 출력 옵션
