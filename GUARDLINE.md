@@ -1,4 +1,4 @@
-# Elasticsearch 노드 디스크 Guardline (VMware vSAN · bare-metal)
+# Elasticsearch 노드 디스크 Guardline (VMware · bare-metal · SAN)
 
 이 문서는 디스크 때문에 Elasticsearch가 불안정해지는 일을 **미리 막기 위한 기준**입니다.
 진단 도구(`es_disk_collect.sh`)이 점검하는 항목과 기준값이 같습니다. 리포트의 "Best practice 대조표"와 나란히 보면 됩니다.
@@ -34,6 +34,9 @@ Guest OS에서는 바꿀 수 없고, 나중에 바꾸려면 VM 정지나 데이�
 
 **쓰기 증폭 계산을 설계에 넣으세요.** ES replica 1 + vSAN FTT=1(RAID-1)이면 문서 하나가 물리적으로 4벌 기록됩니다. ES와 vSAN이 각자 가용성을 보장하므로, 용량과 쓰기 대역폭 산정 때 이 배수를 반드시 포함해야 합니다. replica를 줄일지 여부는 가용성 요구와 함께 판단할 문제이고, 디스크만 보고 결정할 일은 아닙니다.
 
+**VMware 데이터스토어가 SAN(VMFS)·NFS라면** 위 표의 vSAN 항목 대신 어레이 쪽 기준을 봅니다. 볼륨 RAID 레벨, 어레이 쓰기 캐시와 복제 방식,
+Storage I/O Control·디스크 IOPS 한도, ESXi 경로 정책(Round Robin 등)입니다. 진단 도구에는 `-s vmfs` 로 알려 주면 안내가 맞춰집니다.
+
 ---
 
 ## 1-B. 설계 단계: bare-metal 서버와 스토리지 (서버·하드웨어 담당자 영역)
@@ -47,6 +50,7 @@ Guest OS에서는 바꿀 수 없고, 나중에 바꾸려면 VM 정지나 데이�
 | 여러 디스크 묶기 | RAID 0 또는 LVM stripe | ES replica가 이중화를 맡습니다. RAID 1/10과 겹치면 같은 문서를 여러 벌 씁니다 | [Elastic] |
 | RAID 5/6 | hot 노드에는 피함 | 쓰기마다 읽기-수정-쓰기가 생깁니다 | [실무] |
 | 컨트롤러 캐시 | 배터리(또는 flash) 보호 write-back. 배터리 상태 정기 점검 | 캐시가 write-through로 바뀌면 fsync마다 디스크까지 가서 쓰기 지연이 크게 늘어납니다 | [실무] |
+| RAID 관리 도구 | 벤더 도구(storcli·perccli, ssacli, arcconf)를 OS에 설치해 둠 | 진단 도구가 캐시·배터리·구성 디스크 상태를 자동으로 봅니다. 장애 때 확인 시간도 줄어듭니다 | [실무] |
 | NVMe 냉각 | 드라이브 베이 공기 흐름 확보, 빈 슬롯 블랭크 장착 | 경고 온도(WCTEMP)를 넘으면 장치가 스스로 성능을 낮춥니다 | [OS] NVMe 규격 |
 | NVMe 슬롯 | 장치가 지원하는 PCIe 세대·레인 수로 연결되는 슬롯 | 링크가 낮게 잡히면 최대 처리량이 그만큼 줄어듭니다 | [OS] |
 | BIOS 전원 정책 | 성능 우선 프로파일 검토 (벤더 가이드 확인) | 절전 상태에서 깨어나는 시간이 I/O 완료 처리에 더해집니다 | [실무] |

@@ -15,7 +15,7 @@
 #     -p PATH       ES data 경로 (여러 번 지정 가능, 미지정 시 자동 탐지)
 #     -o DIR        결과 저장 위치 (기본 /tmp. ES data 와 같은 디스크면 다른 디스크로 자동 변경)
 #     -s TYPE       스토리지 유형 (기본 auto: 플랫폼과 장치를 보고 자동 판정)
-#                   VMware vSAN: allflash | hybrid
+#                   VMware: allflash | hybrid (vSAN), vmfs (SAN·NFS 데이터스토어)
 #                   bare-metal·SAN: nvme | ssd | hdd (RAID 컨트롤러 뒤라 매체를 못 읽을 때 지정)
 #     --platform P  플랫폼 강제 지정: auto | vmware | baremetal | vm (기본 auto)
 #     --es-url URL  ES 주소 (기본 자동: ES 프로세스가 열어 둔 포트를 http → https 순서로 시도)
@@ -30,8 +30,9 @@
 #     --no-eslog    ES 서버 로그 읽기만 생략 (부가 수집 중 읽기량이 가장 큰 항목)
 #     --no-index-stats  인덱스 수에 비례해 커지는 ES 조회 생략 (샤드가 많으면 자동 생략)
 #                   (_nodes/_local/stats?level=indices, _ilm/explain)
-#     --smart       smartctl 로 디스크 상태(SMART) 읽기. 기본은 꺼짐
-#                   읽기 전용 명령이지만 /proc·/sys 가 아니라 장치에 직접 명령을 보내므로 선택 사항
+#     --no-hw       하드웨어 상태 조회를 끔 (bare-metal 에서 자동으로 하는 SMART, RAID 컨트롤러 조회)
+#                   조회는 모두 읽기 전용이고 모니터링 에이전트가 주기적으로 하는 것과 같은 명령입니다
+#     --smart       VM 에서도 SMART 를 읽음 (보통은 필요 없음. 가상 디스크의 SMART 는 의미가 없음)
 #
 # 부하 (실측, 300초/5초 간격 기준):
 #   CPU 약 1.2초 (측정 시간 대비 CPU 1개의 0.4%), 메모리 12MB 미만,
@@ -47,7 +48,7 @@ umask 077
 export LC_ALL=C
 
 VERSION="0.10.0"
-DUR=300; INT=5; OUT_BASE="/tmp"; OUT_GIVEN=0; STORAGE="auto"; PLATFORM="auto"; SMART=0
+DUR=300; INT=5; OUT_BASE="/tmp"; OUT_GIVEN=0; STORAGE="auto"; PLATFORM="auto"; SMART=0; HW=1
 ES_URL=""; ES_USER=""; NO_ES=0; NO_RENDER=0; NO_CLUSTER=0
 NO_ESLOG=0; NO_KLOG=0; NO_SAR=0; NO_MAPS=0; NO_IDXSTATS=0
 USER_PATHS=()
@@ -69,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --no-index-stats) NO_IDXSTATS=1; shift ;;
     --platform)  PLATFORM="$2"; shift 2 ;;
     --smart)     SMART=1; shift ;;
+    --no-hw)     HW=0; shift ;;
     -h|--help) awk 'NR>1 && /^#/{print;next} NR>1{exit}' "$0"; exit 0 ;;
     *) echo "알 수 없는 옵션: $1"; exit 1 ;;
   esac
@@ -77,7 +79,7 @@ ES_PASSWORD="${ES_PASSWORD:-}"; ES_API_KEY="${ES_API_KEY:-}"
 
 [[ "$INT" =~ ^[0-9]+$ && "$INT" -ge 1 ]] || { echo "-i 는 1 이상 정수"; exit 1; }
 [[ "$DUR" =~ ^[0-9]+$ && "$DUR" -ge $((INT*3)) ]] || { echo "-d 는 간격의 3배 이상"; exit 1; }
-case "$STORAGE" in auto|allflash|hybrid|nvme|ssd|hdd) ;; *) echo "-s 는 auto|allflash|hybrid|nvme|ssd|hdd"; exit 1 ;; esac
+case "$STORAGE" in auto|allflash|hybrid|vmfs|nvme|ssd|hdd) ;; *) echo "-s 는 auto|allflash|hybrid|vmfs|nvme|ssd|hdd"; exit 1 ;; esac
 case "$PLATFORM" in auto|vmware|baremetal|vm) ;; *) echo "--platform 은 auto|vmware|baremetal|vm"; exit 1 ;; esac
 ES_URL="${ES_URL%/}"        # 뒤 슬래시 제거. 붙어 있으면 //_cluster/health 로 요청이 나감
 
@@ -105,6 +107,12 @@ N_ES=$(for p in $(pgrep -x java 2>/dev/null); do grep -qa 'org.elasticsearch.boo
 ES_CMDLINE=""; [[ -n "$ES_PID" ]] && ES_CMDLINE=$(tr '\0' ' ' < /proc/$ES_PID/cmdline 2>/dev/null)
 CONF_DIR=$(printf '%s' "$ES_CMDLINE" | grep -oE 'es\.path\.conf=[^ ]+' | head -1 | cut -d= -f2)
 CONF_DIR=${CONF_DIR:-${ES_PATH_CONF:-/etc/elasticsearch}}
+# ES 가 컨테이너(ECK, Docker) 안에 있으면 경로는 컨테이너 기준이다. 호스트에서는 /proc/<pid>/root 를 거쳐 읽는다
+ES_ROOT=""
+if [[ -n "$ES_PID" && "$(readlink /proc/$ES_PID/ns/mnt 2>/dev/null)" != "$(readlink /proc/self/ns/mnt 2>/dev/null)" ]]; then
+  ES_ROOT="/proc/$ES_PID/root"
+  msg "ES 가 컨테이너 안에서 실행 중입니다 (pid $ES_PID). 컨테이너의 mount 정보로 data 디스크를 찾습니다"
+fi
 
 # elasticsearch.yml 의 path.data. 한 줄(path.data: /a, [/a, /b])과 중첩(path:\n  data: ...), 목록(- /a) 표기를 모두 읽는다
 yml_data_paths() {
@@ -124,15 +132,20 @@ DATA_PATHS=()
 for p in ${USER_PATHS[@]+"${USER_PATHS[@]}"}; do DATA_PATHS+=("$p"); done
 while read -r p; do [[ -n "$p" ]] && DATA_PATHS+=("$p"); done < <(
   printf '%s' "$ES_CMDLINE" | grep -oE 'path\.data=[^ ]+' | cut -d= -f2 | tr ',' '\n'
-  yml_data_paths "$CONF_DIR/elasticsearch.yml")
-[[ ${#DATA_PATHS[@]} -eq 0 && -d /var/lib/elasticsearch ]] && DATA_PATHS+=(/var/lib/elasticsearch)
+  yml_data_paths "$ES_ROOT$CONF_DIR/elasticsearch.yml")
+# 기본 경로: 패키지 설치는 /var/lib/elasticsearch, 공식 컨테이너 이미지(ECK 포함)는 /usr/share/elasticsearch/data
+if [[ ${#DATA_PATHS[@]} -eq 0 ]]; then
+  for dflt in /var/lib/elasticsearch /usr/share/elasticsearch/data; do
+    [[ -d "$ES_ROOT$dflt" ]] && { DATA_PATHS+=("$dflt"); break; }
+  done
+fi
 
 # 결과 저장 위치: -o 를 안 줬으면 ES data 와 다른 파일시스템이면서 여유가 50MB 이상인 곳을 고른다.
 # 측정 대상 디스크에 결과를 쓰면 그만큼 측정값이 오염되기 때문이다
 same_fs_as_data() {
   local d dev; dev=$(stat -c %d "$1" 2>/dev/null) || return 1
   for d in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do
-    [[ -e "$d" && "$(stat -c %d "$d" 2>/dev/null)" == "$dev" ]] && return 0
+    [[ -e "$ES_ROOT$d" && "$(stat -c %d "$ES_ROOT$d" 2>/dev/null)" == "$dev" ]] && return 0
   done
   return 1
 }
@@ -174,6 +187,21 @@ read -r UP0 _ < /proc/uptime; echo "start_uptime=$UP0" >> "$OUT/meta"
 for p in ${USER_PATHS[@]+"${USER_PATHS[@]}"}; do printf '%s\n' "$p" >> "$OUT/user_paths"; done
 # 수집기가 찾은 data 경로 후보 (ES 가 내려가 있어도 분석기가 장치를 특정할 수 있게)
 for p in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do printf '%s\n' "$p"; done > "$S/data_paths"
+# data 경로가 실제로 올라가 있는 블록 장치. ES 프로세스(없으면 이 셸)의 mountinfo 에서 major:minor 를 읽어
+# /sys/dev/block 으로 장치 이름을 찾는다. 컨테이너처럼 경로가 호스트와 달라도 장치는 정확히 잡힌다
+MI="/proc/${ES_PID:-self}/mountinfo"; [[ -r "$MI" ]] || MI=/proc/self/mountinfo
+for p in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do
+  awk -v p="$p" '
+    { mp = $5; gsub(/\\040/, " ", mp)
+      if (p == mp || index(p, (mp == "/" ? "/" : mp "/")) == 1) {
+        if (length(mp) > bl) { bl = length(mp); best = $3 "|" mp; for (i = 7; i <= NF; i++) if ($i == "-") { best = best "|" $(i+1) "|" $(i+2); break } }
+      } }
+    END { if (best != "") print best }' "$MI" 2>/dev/null | while IFS='|' read -r mm mp fst src; do
+      kn=$(readlink "/sys/dev/block/$mm" 2>/dev/null); kn=${kn##*/}
+      printf 'DATADEV|%s|%s|%s|%s|%s|%s\n' "$p" "$mm" "${kn:-?}" "$fst" "$src" "$mp"
+    done
+done > "$S/datadev" 2>/dev/null
+[[ -n "$ES_ROOT" ]] && echo "es_in_container=1" >> "$OUT/meta"
 
 msg "수집 시작 → $OUT  (측정 ${DUR}s / 간격 ${INT}s)"
 
@@ -208,7 +236,7 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
              queue/minimum_io_size queue/optimal_io_size queue/nomerges queue/rq_affinity \
              queue/write_cache queue/discard_max_bytes queue/add_random \
              queue/wbt_lat_usec queue/iostats queue/max_hw_sectors_kb queue/io_poll \
-             device/queue_depth device/timeout device/vendor device/model dm/name md/level; do
+             device/queue_depth device/timeout device/vendor device/model device/raid_level dm/name md/level; do
       [[ -r "$d/$f" ]] && printf 'ATTR|%s|%s|%s\n' "$n" "$f" "$(tr -d '\n' < "$d/$f" 2>/dev/null)"
     done
     for s in "$d"/slaves/*;  do [[ -e "$s" ]] && printf 'SLAVE|%s|%s\n'  "$n" "${s##*/}"; done
@@ -216,6 +244,8 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
     real=$(readlink -f "$d/device" 2>/dev/null || true)
     host=$(echo "$real" | grep -oE '/host[0-9]+/' | head -1 | tr -d '/')
     [[ -n "$host" ]] && printf 'SCSIHOST|%s|%s\n' "$n" "$host"
+    # SCSI 주소 H:C:T:L (RAID 컨트롤러의 논리 디스크 번호와 OS 장치를 잇는 보조 근거)
+    hctl=${real##*/}; [[ "$hctl" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+$ ]] && printf 'HCTL|%s|%s\n' "$n" "$hctl"
     # 파티션
     for p in "$d"/"$n"*; do
       [[ -r "$p/start" ]] && printf 'PART|%s|%s|%s\n' "${p##*/}" "$n" "$(cat "$p/start")"
@@ -223,6 +253,16 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
   done
   for h in /sys/class/scsi_host/host*; do
     [[ -r "$h/proc_name" ]] && printf 'HOSTDRV|%s|%s\n' "${h##*/}" "$(cat "$h/proc_name")"
+    # RAID 컨트롤러 드라이버가 sysfs 로 내주는 상태 (megaraid: 펌웨어 크래시, hpsa·smartpqi: 펌웨어 버전)
+    for f in fw_crash_state fw_version firmware_revision; do
+      [[ -r "$h/$f" ]] && printf 'HOSTATTR|%s|%s|%s\n' "${h##*/}" "$f" "$(tr -d '\n' < "$h/$f" 2>/dev/null)"
+    done
+  done
+  # 커널 raid_class (mpt2sas·mpt3sas IR 볼륨 등): 레벨, 상태, resync 진행
+  for r in /sys/class/raid_devices/*; do
+    [[ -d "$r" ]] || continue
+    printf 'RAIDDEV|%s|level=%s|state=%s|resync=%s|dev=%s\n' "${r##*/}" "$(catf "$r/level")" "$(catf "$r/state")" \
+      "$(catf "$r/resync")" "$(ls "$r/device/block" 2>/dev/null | head -1)"
   done
 } > "$S/sysfs" 2>/dev/null
 
@@ -310,15 +350,80 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
 # 소프트웨어 RAID 상태 (resync·degraded). 메모리에서 만들어지는 값
 [[ -r /proc/mdstat ]] && cat /proc/mdstat > "$S/mdstat" 2>/dev/null
 
-# SMART (선택, --smart). smartctl 은 장치에 SMART 읽기 명령을 보낸다. 쓰기·self-test 는 하지 않는다.
-# -n standby: 절전 중인 HDD 는 깨우지 않고 건너뛴다. 장치 하나에 15초 상한
-# RAID 컨트롤러 뒤의 논리 디스크는 -d megaraid,N 같은 지정이 필요해 대개 실패한다. 실패는 그대로 기록만 한다
+# ── 하드웨어 상태 (bare-metal 에서 자동, --no-hw 로 끔) ─────────────────────
+# 가상 머신의 디스크는 가상 장치라 SMART·RAID 정보가 의미가 없어 건너뛴다.
+# 아래 명령은 모두 조회(show) 전용이다. 설정을 바꾸거나 self-test·재구성을 시작하는 명령은 쓰지 않는다.
+# smartd, 모니터링 에이전트(Prometheus storcli exporter 등)가 주기적으로 실행하는 것과 같은 수준이다.
+IS_BARE=0
+case "$PLATFORM" in
+  baremetal) IS_BARE=1 ;;
+  auto)
+    vv=$(systemd-detect-virt -v 2>/dev/null)
+    if [[ "$vv" == "none" ]] || { [[ -z "$vv" ]] && ! grep -qE '^flags.*[[:space:]]hypervisor([[:space:]]|$)' /proc/cpuinfo 2>/dev/null; }; then
+      IS_BARE=1
+    fi ;;
+esac
+[[ $HW -eq 1 && $IS_BARE -eq 1 ]] && SMART=1
+[[ $HW -eq 0 ]] && SMART=0
+DRVS=" $(cat /sys/class/scsi_host/host*/proc_name 2>/dev/null | sort -u | tr '\n' ' ') "
+find_tool() {
+  local t
+  for t in "$@"; do
+    if [[ "$t" == /* ]]; then [[ -x "$t" ]] && { echo "$t"; return 0; }
+    else command -v "$t" 2>/dev/null && return 0; fi
+  done
+  return 1
+}
+# 벤더 도구는 실행 디렉터리에 로그 파일을 남기는 것이 있어(storcli.log, UcliEvt.log) 임시 디렉터리에서 돌리고 지운다
+hw_run() {  # $1=출력 파일, 나머지=명령
+  local out="$1"; shift
+  mkdir -p "$OUT/.hwtmp"
+  { echo "#CMD $*"; (cd "$OUT/.hwtmp" && timeout 30 "$@" 2>&1 | head -c 4194304); echo; } >> "$out"
+}
+RAID_TOOLS=""
+if [[ $HW -eq 1 && $IS_BARE -eq 1 ]]; then
+  if [[ "$DRVS" == *" megaraid_sas "* || "$DRVS" == *" mpt3sas "* ]]; then
+    T=$(find_tool storcli64 storcli perccli64 perccli /opt/MegaRAID/storcli/storcli64 /opt/MegaRAID/perccli/perccli64 \
+                  /opt/lsi/storcli/storcli /opt/dell/perccli/perccli64 /usr/local/sbin/storcli64)
+    if [[ -n "$T" ]]; then
+      for c in "/call show all J" "/call/vall show all J" "/call/eall/sall show all J" "/call show patrolread J" "/call show cc J"; do
+        # shellcheck disable=SC2086
+        hw_run "$S/raid_storcli" "$T" $c
+      done
+      RAID_TOOLS+="storcli "
+    elif [[ "$DRVS" == *" megaraid_sas "* ]]; then
+      echo "#TOOL_ABSENT storcli/perccli" > "$S/raid_storcli"
+    fi
+  fi
+  if [[ "$DRVS" == *" hpsa "* || "$DRVS" == *" smartpqi "* ]]; then
+    T=$(find_tool ssacli hpssacli /usr/sbin/ssacli /opt/smartstorageadmin/ssacli/bin/ssacli)
+    if [[ -n "$T" ]]; then hw_run "$S/raid_ssacli" "$T" ctrl all show config detail; RAID_TOOLS+="ssacli "
+    else echo "#TOOL_ABSENT ssacli" > "$S/raid_ssacli"; fi
+  fi
+  if [[ "$DRVS" == *" aacraid "* || ( "$DRVS" == *" smartpqi "* && -z "$RAID_TOOLS" ) ]]; then
+    T=$(find_tool arcconf /usr/sbin/arcconf /usr/Arcconf/arcconf)
+    if [[ -n "$T" ]]; then
+      for n in 1 2 3 4; do
+        hw_run "$S/raid_arcconf" "$T" getconfig "$n" AL
+        grep -qiE 'Invalid controller|not found' "$S/raid_arcconf" && break
+      done
+      RAID_TOOLS+="arcconf "
+    elif [[ "$DRVS" == *" aacraid "* ]]; then echo "#TOOL_ABSENT arcconf" > "$S/raid_arcconf"; fi
+  fi
+  rm -rf "$OUT/.hwtmp"
+fi
+echo "raid_tools=$RAID_TOOLS" >> "$OUT/meta"
+
+# SMART: RAID 컨트롤러 뒤 논리 디스크는 컨트롤러 도구가 구성 디스크 상태를 알려 주므로 건너뛴다.
+# -n standby: 절전 중인 HDD 는 깨우지 않는다. 장치 하나에 15초 상한
 SMART_N=0
 if [[ $SMART -eq 1 ]]; then
   if command -v smartctl >/dev/null 2>&1; then
     for d in /sys/block/*; do
       n=${d##*/}
       case "$n" in loop*|ram*|sr*|zram*|dm-*|md*|nbd*|rbd*) continue ;; esac
+      hdrv=$(cat "$(readlink -f "$d/device" 2>/dev/null | grep -oE '.*/host[0-9]+')/scsi_host/"*/proc_name 2>/dev/null | head -1)
+      case "$hdrv" in megaraid_sas|hpsa|smartpqi|aacraid|arcmsr) continue ;; esac
       dev="/dev/$n"; [[ "$n" == nvme*n* ]] && dev="/dev/${n%n*}"
       [[ $SMART_N -ge 32 ]] && break
       echo "#DEV $n $dev"
@@ -327,10 +432,10 @@ if [[ $SMART -eq 1 ]]; then
     done > "$S/smart"
   else
     echo "#SMARTCTL_ABSENT" > "$S/smart"
-    msg "⚠ --smart 를 줬지만 smartctl 이 없습니다 (smartmontools 패키지). SMART 판정은 빠집니다"
   fi
 fi
 echo "smart=$SMART" >> "$OUT/meta"
+echo "hw=$HW" >> "$OUT/meta"
 
 save tuned  tuned-adm active
 save fstrim sh -c "systemctl is-enabled fstrim.timer 2>&1; systemctl is-active fstrim.timer 2>&1"

@@ -65,3 +65,35 @@ def check(out):
             if hit:
                 fails.append("{}: 있으면 안 됨 {} → {}".format(name, (sev, owner, title), hit[0]))
     return fails
+
+EXPECT += [
+    ("bm_raid_storcli", "baremetal", "성능 저하",
+     [("warn", "하드웨어 담당자", "배터리·캐시 보호 모듈"), ("warn", "하드웨어 담당자", "write-through로 동작 중 (설정은 write-back)"),
+      (None, "하드웨어 담당자", "패리티 RAID"), ("warn", "하드웨어 담당자", "RAID 구성 디스크에 이상 징후"),
+      (None, None, "HDD 기준")],
+     [(None, None, "추정으로 판정"), (None, None, "도구가 없어")]),
+    ("bm_raid_ssacli", "baremetal", "정상",
+     [],
+     [(None, None, "추정으로 판정"), (None, None, "HDD"), (None, "하드웨어 담당자", "RAID")]),
+    ("bm_raid_arcconf", "baremetal", "",
+     [("warn", "하드웨어 담당자", "RAID 논리 디스크가 정상 상태가 아님 (sda"), ("warn", None, "RAID 구성 디스크")],
+     []),
+    ("bm_raid_notool", "baremetal", "",
+     [("info", None, "도구가 없어"), ("info", None, "추정으로 판정")],
+     []),
+    ("vmware_default", "vmware", "성능 저하",
+     [(None, None, "VMware 공유 스토리지 기준"), ("warn", "VMware 관리자", "vSAN·데이터스토어 스토리지")],
+     []),
+    ("vmware_vmfs", "vmware", "성능 저하",
+     [("warn", "VMware 관리자", "VM 바깥(하이퍼바이저·데이터스토어 스토리지)")],
+     [(None, None, "vSAN")]),
+    ("aws_ebs_cap", "vm", "",
+     [("caution", "가상화·클라우드 관리자", "상한에서 더 오르지 않음"), (None, None, "클라우드 블록 볼륨 기준")],
+     [(None, "VMware 관리자", "")]),
+    ("eck_host", "baremetal", "정상",
+     [("info", None, "컨테이너(Docker·Kubernetes) 안에서 실행 중")],
+     [(None, None, "컨테이너 안에서 실행됨")]),
+    ("bm_ceph_rbd", "baremetal", "위험 요인",
+     [(None, None, "네트워크 블록 스토리지 기준"), (None, "스토리지 관리자", "네트워크 블록 스토리지(Ceph RBD 등)")],
+     [(None, None, "NVMe")]),
+]

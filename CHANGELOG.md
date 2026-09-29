@@ -67,6 +67,37 @@ VMware 판정은 그대로다 (합성 번들 3종에서 0.9.5 와 판정 목록 
   "기본값"으로 표시하고 Hybrid 면 다시 분석하는 방법을 안내
 - 한 서버에 ES 노드가 여러 개면 어느 노드 기준으로 수집하는지 알림
 
+### 하드웨어 RAID 컨트롤러 판정 (bare-metal)
+- 컨트롤러 도구가 있으면 자동 조회: Broadcom·Dell `storcli`·`perccli` (JSON), HPE `ssacli`, Microchip·Adaptec `arcconf`.
+  모두 show 명령, 명령당 30초 상한, 도구가 남기는 로그 파일은 결과 디렉터리 임시 위치에서 지움
+- 판정: 컨트롤러 상태, 배터리·CacheVault·ZMM 상태, 컨트롤러 캐시 꺼짐, 논리 디스크 상태(degraded·offline),
+  ES data 논리 디스크의 쓰기 캐시가 write-through 인지(설정은 write-back 인데 떨어진 경우 구분),
+  패리티 RAID(5/6), 구성 디스크 오류(predictive failure, media error, SMART 경고, failed), rebuild·patrol read·consistency check 진행
+- 구성 디스크 매체(HDD·SSD)로 RAID 논리 디스크의 매체를 확정. rotational 값에 기대던 "추정"이 도구가 있으면 사라짐
+- OS 장치 연결: storcli 의 OS Drive Name, ssacli 의 Disk Name, 없으면 SCSI 주소(megaraid channel 2 · aacraid channel 0 의 target 번호)
+- 커널 sysfs 만으로 보는 것: /sys/class/raid_devices(mpt*sas IR 볼륨 상태·resync), hpsa·smartpqi 의 raid_level, megaraid 펌웨어 크래시 기록
+- 도구가 없으면 무엇을 설치하면 되는지 안내
+- 쓰기만 느릴 때 안내가 컨트롤러 조회 결과를 반영 (write-back 정상이면 캐시 문제가 아니라고 명시)
+
+### SMART
+- bare-metal 에서는 기본으로 조회 (`--no-hw` 로 끔). VM 에서는 가상 장치라 건너뜀. RAID 컨트롤러 뒤 디스크는 컨트롤러 도구가 대신 봄
+
+### VMware 데이터스토어 중립화
+- VMware 면 vSAN 으로 가정하던 것을 고침. Guest 에서는 데이터스토어 종류를 알 수 없으므로 기본은 공통 기준(5ms)과
+  vSAN·SAN·NFS 를 함께 다루는 안내. `-s allflash|hybrid` 면 vSAN, `-s vmfs` 면 SAN·NFS 데이터스토어에 맞춘 안내
+- vSAN 에만 해당하는 문구(resync, vSAN 네트워크, vSAN TRIM, 디스크 그룹)를 데이터스토어 종류에 따라 분기
+
+### 클라우드·네트워크 스토리지
+- 클라우드 볼륨(EBS, Azure Disk, Persistent Disk)과 인스턴스 로컬 NVMe 를 모델명으로 구분. 로컬 NVMe 는 NVMe 기준, 볼륨은 클라우드 기준
+- Ceph RBD·NBD 를 네트워크 블록 장치로 판별. 스토리지 클러스터·네트워크 쪽 안내, 담당자는 스토리지 관리자
+- 모든 플랫폼: 요청은 쌓이는데 IOPS·처리량이 같은 값에서 더 오르지 않는 "한도에 걸린 모양" 판정
+  (상한 근처 구간 30~90%, 그 구간 대기 I/O 가 나머지의 2배 이상일 때) [실무 기준]
+
+### 컨테이너(ECK, Docker)
+- 호스트에서 실행하면 컨테이너 안 ES 를 찾아 /proc/<pid>/root 로 elasticsearch.yml 을 읽고,
+  ES 프로세스의 mountinfo 로 data 경로가 올라간 블록 장치를 찾음 (로컬 PV, Ceph RBD, 클라우드 볼륨)
+- 컨테이너 안에서 실행해도 data 장치를 찾으면 경고를 참고로 낮춤
+
 ### 수정
 - --no-index-stats 를 줘도 종료 시점에 인덱스별 통계를 한 번 더 조회하던 문제
 

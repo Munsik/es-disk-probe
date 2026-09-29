@@ -56,7 +56,8 @@ cron이나 systemd timer로 반복 실행하도록 만들지 마세요. 측정 �
 - 상시 감시 목적. 위 표를 봐 주세요
 - 용량 사이징 근거. 최대 성능을 재는 쪽은 `es_disk_bench.sh`(부하 발생)이고, 기본 수집은 현재 부하만 봅니다
 - 디스크 밖의 성능 문제. CPU, heap, GC, 쿼리 튜닝은 범위가 아닙니다. 다만 "디스크가 원인이 아니다"까지는 판정합니다
-- 컨테이너(ECK, Docker) 안에서 실행. 컨테이너가 아니라 그 노드(호스트)에서 실행하세요. 컨테이너 안에서 돌리면 리포트가 경고합니다
+- 컨테이너(ECK, Docker) 안에서 실행. 그 노드(호스트)에서 실행하세요. 호스트에서 돌리면 컨테이너 안 ES를 자동으로 찾고,
+  ES 프로세스의 mount 정보로 data가 올라간 장치(로컬 PV, Ceph RBD, 클라우드 볼륨 등)까지 따라갑니다
 
 ### 서버에서 하는 일과 하지 않는 일
 
@@ -75,8 +76,19 @@ cron이나 systemd timer로 반복 실행하도록 만들지 마세요. 측정 �
 - 자기 자신의 우선순위를 낮추는 `renice 19`, `ionice idle`. 프로세스가 끝나면 사라집니다
 - NVMe 온도 읽기. `/sys/class/nvme/*/hwmon` 을 읽으면 커널이 장치에 SMART log 를 한 번 요청합니다. 읽기 전용 명령이고 실행당 1회입니다
 
-`--smart` 를 줄 때만 하는 일도 있습니다. `smartctl -H -A -i -n standby` 로 디스크의 SMART 값을 읽습니다.
-장치에 읽기 명령을 보내는 것이라 기본은 꺼 두었습니다. 잠든 HDD는 깨우지 않고 건너뛰며, 장치당 15초 상한이 있습니다.
+bare-metal에서는 하드웨어 상태 조회를 자동으로 합니다. VM에서는 가상 장치라 의미가 없어 하지 않습니다.
+모두 조회(show) 명령이고, smartd나 모니터링 에이전트(Prometheus storcli exporter 등)가 주기적으로 실행하는 것과 같은 수준입니다.
+`--no-hw` 로 끌 수 있습니다.
+
+| 조회 | 명령 | 조건 |
+|---|---|---|
+| SMART | `smartctl -H -A -i -n standby` (잠든 HDD는 깨우지 않음, 장치당 15초 상한) | smartmontools 설치, RAID 컨트롤러 뒤가 아닌 디스크 |
+| Broadcom·Dell RAID | `storcli64` 또는 `perccli64` 의 `/call show all J`, `/call/vall show all J`, `/call/eall/sall show all J`, `/call show patrolread J`, `/call show cc J` | megaraid_sas·mpt3sas 드라이버, 도구 설치 |
+| HPE RAID | `ssacli ctrl all show config detail` | hpsa·smartpqi 드라이버, 도구 설치 |
+| Microchip·Adaptec RAID | `arcconf getconfig <n> AL` | aacraid·smartpqi 드라이버, 도구 설치 |
+
+벤더 도구는 실행한 디렉터리에 로그 파일(storcli.log, UcliEvt.log)을 남기는 것이 있어 결과 디렉터리 안의 임시 위치에서 실행하고 지웁니다.
+명령마다 30초 상한이 있습니다. 도구가 없으면 건너뛰고, 리포트에 "설치하면 캐시·배터리까지 자동으로 본다"고 안내합니다.
 
 ---
 
@@ -190,27 +202,44 @@ VMware 관리자, 하드웨어 담당자, 스토리지 관리자 요청 항목�
 1. `systemd-detect-virt -v`(VM), `-c`(컨테이너)
 2. 명령이 없으면 DMI(`/sys/class/dmi/id`), `/sys/hypervisor/type`, `/proc/cpuinfo` 의 hypervisor 플래그
 3. bare-metal 은 "가상화 없음"이 확인될 때만 판정합니다. 근거가 없으면 "플랫폼 미확정"으로 두고 공통 기준을 씁니다
-4. ES data 디스크마다 연결 방식과 매체를 봅니다. NVMe(PCIe), NVMe-oF, FC·iSCSI HBA, 어레이 벤더 이름, dm-multipath, RAID 컨트롤러 드라이버, `rotational`
+4. ES data 디스크마다 연결 방식과 매체를 봅니다. NVMe(PCIe), NVMe-oF, FC·iSCSI HBA, 어레이 벤더 이름, dm-multipath, Ceph RBD·NBD,
+   클라우드 볼륨(EBS, Azure Disk, Persistent Disk)과 인스턴스 로컬 NVMe, RAID 컨트롤러 드라이버와 컨트롤러 도구 조회 결과, `rotational`
+5. ES가 컨테이너 안에 있으면 ES 프로세스의 mountinfo 로 data 경로가 올라간 블록 장치를 찾습니다
 
 ### 플랫폼별로 달라지는 것
 
-| | VMware Guest | bare-metal 로컬 | bare-metal SAN | 그 밖의 VM·클라우드 |
+| | VMware Guest | bare-metal 로컬 | bare-metal SAN·네트워크 블록 | 그 밖의 VM·클라우드 |
 |---|---|---|---|---|
-| 판별 | detect-virt = vmware | detect-virt = none | FC·iSCSI HBA, multipath, 어레이 벤더 | kvm, microsoft, xen, amazon, google 등 |
-| 응답시간 기준 (주의) | All-Flash 5ms / Hybrid 10ms | NVMe 1ms / SSD 3ms / HDD 25ms | SSD 3ms (어레이가 HDD면 `-s hdd`) | 5ms |
-| 병목 위치 | VM 안의 큐 대 VM 바깥 | 디스크 구성 포화 대 디스크·컨트롤러 이상 | 서버 LUN 큐 대 어레이·SAN 경로 | VM 안의 큐 대 VM 바깥 |
+| 판별 | detect-virt = vmware | detect-virt = none | FC·iSCSI HBA, multipath, 어레이 벤더, Ceph RBD | kvm, microsoft, xen, amazon, google 등 |
+| 응답시간 기준 (주의) | 5ms. 데이터스토어 종류는 Guest에서 알 수 없어 공통 기준 (`-s allflash`·`hybrid`·`vmfs` 로 좁힘) | NVMe 1ms / SSD 3ms / HDD 25ms. RAID 뒤 매체는 컨트롤러 도구로 확정 | FC·iSCSI SSD 3ms (어레이가 HDD면 `-s hdd`), Ceph RBD 5ms | 클라우드 볼륨 5ms, 인스턴스 로컬 NVMe 1ms, 그 밖 5ms |
+| 병목 위치 | VM 안의 큐 대 VM 바깥 | 디스크 구성 포화 대 디스크·컨트롤러 이상 | 서버 LUN 큐 대 어레이·SAN 경로, Ceph 는 스토리지 클러스터 | VM 안의 큐 대 VM 바깥 |
 | "바깥" 담당자 | VMware 관리자 | 하드웨어 담당자 | 스토리지 관리자 | 가상화·클라우드 관리자 |
-| 전용 점검 | PVSCSI, balloon, 메모리 예약, SCSI timeout 180초, VMXNET3 | NVMe 온도·PCIe 링크, md RAID, CPU governor, SMART(`--smart`) | FC 포트 상태, multipath 경로별 지연 | CPU steal |
+| 전용 점검 | PVSCSI, balloon, 메모리 예약, SCSI timeout 180초, VMXNET3 | RAID 컨트롤러(논리 디스크 상태, 쓰기 캐시, 배터리, 구성 디스크 오류, rebuild), SMART, NVMe 온도·PCIe 링크, md RAID, CPU governor | FC 포트 상태, multipath 경로별 지연 | CPU steal |
 | 스케줄러 권고 | mq-deadline 또는 none | NVMe·SSD none/kyber, HDD mq-deadline/bfq | mq-deadline 또는 none | mq-deadline 또는 none |
 | tuned 권고 | virtual-guest | throughput-performance | throughput-performance | virtual-guest |
 
-같은 묶음(RAID 0, LVM stripe, md, multipath 경로) 안에서 한 장치만 느린 경우는 모든 플랫폼에서 따로 판정합니다.
-stripe는 가장 느린 구성원 속도로 움직이는데, 합산 지표에서는 그 차이가 희석되어 보이지 않기 때문입니다.
+모든 플랫폼에서 공통으로 보는 것도 있습니다.
+
+- 같은 묶음(RAID 0, LVM stripe, md, multipath 경로) 안에서 한 장치만 느린 경우
+- 요청은 쌓이는데 IOPS나 처리량이 같은 값에서 더 오르지 않는 모양. 클라우드 볼륨 한도, VM 디스크 IOPS 한도, 어레이 QoS 같은 한도에 걸렸을 때 나타납니다
+- ES가 컨테이너 안에 있을 때 data 장치를 mount 정보로 따라가기
+
+### VMware 데이터스토어
+
+Guest OS에서는 데이터스토어가 vSAN인지 SAN(VMFS)·NFS인지 알 수 없습니다. 그래서 기본은 어느 쪽에도 맞는 공통 기준(5ms)과 문구를 씁니다.
+종류를 알고 있으면 `-s` 로 알려 주세요. 기준값과 조치 안내가 그 환경에 맞춰집니다.
+
+| `-s` | 데이터스토어 | 달라지는 것 |
+|---|---|---|
+| 지정 안 함 | 모름 (기본) | 공통 기준 5ms. 안내에 vSAN과 SAN·NFS 확인 방법을 함께 적음 |
+| `allflash`, `hybrid` | vSAN | 5ms / 10ms. vSAN 성능 서비스, resync, vSAN 네트워크 중심 안내 |
+| `vmfs` | SAN(VMFS)·NFS | 5ms. 어레이 볼륨 응답시간, 경로 상태, Storage I/O Control 중심 안내 |
 
 ### 매체를 확정할 수 없는 경우
 
 RAID 컨트롤러(megaraid_sas, hpsa, smartpqi 등) 뒤의 논리 디스크는 `rotational` 값이 실제 매체와 다를 수 있습니다.
-이때는 "추정"으로 표시하고 리포트에 `-s` 지정을 안내합니다. SAN도 서버에서 어레이 매체를 알 수 없어 SSD 기준을 기본으로 씁니다.
+컨트롤러 도구(storcli·perccli, ssacli, arcconf)가 있으면 구성 디스크의 매체를 읽어 확정합니다.
+도구가 없을 때만 "추정"으로 표시하고 `-s` 지정이나 도구 설치를 안내합니다. SAN도 서버에서 어레이 매체를 알 수 없어 SSD 기준을 기본으로 씁니다.
 ES data 디스크의 매체가 섞여 있으면 가장 느린 매체 기준으로 판정합니다. 빠른 매체 기준을 느린 디스크에 대면 정상인데도 경고가 나기 때문입니다.
 
 ---
@@ -259,7 +288,9 @@ ES가 인증을 요구하면 사용자와 비밀번호를 물어봅니다. 조�
 | 항목 | 자동으로 하는 일 | 바꾸는 옵션 |
 |---|---|---|
 | 플랫폼 | VMware, bare-metal(로컬·SAN), 그 밖의 VM·클라우드 판별 | `--platform` |
-| 판정 기준 매체 | NVMe·SSD·HDD, SAN, vSAN 판별 (vSAN 종류만은 Guest에서 알 수 없어 All-Flash가 기본) | `-s` |
+| 판정 기준 매체 | NVMe·SSD·HDD, RAID 뒤 매체(컨트롤러 도구), SAN, Ceph RBD, 클라우드 볼륨 판별. VMware 데이터스토어 종류만은 Guest에서 알 수 없어 공통 기준이 기본 | `-s` |
+| 하드웨어 상태 | bare-metal이면 SMART와 RAID 컨트롤러(storcli·perccli, ssacli, arcconf)를 조회. 도구가 있는 것만 | `--no-hw` |
+| 컨테이너 안 ES | 호스트에서 실행하면 컨테이너 안 ES를 찾아 mount 정보로 data 장치까지 따라감 | `-p` |
 | ES 주소 | ES 프로세스가 실제로 열어 둔 포트를 찾아 http, https 순서로 접속. `network.host` 를 IP로 묶은 경우도 찾음 | `--es-url` |
 | ES 인증 | 401이면 터미널에서 사용자·비밀번호를 물어봄. 비밀번호가 셸 history에 남지 않음 | `--es-user` + `ES_PASSWORD`, `ES_API_KEY` |
 | ES data 경로 | ES 프로세스, `elasticsearch.yml` 의 `path.data` 에서 찾음 (ES가 내려가 있어도) | `-p` |
@@ -286,7 +317,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | 분석기 | Python 3.6+ 표준 라이브러리만 (RHEL 8의 `/usr/libexec/platform-python` 자동 인식) |
 | 권한 | root 권장 (ES 프로세스 I/O, 커널 로그, VMware 정보) |
 | ES 권한 | `cluster monitor` (`monitoring_user` 수준). 관리자 계정 필요 없음 |
-| 선택 | `sysstat`(과거 이력), `ethtool`(NIC ring), `open-vm-tools`(VMware 자원), `smartmontools`(`--smart`), `fio` + `libaio`(최대 성능 측정) |
+| 선택 | `sysstat`(과거 이력), `ethtool`(NIC ring), `open-vm-tools`(VMware 자원), `smartmontools`(SMART), RAID 컨트롤러 도구(`storcli`·`perccli`, `ssacli`, `arcconf`), `fio` + `libaio`(최대 성능 측정) |
 
 `es_disk_collect.sh`와 `es_cluster_probe.sh`는 기본적으로 `curl -k`로 동작합니다.
 자체 서명 인증서 환경을 감안한 기본값입니다. 수집기는 localhost만 보므로 그대로 두어도 무리가 없습니다.
@@ -302,10 +333,11 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 -p PATH       ES data 경로 (여러 번 지정 가능, 안 주면 자동 탐지)
 -o DIR        결과 저장 위치 (기본 /tmp. ES data 와 같은 디스크면 다른 곳으로 자동 변경)
 -s TYPE       스토리지 유형 (기본 auto)
-              VMware vSAN: allflash | hybrid
-              bare-metal·SAN: nvme | ssd | hdd  (RAID 컨트롤러 뒤라 매체를 못 읽을 때 지정)
+              VMware: allflash | hybrid (vSAN), vmfs (SAN·NFS 데이터스토어)
+              bare-metal·SAN: nvme | ssd | hdd  (RAID 컨트롤러 도구가 없어 매체를 못 읽을 때 지정)
 --platform P  플랫폼 강제 지정: auto | vmware | baremetal | vm (기본 auto)
---smart       smartctl 로 SMART 읽기 (기본 꺼짐)
+--no-hw       하드웨어 상태 조회를 끔 (bare-metal 에서 자동으로 하는 SMART, RAID 컨트롤러 조회)
+--smart       VM 에서도 SMART 를 읽음 (보통 필요 없음)
 --es-url URL  ES 주소 (기본 자동 탐지)
 --es-user U   ES 사용자 (비밀번호는 환경변수 ES_PASSWORD, API Key는 ES_API_KEY)
 --no-es       ES API 조회 생략
@@ -338,7 +370,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | `es_cluster_probe.sh` | (선택) 노드 접속 없이 클러스터만 원격 조회 | 조회 API GET만 |
 | `es_disk_bench.sh` | (선택) 최대 성능 측정 | 부하를 검. 점검 시간에만 |
 | `GUARDLINE.md` | 설계, 구성, 상시 감시 기준과 변경 원칙 | 문서 |
-| `tests/` | 합성 번들 생성기와 판정 테스트 (플랫폼·매체별 10개 시나리오) | 서버에서 안 돌림 |
+| `tests/` | 합성 번들 생성기와 판정 테스트 (플랫폼·매체·RAID 도구별 19개 시나리오) | 서버에서 안 돌림 |
 
 ---
 
@@ -379,7 +411,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 
 클러스터 조회나 sar 기록이 없으면 해당 섹션은 빠집니다.
 
-샘플 리포트: `docs/sample_node_report.html`(VMware Guest), `docs/sample_baremetal_report.html`(bare-metal, HDD RAID 쓰기 지연),
+샘플 리포트: `docs/sample_node_report.html`(VMware Guest), `docs/sample_baremetal_report.html`(bare-metal, HDD RAID5 에서 CacheVault 이상으로 쓰기 캐시가 write-through 로 떨어진 사례),
 `docs/sample_cluster_report.html`(클러스터 원격 조회). 모두 합성 데이터입니다.
 
 ---
@@ -485,13 +517,15 @@ bare-metal에는 그 계층이 없어 장치 관점 수치(KB 424485)가 곧 기
 
 | 플랫폼 | 항목 |
 |---|---|
-| VMware | vSAN 스토리지 정책(RAID, FTT, stripe, IOPS 제한), ES replica와 vSAN 복제가 겹쳐 생기는 쓰기 증폭, VM snapshot, ES 노드의 호스트 배치(anti-affinity), vSAN 네트워크와 resync, 캐시 사용률, 물리 디스크 상태, vNUMA |
-| bare-metal 로컬 | RAID 컨트롤러 캐시 정책과 배터리 상태, RAID 레벨과 재구성·patrol read 일정, RAID 뒤 개별 디스크 SMART, BIOS 전원 정책 |
+| VMware (vSAN) | vSAN 스토리지 정책(RAID, FTT, stripe, IOPS 제한), ES replica와 vSAN 복제가 겹쳐 생기는 쓰기 증폭, VM snapshot, ES 노드의 호스트 배치(anti-affinity), vSAN 네트워크와 resync, 캐시 사용률, 물리 디스크 상태, vNUMA |
+| VMware (SAN·NFS 데이터스토어) | 데이터스토어 종류와 뒤의 어레이, 어레이 쪽 응답시간, Storage I/O Control·디스크 IOPS 한도, VM snapshot, 호스트·데이터스토어 배치, ESXi 경로 정책 |
+| bare-metal 로컬 | BIOS 전원 정책. RAID 컨트롤러 도구가 없으면 캐시 정책·배터리, RAID 레벨·재구성 일정, 구성 디스크 상태도 여기에 들어감 |
 | bare-metal SAN | 어레이 쪽 응답시간과 컨트롤러 부하, 같은 어레이의 다른 서버, 볼륨 QoS 한도, SAN 스위치 포트 오류, 어레이 복제·스냅샷 일정 |
 | 그 밖의 VM·클라우드 | 호스트 스토리지 백엔드와 캐시, 볼륨 IOPS·처리량 한도, 같은 호스트의 다른 VM, ES 노드 배치 |
 
 RAID 컨트롤러 캐시는 커널의 `queue/write_cache` 값으로 판단하지 않습니다.
 배터리로 보호되는 캐시를 "write through"로 보고하는 컨트롤러가 있어서, 그 값만으로는 캐시가 켜졌는지 알 수 없습니다.
+컨트롤러 도구의 현재 캐시 정책(설정값과 실제 적용값)으로 판정합니다.
 
 ---
 
@@ -500,7 +534,7 @@ RAID 컨트롤러 캐시는 커널의 `queue/write_cache` 값으로 판단하지
 실제 서버 없이 플랫폼·매체·부하 조합별 판정을 확인할 수 있습니다. Python 표준 라이브러리만 씁니다.
 
 ```bash
-python3 tests/run_tests.py                 # 10개 시나리오 기대 판정 검사
+python3 tests/run_tests.py                 # 19개 시나리오 기대 판정 검사
 python3 tests/run_tests.py --dump /tmp/t   # 시나리오별 HTML 리포트와 판정 목록(JSON) 저장
 python3 tests/make_bundle.py --list        # 시나리오 목록
 ```
@@ -517,10 +551,11 @@ python3 tests/make_bundle.py --list        # 시나리오 목록
 | `path.data` 표기 5종 파싱 | 통과 |
 | HTML과 차트 | 태그 검증 + 가짜 DOM 실행 검증 통과 |
 | 호환성 | Python 3.6 문법, bash 4.2, mawk 검사 통과 |
-| 플랫폼별 판정 | 합성 번들 10종 통과 (`python3 tests/run_tests.py`): VMware 3, bare-metal NVMe 2, HDD RAID, md SSD stripe, FC SAN, KVM, 컨테이너 |
+| 플랫폼별 판정 | 합성 번들 19종 통과 (`python3 tests/run_tests.py`): VMware 5(vSAN·기본·VMFS), bare-metal NVMe 2, HDD RAID, md SSD stripe, FC SAN, Ceph RBD, RAID 도구 4(perccli·ssacli·arcconf·도구 없음), KVM, AWS EBS 한도, ECK, 컨테이너 |
+| RAID 도구 출력 해석 | storcli JSON 키는 Prometheus storcli exporter 가 쓰는 키, ssacli·arcconf 는 공개된 출력 레이블을 기준으로 만든 합성 출력으로만 검증. 실제 장비 출력 확인 필요 |
 | 0.9.x → 0.10 회귀 | VMware 합성 번들 3종의 판정 목록이 0.9.5와 동일 |
 | 실제 vSphere Guest | 미검증 |
-| 실제 bare-metal (NVMe, RAID, SAN) | 미검증 |
+| 실제 bare-metal (NVMe, RAID, SAN), 클라우드, Kubernetes | 미검증 |
 | 운영 클러스터 `fs.io_stats` | 미검증 (모의 서버 기준) |
 
 ---
