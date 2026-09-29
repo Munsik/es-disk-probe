@@ -13,13 +13,14 @@
 #     -d SEC        측정 시간 (기본 300초. 피크 시간대에 실행 권장)
 #     -i SEC        샘플 간격 (기본 5초, 최소 1초)
 #     -p PATH       ES data 경로 (여러 번 지정 가능, 미지정 시 자동 탐지)
-#     -o DIR        결과 저장 위치 (기본 /tmp)
+#     -o DIR        결과 저장 위치 (기본 /tmp. ES data 와 같은 디스크면 다른 디스크로 자동 변경)
 #     -s TYPE       스토리지 유형 (기본 auto: 플랫폼과 장치를 보고 자동 판정)
 #                   VMware vSAN: allflash | hybrid
 #                   bare-metal·SAN: nvme | ssd | hdd (RAID 컨트롤러 뒤라 매체를 못 읽을 때 지정)
 #     --platform P  플랫폼 강제 지정: auto | vmware | baremetal | vm (기본 auto)
-#     --es-url URL  ES 주소 (기본 자동: http://localhost:9200 → https 순서)
+#     --es-url URL  ES 주소 (기본 자동: ES 프로세스가 열어 둔 포트를 http → https 순서로 시도)
 #     --es-user U   ES 사용자 (비밀번호는 환경변수 ES_PASSWORD)
+#                   둘 다 안 주고 ES 가 인증을 요구하면 터미널에서 물어봅니다
 #                   API Key 사용 시 환경변수 ES_API_KEY (base64 인코딩 값)
 #     --no-es       ES API 조회 생략 (OS 레벨만 수집)
 #     --no-cluster  클러스터 전체 조회 생략 (이 노드만)
@@ -27,7 +28,7 @@
 #     --light       디스크를 읽는 부가 수집을 모두 생략 (ES 로그·커널 로그·sar·mmap 목록)
 #                   → 디스크 읽기량이 1MB 미만이 됩니다. 판정 근거는 줄어듭니다
 #     --no-eslog    ES 서버 로그 읽기만 생략 (부가 수집 중 읽기량이 가장 큰 항목)
-#     --no-index-stats  인덱스 수에 비례해 커지는 ES 조회 2건 생략
+#     --no-index-stats  인덱스 수에 비례해 커지는 ES 조회 생략 (샤드가 많으면 자동 생략)
 #                   (_nodes/_local/stats?level=indices, _ilm/explain)
 #     --smart       smartctl 로 디스크 상태(SMART) 읽기. 기본은 꺼짐
 #                   읽기 전용 명령이지만 /proc·/sys 가 아니라 장치에 직접 명령을 보내므로 선택 사항
@@ -38,14 +39,15 @@
 #   자세한 내역은 README "이 도구가 서버에 주는 부하" 참고.
 #
 # 예:
-#   sudo ES_PASSWORD='***' ./es_disk_collect.sh -d 600 --es-user elastic
+#   sudo ./es_disk_collect.sh            # 대부분 이것으로 충분 (플랫폼·주소·경로·기준 자동)
+#   sudo ./es_disk_collect.sh -d 600     # 피크 시간대에 10분
 # =============================================================================
 set -u
 umask 077
 export LC_ALL=C
 
 VERSION="0.10.0"
-DUR=300; INT=5; OUT_BASE="/tmp"; STORAGE="auto"; PLATFORM="auto"; SMART=0
+DUR=300; INT=5; OUT_BASE="/tmp"; OUT_GIVEN=0; STORAGE="auto"; PLATFORM="auto"; SMART=0
 ES_URL=""; ES_USER=""; NO_ES=0; NO_RENDER=0; NO_CLUSTER=0
 NO_ESLOG=0; NO_KLOG=0; NO_SAR=0; NO_MAPS=0; NO_IDXSTATS=0
 USER_PATHS=()
@@ -55,7 +57,7 @@ while [[ $# -gt 0 ]]; do
     -d) DUR="$2"; shift 2 ;;
     -i) INT="$2"; shift 2 ;;
     -p) USER_PATHS+=("$2"); shift 2 ;;
-    -o) OUT_BASE="$2"; shift 2 ;;
+    -o) OUT_BASE="$2"; OUT_GIVEN=1; shift 2 ;;
     -s) STORAGE="$2"; shift 2 ;;
     --es-url)  ES_URL="$2"; shift 2 ;;
     --es-user) ES_USER="$2"; shift 2 ;;
@@ -88,6 +90,62 @@ command -v ionice >/dev/null 2>&1 && ionice -c 3 -p $$ >/dev/null 2>&1 || true
 IS_ROOT=0; [[ $EUID -eq 0 ]] && IS_ROOT=1
 [[ $IS_ROOT -eq 0 ]] && msg "⚠ root가 아닙니다. ES 프로세스 I/O, dmesg, 가상화·장치 정보 일부가 빠질 수 있습니다."
 
+# ── ES 프로세스와 data 경로를 먼저 찾는다 ─────────────────────────────────
+# 결과 저장 위치를 고르고 ES 주소를 찾는 데 쓴다. 사용자가 경로·주소를 몰라도 되게 하려는 것
+# pgrep -f 는 패턴 문자열을 포함한 다른 명령(tail, 셸 등)도 잡으므로 java 프로세스만 고른다
+ES_PID=""
+for p in $(pgrep -f 'org\.elasticsearch\.bootstrap\.Elasticsearch' 2>/dev/null); do
+  [[ "$p" == "$$" ]] && continue
+  a0=$(tr '\0' '\n' < /proc/$p/cmdline 2>/dev/null | head -1)
+  c=$(cat /proc/$p/comm 2>/dev/null)
+  if [[ "$c" == "java" || "${a0##*/}" == java* ]]; then ES_PID=$p; break; fi
+done
+N_ES=$(for p in $(pgrep -x java 2>/dev/null); do grep -qa 'org.elasticsearch.bootstrap.Elasticsearch' /proc/$p/cmdline 2>/dev/null && echo $p; done | wc -l)
+[[ "$N_ES" -gt 1 ]] && msg "⚠ 이 서버에 ES 노드가 ${N_ES}개 떠 있습니다. 첫 번째(pid $ES_PID) 기준으로 수집합니다. 다른 노드는 -p 로 data 경로를 지정하세요"
+ES_CMDLINE=""; [[ -n "$ES_PID" ]] && ES_CMDLINE=$(tr '\0' ' ' < /proc/$ES_PID/cmdline 2>/dev/null)
+CONF_DIR=$(printf '%s' "$ES_CMDLINE" | grep -oE 'es\.path\.conf=[^ ]+' | head -1 | cut -d= -f2)
+CONF_DIR=${CONF_DIR:-${ES_PATH_CONF:-/etc/elasticsearch}}
+
+# elasticsearch.yml 의 path.data. 한 줄(path.data: /a, [/a, /b])과 중첩(path:\n  data: ...), 목록(- /a) 표기를 모두 읽는다
+yml_data_paths() {
+  [[ -r "$1" ]] || return 0
+  awk '
+    /^[[:space:]]*#/ { next }
+    function emit(v,   n, i, a) { gsub(/[\[\]"\047]/, "", v); n = split(v, a, ","); for (i = 1; i <= n; i++) { gsub(/^[ \t]+|[ \t]+$/, "", a[i]); if (a[i] != "") print a[i] } }
+    /^path\.data[[:space:]]*:/ { v = $0; sub(/^[^:]*:[[:space:]]*/, "", v); if (v != "") emit(v); else inlist = 1; next }
+    /^path[[:space:]]*:[[:space:]]*$/ { inpath = 1; next }
+    inpath && /^[[:space:]]+data[[:space:]]*:/ { v = $0; sub(/^[^:]*:[[:space:]]*/, "", v); if (v != "") emit(v); else inlist = 1; next }
+    inlist && /^[[:space:]]*-[[:space:]]*/ { v = $0; sub(/^[[:space:]]*-[[:space:]]*/, "", v); emit(v); next }
+    /^[^[:space:]]/ { inpath = 0; inlist = 0 }
+    /^[[:space:]]+[a-z]/ && !/^[[:space:]]+data/ { inlist = 0 }
+  ' "$1" 2>/dev/null
+}
+DATA_PATHS=()
+for p in ${USER_PATHS[@]+"${USER_PATHS[@]}"}; do DATA_PATHS+=("$p"); done
+while read -r p; do [[ -n "$p" ]] && DATA_PATHS+=("$p"); done < <(
+  printf '%s' "$ES_CMDLINE" | grep -oE 'path\.data=[^ ]+' | cut -d= -f2 | tr ',' '\n'
+  yml_data_paths "$CONF_DIR/elasticsearch.yml")
+[[ ${#DATA_PATHS[@]} -eq 0 && -d /var/lib/elasticsearch ]] && DATA_PATHS+=(/var/lib/elasticsearch)
+
+# 결과 저장 위치: -o 를 안 줬으면 ES data 와 다른 파일시스템이면서 여유가 50MB 이상인 곳을 고른다.
+# 측정 대상 디스크에 결과를 쓰면 그만큼 측정값이 오염되기 때문이다
+same_fs_as_data() {
+  local d dev; dev=$(stat -c %d "$1" 2>/dev/null) || return 1
+  for d in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do
+    [[ -e "$d" && "$(stat -c %d "$d" 2>/dev/null)" == "$dev" ]] && return 0
+  done
+  return 1
+}
+if [[ $OUT_GIVEN -eq 0 ]] && same_fs_as_data "$OUT_BASE"; then
+  for cand in /var/tmp /root "${HOME:-/root}" /opt /home; do
+    [[ -d "$cand" && -w "$cand" ]] || continue
+    same_fs_as_data "$cand" && continue
+    [[ "$(df -Pk "$cand" 2>/dev/null | awk 'NR==2{print $4}')" -ge 51200 ]] 2>/dev/null || continue
+    msg "결과 저장 위치를 $cand 로 정했습니다 ($OUT_BASE 는 ES data 와 같은 디스크)"
+    OUT_BASE="$cand"; break
+  done
+fi
+
 HOST=$(hostname 2>/dev/null || echo unknown)
 TS=$(date +%Y%m%d_%H%M%S)
 OUT="$OUT_BASE/esdisk_${HOST}_${TS}"
@@ -114,6 +172,8 @@ read -r UP0 _ < /proc/uptime; echo "start_uptime=$UP0" >> "$OUT/meta"
 # -p 로 준 경로는 공백이 들어갈 수 있으므로 한 줄에 하나씩 따로 저장 (meta 는 호환용)
 : > "$OUT/user_paths"
 for p in ${USER_PATHS[@]+"${USER_PATHS[@]}"}; do printf '%s\n' "$p" >> "$OUT/user_paths"; done
+# 수집기가 찾은 data 경로 후보 (ES 가 내려가 있어도 분석기가 장치를 특정할 수 있게)
+for p in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do printf '%s\n' "$p"; done > "$S/data_paths"
 
 msg "수집 시작 → $OUT  (측정 ${DUR}s / 간격 ${INT}s)"
 
@@ -319,16 +379,7 @@ if [[ $NO_SAR -eq 0 ]] && command -v sar >/dev/null 2>&1; then
 fi
 echo "read_sar_bytes=$SAR_BYTES" >> "$OUT/meta"
 
-# ── ES 프로세스 ─────────────────────────────────────────────────────────────
-# pgrep -f 는 패턴 문자열을 포함한 다른 명령(tail, 셸 등)도 잡으므로 java 프로세스만 고른다
-ES_PID=""
-for p in $(pgrep -f 'org\.elasticsearch\.bootstrap\.Elasticsearch' 2>/dev/null); do
-  [[ "$p" == "$$" ]] && continue
-  a0=$(tr '\0' '\n' < /proc/$p/cmdline 2>/dev/null | head -1)
-  c=$(cat /proc/$p/comm 2>/dev/null)
-  if [[ "$c" == "java" || "${a0##*/}" == java* ]]; then ES_PID=$p; break; fi
-done
-N_ES=$(for p in $(pgrep -x java 2>/dev/null); do grep -qa 'org.elasticsearch.bootstrap.Elasticsearch' /proc/$p/cmdline 2>/dev/null && echo $p; done | wc -l)
+# ── ES 프로세스 (앞에서 찾은 값을 기록) ───────────────────────────────────
 echo "es_instances=$N_ES" >> "$OUT/meta"
 echo "es_pid=$ES_PID" >> "$OUT/meta"
 if [[ -n "$ES_PID" && -d /proc/$ES_PID ]]; then
@@ -346,8 +397,6 @@ if [[ -n "$ES_PID" && -d /proc/$ES_PID ]]; then
     done
   } > "$S/es_cgroup_io" 2>/dev/null
   # elasticsearch.yml: 필요한 키만 추출 (비밀정보 제외)
-  CONF_DIR=$(grep -oE 'es\.path\.conf=[^ ]+' "$S/es_cmdline" 2>/dev/null | head -1 | cut -d= -f2)
-  CONF_DIR=${CONF_DIR:-/etc/elasticsearch}
   if [[ -r "$CONF_DIR/elasticsearch.yml" ]]; then
     grep -vE '^\s*#' "$CONF_DIR/elasticsearch.yml" | grep -viE 'password|secret|token|key' \
       | grep -E '^\s*(path|data|bootstrap|node\.roles|node\.attr|index\.store|cluster\.routing|- )' > "$S/es_yml" 2>/dev/null
@@ -408,29 +457,68 @@ es_get() {  # $1=path $2=outfile  → http code 출력
   printf '%s\t%s\t%s\n' "$code" "$(stat -c %s "$2" 2>/dev/null || echo 0)" "${1%%\?*}" >> "$ES_CALLS"
   printf '%s' "$code"
 }
+# ES 가 실제로 열고 있는 포트를 ES 프로세스의 소켓에서 찾는다.
+# network.host 를 특정 IP 로 묶어 localhost 로는 안 붙는 경우, http.port 를 바꾼 경우에도 주소를 몰라도 되게.
+# /proc/<pid>/net/tcp 는 ES 프로세스의 network namespace 기준이라 컨테이너 안 ES 도 맞게 읽힌다
+es_listen_addrs() {
+  local pid=$1 inodes
+  [[ -n "$pid" && -d /proc/$pid/fd ]] || return 0
+  inodes=$(ls -l /proc/$pid/fd 2>/dev/null | sed -n 's/.*socket:\[\([0-9]*\)\].*/\1/p' | tr '\n' ' ')
+  [[ -n "$inodes" ]] || return 0
+  awk -v inodes=" $inodes " '
+    function h2d(h,   i, v) { v = 0; h = toupper(h); for (i = 1; i <= length(h); i++) v = v * 16 + index("0123456789ABCDEF", substr(h, i, 1)) - 1; return v }
+    function v4(h) { return h2d(substr(h, 7, 2)) "." h2d(substr(h, 5, 2)) "." h2d(substr(h, 3, 2)) "." h2d(substr(h, 1, 2)) }
+    FNR > 1 && $4 == "0A" && index(inodes, " " $10 " ") {
+      split($2, a, ":"); ip = a[1]; host = ""
+      if (length(ip) == 8) host = (ip == "00000000") ? "localhost" : v4(ip)
+      else if (ip ~ /^0+$/ || ip == "00000000000000000000000001000000") host = "localhost"
+      else if (substr(ip, 1, 24) == "0000000000000000FFFF0000") host = v4(substr(ip, 25, 8))
+      if (host != "") print h2d(a[2]), host
+    }' /proc/$pid/net/tcp /proc/$pid/net/tcp6 2>/dev/null | sort -n -u | head -8
+}
+
 ES_OK=0
 if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
   c=""
   if [[ -z "$ES_URL" ]]; then
-    for u in http://localhost:9200 https://localhost:9200; do
-      ES_URL=$u; c=$(es_get "" "$S/es_root.json")
-      [[ "$c" == "200" || "$c" == "401" ]] && break
+    CANDS=()
+    while read -r port host; do
+      [[ -n "$port" ]] && CANDS+=("$host:$port")
+    done < <(es_listen_addrs "$ES_PID")
+    CANDS+=("localhost:9200")
+    for hp in "${CANDS[@]}"; do
+      for sch in http https; do
+        ES_URL="$sch://$hp"; c=$(es_get "" "$S/es_root.json")
+        [[ "$c" == "200" || "$c" == "401" ]] && break 2
+      done
     done
+    [[ "$c" == "200" || "$c" == "401" ]] && msg "ES 주소 자동 탐지: $ES_URL"
   fi
   [[ -n "$c" ]] || c=$(es_get "" "$S/es_root.json")
+  # 인증이 필요한데 계정을 안 줬으면, 터미널에서 실행 중일 때 직접 물어본다.
+  # 비밀번호가 셸 history 나 프로세스 목록에 남지 않는다
+  if [[ "$c" == "401" && -z "$ES_USER" && -z "$ES_API_KEY" && -t 0 && -r /dev/tty ]]; then
+    msg "ES 가 인증을 요구합니다. 조회 전용 권한(monitor)이면 충분합니다. 빈 값으로 Enter 를 누르면 ES 조회 없이 진행합니다"
+    read -r -p "  ES 사용자: " ES_USER < /dev/tty
+    if [[ -n "$ES_USER" ]]; then
+      read -rs -p "  비밀번호: " ES_PASSWORD < /dev/tty; echo >&2
+      c=$(es_get "" "$S/es_root.json")
+      [[ "$c" == "401" ]] && msg "⚠ 인증 실패 (401). OS 레벨만 수집합니다"
+    fi
+  fi
   echo "es_url=$ES_URL" >> "$OUT/meta"; echo "es_http=$c" >> "$OUT/meta"
   if [[ "$c" == "200" ]]; then
     ES_OK=1
     es_get "_nodes/_local?filter_path=nodes.*.name,nodes.*.version,nodes.*.roles,nodes.*.process.mlockall,nodes.*.settings.path,nodes.*.jvm.mem,nodes.*.os.allocated_processors" "$S/es_nodeinfo.json" >/dev/null
     es_get "_cluster/settings?include_defaults=true&flat_settings=true&filter_path=**.cluster.routing.allocation.disk*,**.cluster.routing.allocation.awareness*" "$S/es_cluster_settings.json" >/dev/null
-    es_get "_cluster/health?filter_path=status,number_of_nodes,relocating_shards,initializing_shards,unassigned_shards" "$S/es_health.json" >/dev/null
+    es_get "_cluster/health?filter_path=status,number_of_nodes,active_shards,relocating_shards,initializing_shards,unassigned_shards" "$S/es_health.json" >/dev/null
   elif [[ "$c" == "401" ]]; then
     msg "⚠ ES 인증 필요 (401). --es-user + ES_PASSWORD 또는 ES_API_KEY 지정 시 ES 지표 포함"
   else
     msg "⚠ ES API 접속 실패 (http=$c). OS 레벨만 수집합니다"
   fi
 fi
-NODE_STATS_PATH="_nodes/_local/stats/indices,fs,thread_pool,jvm,indexing_pressure?filter_path=nodes.*.timestamp,nodes.*.name,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.store,nodes.*.indices.segments,nodes.*.indices.translog,nodes.*.fs,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.jvm.gc,nodes.*.indexing_pressure"
+NODE_STATS_PATH="_nodes/_local/stats/indices,fs,thread_pool,jvm,indexing_pressure?filter_path=nodes.*.timestamp,nodes.*.name,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.store,nodes.*.indices.segments,nodes.*.indices.translog,nodes.*.fs,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.jvm.gc,nodes.*.indexing_pressure,nodes.*.indices.shard_stats"
 # 디스크와 직결되는 인덱스 설정. include_defaults 를 쓰지 않으므로 "명시적으로 바꾼 인덱스"만 응답에 들어온다
 IDX_SETTINGS_PATH="_all/_settings?flat_settings=true&filter_path=**.index.translog.durability,**.index.translog.sync_interval,**.index.translog.flush_threshold_size,**.index.merge.scheduler.max_thread_count,**.index.store.type,**.index.store.preload,**.index.refresh_interval"
 IDX_STATS_PATH="_nodes/_local/stats/indices?level=indices&filter_path=nodes.*.indices.*.indexing.index_total,nodes.*.indices.*.indexing.index_time_in_millis,nodes.*.indices.*.merges.total_time_in_millis,nodes.*.indices.*.merges.total_size_in_bytes,nodes.*.indices.*.refresh.total,nodes.*.indices.*.store.size_in_bytes,nodes.*.indices.*.segments.count,nodes.*.indices.*.search.query_total"
@@ -438,6 +526,16 @@ CLUSTER_STATS_PATH="_nodes/stats/fs,indices,thread_pool,jvm,os?filter_path=nodes
 
 if [[ $ES_OK -eq 1 ]]; then
   es_get "$NODE_STATS_PATH" "$S/es_stats_start.json" >/dev/null
+  # 인덱스 수에 비례해 커지는 조회(인덱스별 통계, _all/_settings, _ilm/explain)는 규모가 크면 알아서 뺀다.
+  # 사용자가 클러스터 규모를 보고 --no-index-stats 를 판단하지 않아도 되게. 기준은 실무 기준
+  if [[ $NO_IDXSTATS -eq 0 ]]; then
+    NODE_SHARDS=$(grep -oE '"total_count": *[0-9]+' "$S/es_stats_start.json" 2>/dev/null | head -1 | tr -dc '0-9')
+    CL_SHARDS=$(grep -oE '"active_shards": *[0-9]+' "$S/es_health.json" 2>/dev/null | head -1 | tr -dc '0-9')
+    if [[ "${NODE_SHARDS:-0}" -ge 2000 || "${CL_SHARDS:-0}" -ge 20000 ]]; then
+      NO_IDXSTATS=1; echo "index_stats_auto_skip=1" >> "$OUT/meta"
+      msg "샤드가 많아(이 노드 ${NODE_SHARDS:-?}개, 클러스터 ${CL_SHARDS:-?}개) 인덱스별 조회는 생략합니다"
+    fi
+  fi
   [[ $NO_IDXSTATS -eq 0 ]] && es_get "$IDX_STATS_PATH" "$S/es_idx_start.json" >/dev/null
   [[ $NO_IDXSTATS -eq 0 ]] && es_get "$IDX_SETTINGS_PATH" "$S/es_idx_settings.json" >/dev/null
   # ── 클러스터 전체: 로컬 측정과 같은 창으로 1차 스냅샷 ────────────────
@@ -514,7 +612,7 @@ echo "end_wall=$(date '+%Y-%m-%d %H:%M:%S %z')" >> "$OUT/meta"
 msg "[3/4] 종료 스냅샷"
 if [[ $ES_OK -eq 1 ]]; then
   es_get "$NODE_STATS_PATH" "$S/es_stats_end.json" >/dev/null
-  es_get "$IDX_STATS_PATH"  "$S/es_idx_end.json"   >/dev/null
+  [[ $NO_IDXSTATS -eq 0 ]] && es_get "$IDX_STATS_PATH"  "$S/es_idx_end.json"   >/dev/null
   if [[ $NO_CLUSTER -eq 0 ]]; then
     es_get "$CLUSTER_STATS_PATH" "$C/node_stats_2.json" >/dev/null
     es_get "_cat/recovery?format=json&active_only=true&h=index,shard,type,stage,source_node,target_node,bytes_total,bytes_percent,time" "$C/cat_recovery_end.json" >/dev/null
@@ -535,13 +633,13 @@ awk -F'\t' '{n++; b+=$2} END{printf "es_api_calls=%d\nes_api_bytes=%d\n", n+0, b
   echo "light_mode=$(( NO_ESLOG & NO_KLOG & NO_SAR & NO_MAPS ))"
   echo "skipped=$( [[ $NO_ESLOG -eq 1 ]] && printf 'eslog '; [[ $NO_KLOG -eq 1 ]] && printf 'klog '; \
                    [[ $NO_SAR -eq 1 ]] && printf 'sar '; [[ $NO_MAPS -eq 1 ]] && printf 'maps '; \
-                   [[ $NO_IDXSTATS -eq 1 ]] && printf 'index-stats ' )"
+                   [[ $NO_IDXSTATS -eq 1 ]] && printf 'index-stats%s ' "$(grep -q '^index_stats_auto_skip=1' "$OUT/meta" && echo '(자동)')" )"
 } >> "$OUT/meta"
 
 # 결과를 ES data 와 같은 파일시스템에 쓰고 있으면 경고.
 # 측정 대상 디스크에 쓰기를 더하는 셈이고 그만큼 측정값이 오염된다
 OUT_DEV=$(df -Pk "$OUT_BASE" 2>/dev/null | awk 'NR==2{print $1}')
-for dp in ${USER_PATHS[@]+"${USER_PATHS[@]}"} /var/lib/elasticsearch; do
+for dp in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do
   [[ -d "$dp" ]] || continue
   if [[ "$(df -Pk "$dp" 2>/dev/null | awk 'NR==2{print $1}')" == "$OUT_DEV" ]]; then
     msg "⚠ 결과 저장 위치($OUT_BASE)가 ES data 경로($dp)와 같은 파일시스템입니다."
@@ -550,6 +648,17 @@ for dp in ${USER_PATHS[@]+"${USER_PATHS[@]}"} /var/lib/elasticsearch; do
     break
   fi
 done
+
+# es_disk_bench.sh 로 이 서버에서 잰 결과가 있으면 번들에 함께 넣는다 (최근 180일, 가장 최신 1건).
+# 리포트에 "최대 능력 대비 사용률"이 자동으로 나오고, --bench 로 따로 연결하지 않아도 된다
+BENCH_SRC=$(for d in "$OUT_BASE" /tmp /var/tmp; do
+              find "$d" -maxdepth 1 -type d -name "esbench_${HOST}_*" -mtime -180 -printf '%T@\t%p\n' 2>/dev/null
+            done | sort -rn | head -1 | cut -f2-)
+if [[ -n "$BENCH_SRC" ]] && ls "$BENCH_SRC"/*.json >/dev/null 2>&1; then
+  mkdir -p "$OUT/bench" && cp "$BENCH_SRC"/*.json "$OUT/bench/" 2>/dev/null
+  echo "bench_src=$BENCH_SRC" >> "$OUT/meta"
+  msg "벤치 결과를 함께 넣었습니다: $BENCH_SRC"
+fi
 
 # =============================================================================
 # 4. 번들 + HTML

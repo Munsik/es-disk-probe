@@ -12,8 +12,9 @@
 #   ES_PASSWORD='***' ./es_cluster_probe.sh --es-url https://es:9200 --es-user elastic
 #   ES_API_KEY='...'  ./es_cluster_probe.sh --es-url https://es:9200 -g 120
 #
-#   --es-url URL  ES 주소 (기본 http://localhost:9200)
+#   --es-url URL  ES 주소 (기본: localhost:9200 을 http, https 순서로 시도)
 #   --es-user U   ES 사용자. 비밀번호는 환경변수 ES_PASSWORD, API Key 는 ES_API_KEY
+#                 둘 다 없고 ES 가 인증을 요구하면 터미널에서 물어봅니다
 #   -g SEC        두 스냅샷 사이 간격 (기본 60초, 길수록 안정적. 최소 10)
 #   -o DIR        결과 위치 (기본 /tmp)
 #   --deep        인덱스별 용량까지 수집 (인덱스가 많으면 응답이 커짐)
@@ -24,14 +25,14 @@
 # ⚠ 기본 동작은 curl -k (인증서 검증 생략)입니다. 사내 보안 정책상 검증이 필요하면
 #   --strict-tls 또는 --cacert 를 쓰세요.
 #
-# 결과: <출력>/escluster_<ts>/  →  es_disk_render.py <노드번들> --cluster <이 디렉터리>
-#       노드 번들 없이 클러스터만 볼 때:  es_disk_render.py --cluster-only <이 디렉터리>
+# 결과: <출력>/escluster_<ts>/ 와 그 안의 es_cluster_report.html (python3 가 있으면 자동 생성)
+#       노드 번들과 합쳐 보려면:  es_disk_render.py <노드번들> --cluster <이 디렉터리>
 # =============================================================================
 set -u
 umask 077
 export LC_ALL=C
 
-ES_URL="http://localhost:9200"; ES_USER=""; GAP=60; OUT_BASE="/tmp"; DEEP=0
+ES_URL=""; ES_USER=""; GAP=60; OUT_BASE="/tmp"; DEEP=0
 STRICT=0; CACERT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -67,9 +68,26 @@ es_get() {  # $1=path $2=outfile
       -o "$2" -w '%{http_code}' "${ES_URL}/$1" 2>/dev/null || true
 }
 
-CODE=$(es_get "" "$OUT/root.json")
+if [[ -z "$ES_URL" ]]; then
+  for ES_URL in http://localhost:9200 https://localhost:9200; do
+    CODE=$(es_get "" "$OUT/root.json")
+    [[ "$CODE" == "200" || "$CODE" == "401" ]] && break
+  done
+else
+  CODE=$(es_get "" "$OUT/root.json")
+fi
+if [[ "$CODE" == "401" && -z "$ES_USER" && -z "$ES_API_KEY" && -t 0 && -r /dev/tty ]]; then
+  msg "ES 가 인증을 요구합니다 ($ES_URL). 조회 전용 권한(monitor)이면 충분합니다"
+  read -r -p "  ES 사용자: " ES_USER < /dev/tty
+  read -rs -p "  비밀번호: " ES_PASSWORD < /dev/tty; echo >&2
+  CODE=$(es_get "" "$OUT/root.json")
+fi
 if [[ "$CODE" != "200" ]]; then
-  echo "ES 접속 실패 (http=$CODE). --es-url / 인증 정보를 확인하세요."
+  if [[ "$CODE" == "401" ]]; then
+    echo "ES 인증 실패 (401, $ES_URL). --es-user 와 ES_PASSWORD, 또는 ES_API_KEY 를 확인하세요."
+  else
+    echo "ES 접속 실패 (http=$CODE, 마지막 시도 $ES_URL). ES 가 다른 주소에 있으면 --es-url 로 지정하세요."
+  fi
   [[ $STRICT -eq 1 ]] && echo "  인증서 검증 모드입니다. 자체 서명 인증서라면 --cacert 로 CA를 지정하세요."
   rm -rf "$OUT"; exit 2
 fi
@@ -102,4 +120,13 @@ echo "end_wall=$(date '+%Y-%m-%d %H:%M:%S %z')" >> "$OUT/meta"
 
 tar -C "$OUT_BASE" -czf "$OUT.tar.gz" "$(basename "$OUT")" 2>/dev/null
 msg "완료: $OUT  (번들 $OUT.tar.gz)"
-msg "리포트에 반영: python3 es_disk_render.py <노드 번들> --cluster $OUT"
+HERE="$(cd "$(dirname "$0")" && pwd)"; PY=""
+for c in python3 /usr/libexec/platform-python; do
+  command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info>=(3,6) else 1)' 2>/dev/null && { PY="$c"; break; }
+done
+if [[ -n "$PY" && -f "$HERE/es_disk_render.py" ]]; then
+  "$PY" "$HERE/es_disk_render.py" --cluster-only "$OUT" -o "$OUT/es_cluster_report.html"
+else
+  msg "HTML 은 PC 에서: python3 es_disk_render.py --cluster-only $(basename "$OUT").tar.gz"
+fi
+msg "노드 번들과 합쳐 보려면: python3 es_disk_render.py <노드 번들> --cluster $OUT"

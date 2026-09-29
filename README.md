@@ -123,8 +123,8 @@ ES 쪽 부하는 GET 19회가 전부이고 모두 모니터링용 조회입니�
 | `_nodes/stats` (클러스터 전체) | 2 | 노드 수에 비례 |
 | 나머지 14회 (`_cat/*`, `_cluster/health`, `_snapshot/_status` 등) | 각 1~2 | 무시할 수준 |
 
-인덱스가 수천 개인 클러스터라면 `--no-index-stats`로 앞의 두 개를 빼거나,
-`--no-cluster`로 클러스터 조회를 전부 생략해 9회로 줄일 수 있습니다.
+샤드가 많으면(이 노드 2,000개 이상 또는 클러스터 20,000개 이상) 인덱스 수에 비례하는 조회는 자동으로 뺍니다.
+기준은 실무 기준입니다. 그보다 작아도 빼고 싶으면 `--no-index-stats`, 클러스터 조회를 전부 생략하려면 `--no-cluster`를 쓰세요.
 `_snapshot/_status`는 인자 없이 호출하므로 실행 중인 snapshot만 보는 가벼운 형태입니다.
 저장소를 읽는 무거운 형태가 아닙니다.
 
@@ -133,8 +133,9 @@ ES 프로세스에 직접 닿는 동작은 하나입니다. `/proc/<pid>/maps`�
 ES가 segment를 열거나 닫을 때(`mmap`, `munmap`) 잠깐 경합하는 정도입니다. 이것도 피하려면 `--light`를 쓰세요.
 나머지 `/proc/<pid>/io`, `/proc/<pid>/task/*/stat` 읽기는 lock을 잡지 않습니다.
 
-결과 저장 위치는 ES data와 다른 디스크로 두세요. 같은 파일시스템이면 측정 대상 디스크에 쓰기를 더하게 되고
-그만큼 측정값이 오염됩니다. 도구가 이 상황을 감지하면 경고하고 리포트에도 표시합니다.
+결과 저장 위치는 ES data와 다른 디스크여야 합니다. 같은 파일시스템이면 측정 대상 디스크에 쓰기를 더하게 되고
+그만큼 측정값이 오염됩니다. `-o`를 안 주면 도구가 ES data와 다른 디스크를 골라 씁니다.
+`-o`로 직접 준 위치가 같은 디스크면 경고하고 리포트에도 표시합니다.
 
 실행할 때마다 그 실행의 실측 부하가 리포트의 "이 진단이 서버에 준 부하" 섹션에 찍힙니다.
 리포트를 받은 사람이 직접 확인할 수 있게 넣었습니다.
@@ -237,17 +238,36 @@ git clone https://github.com/Munsik/es-disk-probe.git
 cd es-disk-probe
 chmod +x *.sh
 
-# 데이터 노드에서 피크 시간대에 실행 (기본 300초, 5초 간격)
-sudo ES_PASSWORD='***' ./es_disk_collect.sh --es-user elastic -d 600
+# 데이터 노드에서 피크 시간대에 실행 (기본 300초, 5초 간격). 옵션 없이 실행하면 됩니다
+sudo ./es_disk_collect.sh
 ```
 
-끝나면 리포트 경로가 출력됩니다.
+ES가 인증을 요구하면 사용자와 비밀번호를 물어봅니다. 조회 전용 권한(`monitor`)이면 충분합니다.
+끝나면 리포트 경로와 판정이 출력됩니다.
 
 ```
-[14:22:31] HTML 리포트: /tmp/esdisk_es-hot-01_20260923_142031/es_disk_report.html
-[14:22:31] 완료. 번들: /tmp/esdisk_es-hot-01_20260923_142031.tar.gz
+[14:17:02] ES 주소 자동 탐지: https://10.10.1.21:9200
+[14:22:31] HTML 리포트: /var/tmp/esdisk_es-hot-01_20260923_142031/es_disk_report.html
+플랫폼: bare-metal · 판정 기준: NVMe (자동 판정)
 판정: 디스크 성능 저하 징후가 있습니다 · 조치 필요 7건
 ```
+
+### 알아서 판단하는 것
+
+사용자가 정할 필요가 없도록 아래는 도구가 자동으로 정합니다. 자동 판단이 틀렸을 때만 옵션으로 바꾸세요.
+
+| 항목 | 자동으로 하는 일 | 바꾸는 옵션 |
+|---|---|---|
+| 플랫폼 | VMware, bare-metal(로컬·SAN), 그 밖의 VM·클라우드 판별 | `--platform` |
+| 판정 기준 매체 | NVMe·SSD·HDD, SAN, vSAN 판별 (vSAN 종류만은 Guest에서 알 수 없어 All-Flash가 기본) | `-s` |
+| ES 주소 | ES 프로세스가 실제로 열어 둔 포트를 찾아 http, https 순서로 접속. `network.host` 를 IP로 묶은 경우도 찾음 | `--es-url` |
+| ES 인증 | 401이면 터미널에서 사용자·비밀번호를 물어봄. 비밀번호가 셸 history에 남지 않음 | `--es-user` + `ES_PASSWORD`, `ES_API_KEY` |
+| ES data 경로 | ES 프로세스, `elasticsearch.yml` 의 `path.data` 에서 찾음 (ES가 내려가 있어도) | `-p` |
+| 결과 저장 위치 | `/tmp` 가 ES data와 같은 디스크면 `/var/tmp`, `/root` 등 다른 디스크로 자동 변경 | `-o` |
+| 인덱스별 조회 | 이 노드 샤드 2,000개 이상이거나 클러스터 샤드 20,000개 이상이면 생략 | `--no-index-stats` |
+| 벤치 결과 | 같은 서버에서 `es_disk_bench.sh` 로 잰 최근 결과(180일 이내)를 번들에 넣어 리포트에 반영 | 분석기 `--bench` |
+| 클러스터 조회 | 권한이 없으면(403) 이 노드 결과만으로 리포트 | `--no-cluster` |
+| 리포트 생성 | 서버에 Python 3.6 이상이 있으면 바로 HTML 생성 (RHEL 8 platform-python 포함) | `--no-render` |
 
 서버에 `python3`가 없으면 번들만 옮겨 PC에서 만듭니다.
 
@@ -280,7 +300,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 -d SEC        측정 시간 (기본 300)
 -i SEC        샘플 간격 (기본 5)
 -p PATH       ES data 경로 (여러 번 지정 가능, 안 주면 자동 탐지)
--o DIR        결과 저장 위치 (기본 /tmp)
+-o DIR        결과 저장 위치 (기본 /tmp. ES data 와 같은 디스크면 다른 곳으로 자동 변경)
 -s TYPE       스토리지 유형 (기본 auto)
               VMware vSAN: allflash | hybrid
               bare-metal·SAN: nvme | ssd | hdd  (RAID 컨트롤러 뒤라 매체를 못 읽을 때 지정)
@@ -295,7 +315,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 부하를 줄이는 옵션 (위 "이 도구가 서버에 주는 부하" 참조)
 --light           디스크를 읽는 부가 수집 전부 생략. 디스크 읽기 0
 --no-eslog        ES 서버 로그 읽기만 생략. 읽기량의 대부분
---no-index-stats  인덱스 수에 비례하는 ES 조회 2건 생략
+--no-index-stats  인덱스 수에 비례하는 ES 조회 생략 (샤드가 많으면 자동으로 생략)
 ```
 
 환경변수로 세부 조정할 수 있습니다.

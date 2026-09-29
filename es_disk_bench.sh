@@ -15,14 +15,16 @@
 #   - 테스트 전용 하위 디렉터리만 사용하고 종료 시(중단 포함) 삭제
 #   - drop_caches, sync 강제, 원시 장치 쓰기는 하지 않음 (direct I/O 파일 테스트만)
 #
-# 사용: sudo ./es_disk_bench.sh -t /var/lib/elasticsearch [-s 4G] [-r 30] [-o /tmp]
+# 사용: sudo ./es_disk_bench.sh [-t /var/lib/elasticsearch] [-s 4G] [-r 30] [-o /tmp]
 #
-#   -t PATH           측정할 ES data 경로 (필수, 존재하는 디렉터리)
+#   -t PATH           측정할 ES data 경로. 안 주면 elasticsearch.yml 의 path.data 에서 찾음
+#                     (ES_PATH_CONF 또는 /etc/elasticsearch). 경로가 여러 개면 -t 로 골라 주세요
 #   -s SIZE           테스트 파일 크기 (기본 4G. 4G / 512M / 1048576 형식)
 #   -r SEC            테스트당 실행 시간 (기본 30, 최소 5)
 #   -o DIR            결과 저장 위치 (기본 /tmp)
 #   --force-with-es   ES 가 떠 있어도 실행 (영향을 감수할 때만)
-# 결과: <출력>/esbench_<host>_<ts>/*.json  →  es_disk_render.py --bench <이 디렉터리>
+# 결과: <출력>/esbench_<host>_<ts>/*.json
+#       같은 서버에서 es_disk_collect.sh 를 실행하면 최근 결과를 자동으로 찾아 리포트에 넣습니다
 #
 # 해석 주의: 테스트 파일이 vSAN 캐시 계층이나 RAID 컨트롤러·어레이 캐시에 들어가면
 #            결과가 실제보다 좋게 나옵니다.
@@ -41,7 +43,27 @@ while [[ $# -gt 0 ]]; do
     *) echo "알 수 없는 옵션: $1"; exit 1 ;;
   esac
 done
-[[ -n "$TARGET" && -d "$TARGET" ]] || { echo "-t 로 ES data 경로(존재하는 디렉터리)를 지정하세요"; exit 1; }
+# -t 가 없으면 elasticsearch.yml 에서 path.data 를 찾는다 (es_disk_collect.sh 와 같은 해석)
+if [[ -z "$TARGET" ]]; then
+  YML="${ES_PATH_CONF:-/etc/elasticsearch}/elasticsearch.yml"
+  mapfile -t FOUND < <(awk '
+    /^[[:space:]]*#/ { next }
+    function emit(v,   n, i, a) { gsub(/[\[\]"\047]/, "", v); n = split(v, a, ","); for (i = 1; i <= n; i++) { gsub(/^[ \t]+|[ \t]+$/, "", a[i]); if (a[i] != "") print a[i] } }
+    /^path\.data[[:space:]]*:/ { v = $0; sub(/^[^:]*:[[:space:]]*/, "", v); if (v != "") emit(v); else inlist = 1; next }
+    /^path[[:space:]]*:[[:space:]]*$/ { inpath = 1; next }
+    inpath && /^[[:space:]]+data[[:space:]]*:/ { v = $0; sub(/^[^:]*:[[:space:]]*/, "", v); if (v != "") emit(v); else inlist = 1; next }
+    inlist && /^[[:space:]]*-[[:space:]]*/ { v = $0; sub(/^[[:space:]]*-[[:space:]]*/, "", v); emit(v); next }
+    /^[^[:space:]]/ { inpath = 0; inlist = 0 }
+    /^[[:space:]]+[a-z]/ && !/^[[:space:]]+data/ { inlist = 0 }
+  ' "$YML" 2>/dev/null)
+  [[ ${#FOUND[@]} -eq 0 && -d /var/lib/elasticsearch ]] && FOUND=(/var/lib/elasticsearch)
+  if [[ ${#FOUND[@]} -eq 1 ]]; then
+    TARGET="${FOUND[0]}"; echo "ES data 경로 자동 탐지: $TARGET"
+  elif [[ ${#FOUND[@]} -gt 1 ]]; then
+    echo "ES data 경로가 여러 개입니다. -t 로 하나를 고르세요: ${FOUND[*]}"; exit 1
+  fi
+fi
+[[ -n "$TARGET" && -d "$TARGET" ]] || { echo "ES data 경로를 찾지 못했습니다. -t 로 지정하세요 (존재하는 디렉터리)"; exit 1; }
 command -v fio >/dev/null 2>&1 || { echo "fio가 없습니다. 폐쇄망이면 OS 설치 미디어의 fio rpm/deb를 설치하세요."; exit 1; }
 
 if pgrep -f 'org\.elasticsearch\.bootstrap\.Elasticsearch' >/dev/null 2>&1 && [[ $FORCE -eq 0 ]]; then
@@ -95,4 +117,6 @@ run randrw_16k   --rw=randrw --rwmixread=70 --bs=16k --ioengine=libaio --iodepth
 # translog fsync 비용: 쓰기마다 fdatasync, 동시성 1
 run fsync_4k     --rw=write     --bs=4k  --ioengine=psync  --iodepth=1  --numjobs=1 --fdatasync=1
 
-echo "완료. 리포트에 반영: python3 es_disk_render.py <수집 번들> --bench $OUT"
+echo "완료: $OUT"
+echo "ES 를 다시 올린 뒤 같은 서버에서 es_disk_collect.sh 를 실행하면 이 결과가 리포트에 자동으로 들어갑니다."
+echo "이미 만든 번들에 넣으려면: python3 es_disk_render.py <수집 번들> --bench $OUT"

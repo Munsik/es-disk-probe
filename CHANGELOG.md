@@ -51,7 +51,27 @@ VMware 판정은 그대로다 (합성 번들 3종에서 0.9.5 와 판정 목록 
 - 플랫폼 판별 원자료, NVMe·FC·iSCSI·mdstat, CPU governor 수집 (모두 /proc·/sys 읽기)
 - `--platform`, `--smart` 옵션. 분석기에도 `--platform`, `--storage auto|allflash|hybrid|nvme|ssd|hdd`
 
+### 사용성: 사람이 정하던 것을 도구가 판단
+- ES 주소: localhost:9200 만 시도하던 것을 ES 프로세스가 실제로 LISTEN 중인 포트(/proc/<pid>/net/tcp)에서 찾아
+  http, https 순서로 접속. network.host 를 특정 IP 로 묶은 운영 노드에서 --es-url 없이 붙음
+- ES 인증: 401 이고 계정을 안 줬으면 터미널에서 사용자·비밀번호를 물어봄. 비밀번호를 환경변수로 넘기지 않아도 되고 셸 history 에 남지 않음
+  (es_cluster_probe.sh 도 같음)
+- ES data 경로: ES 프로세스 인자와 elasticsearch.yml 의 path.data 를 수집 시작 전에 읽음. ES 가 내려가 있어도 장치를 특정
+- 결과 저장 위치: -o 를 안 줬고 /tmp 가 ES data 와 같은 디스크면 /var/tmp, /root 등 다른 디스크로 자동 변경.
+  예전에는 끝난 뒤 경고만 했다
+- 인덱스별 조회: 이 노드 샤드 2,000개 이상 또는 클러스터 샤드 20,000개 이상이면 자동 생략 [실무 기준]
+- 벤치 결과: 같은 서버의 최근 es_disk_bench.sh 결과(180일 이내)를 번들에 자동으로 넣음. --bench 로 따로 연결할 필요 없음
+- es_disk_bench.sh: -t 를 안 주면 elasticsearch.yml 의 path.data 를 씀 (하나일 때)
+- es_cluster_probe.sh: --es-url 이 없으면 localhost 를 http, https 순서로 시도. 끝나면 HTML 리포트까지 생성
+- 분석기가 끝날 때 플랫폼과 판정 기준을 한 줄로 출력. vSAN 종류는 Guest 에서 알 수 없으므로 "자동 판정"이 아니라
+  "기본값"으로 표시하고 Hybrid 면 다시 분석하는 방법을 안내
+- 한 서버에 ES 노드가 여러 개면 어느 노드 기준으로 수집하는지 알림
+
+### 수정
+- --no-index-stats 를 줘도 종료 시점에 인덱스별 통계를 한 번 더 조회하던 문제
+
 ### 문서·테스트
+- README: 빠른 시작을 옵션 없는 실행으로, "알아서 판단하는 것" 표 추가
 - README: 플랫폼별 판정 절, 병목 위치 표를 플랫폼별로, 기준값 출처 보강, 트러블슈팅
 - GUARDLINE: bare-metal 설계 기준(1-B), 하드웨어·스토리지 담당자 체크리스트(7-B, 7-C)
 - `tests/`: 합성 번들 생성기와 10개 시나리오 판정 테스트

@@ -894,6 +894,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         if "path.data=" in l:
             cand += l.split("path.data=", 1)[1].split(",")
     cand += yml_data_paths(rd(S, "es_yml"))
+    cand += [l.strip() for l in rd(S, "data_paths").splitlines() if l.strip()]
     if not cand:
         cand = ["/var/lib/elasticsearch"]
     data_paths = []
@@ -2064,6 +2065,9 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
                     "·vSAN" if is_vmware else ("·RAID 점검(patrol read, consistency check)" if kind == "baremetal" else "")), "sysstat sar 이력")
 
     # ═════════════ 10. 벤치(선택) → 여유율 ═════════════
+    # 수집기가 번들에 넣어 둔 벤치 결과가 있으면 --bench 없이도 쓴다
+    if not bench_dir and os.path.isdir(os.path.join(base, "bench")):
+        bench_dir = os.path.join(base, "bench")
     bench = load_bench(bench_dir)
     headroom = []
     if bench:
@@ -2578,6 +2582,9 @@ def storage_basis(R):
     st = R["storage"]
     lab = {"allflash": "All-Flash vSAN", "hybrid": "Hybrid vSAN"}.get(st, STORAGE_LABEL.get(st, st))
     how = "자동 판정" if R.get("storage_auto") else "-s 지정"
+    if R.get("platform") == "vmware" and R.get("storage_auto"):
+        # All-Flash 인지 Hybrid 인지는 Guest 에서 알 수 없다. 더 엄격한 All-Flash 를 기본으로 둔다
+        how = "기본값. Guest 에서는 vSAN 종류를 알 수 없음. Hybrid 면 --storage hybrid 로 다시 분석"
     if R.get("platform") == "baremetal" and R.get("attach") == "san" and R.get("storage_auto"):
         how = "자동 판정, SAN 은 매체를 알 수 없어 SSD 기준. 어레이가 HDD면 -s hdd"
     elif R.get("unsure") and R.get("storage_auto"):
@@ -2704,7 +2711,8 @@ def render(R, out_path):
 
     # 여유율
     if R["headroom"]:
-        h.append('<h2>최대 능력 대비 사용률</h2><p class="lead">es_disk_bench.sh로 잰 최대 능력과 이번 측정의 p95를 비교했습니다. {}</p>'.format(
+        h.append('<h2>최대 능력 대비 사용률</h2><p class="lead">es_disk_bench.sh로 잰 최대 능력{}과 이번 측정의 p95를 비교했습니다. {}</p>'.format(
+            "(" + E(os.path.basename(meta.get("bench_src", ""))) + ")" if meta.get("bench_src") else "",
             "vSAN 캐시 계층에 벤치 파일이 들어가면 최대 능력이 실제보다 높게 나오므로 사용률은 낙관적인 값입니다." if kind == "vmware" else
             "RAID 컨트롤러·스토리지 캐시에 벤치 파일이 들어가면 최대 능력이 실제보다 높게 나오므로 사용률은 낙관적인 값입니다."))
         h.append('<table><tr><th>항목</th><th>관측 p95</th><th>측정 최대</th><th>사용률</th></tr>')
@@ -3035,6 +3043,7 @@ def main():
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.bundle)), "es_disk_report_{}.html".format(R["meta"].get("host", "node")))
     render(R, out)
     print(out)
+    print("플랫폼: {} · 판정 기준: {}".format(platform_label(R), storage_basis(R)))
     print("판정: {} · 조치 필요 {}건".format(R["verdict"][1], R["n_act"]))
 
 if __name__ == "__main__":
