@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
 # es_disk_bench.sh  (v0.10.0, 선택 사항)
-# ES data 디스크의 "최대 능력"을 fio로 측정합니다. → 리포트의 여유율 계산용
+# ES data 디스크의 "최대 능력"을 측정합니다. → 리포트의 여유율 계산용
+# fio 가 있으면 fio 로 5가지(무작위 읽기, 순차 쓰기·읽기, 혼합, 동기 쓰기)를 재고,
+# 없으면 OS 기본 도구 dd 로 3가지(순차 쓰기·읽기, 동기 쓰기 지연)만 잽니다. 무작위 I/O 는 dd 로 잴 수 없습니다.
 #
 # ⚠ 이 스크립트는 디스크에 실제 부하를 겁니다. 반드시 아래 조건에서만 실행하세요.
 #   - 서비스 투입 전, 또는 해당 노드의 ES를 내린 점검 시간
@@ -64,7 +66,11 @@ if [[ -z "$TARGET" ]]; then
   fi
 fi
 [[ -n "$TARGET" && -d "$TARGET" ]] || { echo "ES data 경로를 찾지 못했습니다. -t 로 지정하세요 (존재하는 디렉터리)"; exit 1; }
-command -v fio >/dev/null 2>&1 || { echo "fio가 없습니다. 폐쇄망이면 OS 설치 미디어의 fio rpm/deb를 설치하세요."; exit 1; }
+ENGINE=fio
+if ! command -v fio >/dev/null 2>&1; then
+  ENGINE=dd
+  echo "fio 가 없어 dd 로 측정합니다 (순차 쓰기·읽기, 동기 쓰기 지연). 무작위 I/O 까지 재려면 fio 를 설치하세요."
+fi
 
 if pgrep -f 'org\.elasticsearch\.bootstrap\.Elasticsearch' >/dev/null 2>&1 && [[ $FORCE -eq 0 ]]; then
   echo "ES가 실행 중입니다. 벤치 부하가 서비스 I/O와 경합하므로 실행하지 않습니다."
@@ -105,6 +111,41 @@ COMMON=(--directory="$WORK" --filename=bench.dat --size="$SIZE" --direct=1 --tim
         --runtime="$RT" --ramp_time=5 --group_reporting --output-format=json)
 
 run() { local name="$1"; shift; echo "  ▸ $name"; fio --name="$name" "${COMMON[@]}" "$@" > "$OUT/$name.json" 2>"$OUT/$name.err" || echo "    실패. $OUT/$name.err 확인"; }
+
+# ── fio 가 없을 때: dd (coreutils) 로 측정 ─────────────────────────────────
+# 결과는 분석기가 읽는 fio JSON 과 같은 키로 남긴다 (jobs[0].read/write.bw 는 KiB/s)
+if [[ $ENGINE == dd ]]; then
+  MB=$(( NEED_KB / 1024 )); [[ $MB -lt 64 ]] && MB=64
+  ddrun() {  # $1=이름 $2=측정 대상 방향(read|write) 나머지=dd 인자. 경과 시간은 date +%s%N 로 직접 잰다
+    local name="$1" dir="$2"; shift 2
+    echo "  ▸ $name (dd)"
+    local t0 t1 bytes
+    t0=$(date +%s%N)
+    timeout $(( RT * 20 + 60 )) dd "$@" 2>"$OUT/$name.err"
+    t1=$(date +%s%N)
+    bytes=$(awk '/bytes/ {print $1; exit}' "$OUT/$name.err")
+    awk -v b="${bytes:-0}" -v ns="$(( t1 - t0 ))" -v dir="$dir" -v name="$name" 'BEGIN {
+      s = ns / 1e9; kibs = (s > 0) ? b / 1024 / s : 0
+      printf "{\"engine\": \"dd\", \"jobs\": [{\"jobname\": \"%s\", \"%s\": {\"bw\": %.1f, \"iops\": %.1f}}], \"elapsed_s\": %.3f}\n", name, dir, kibs, 0, s
+    }' > "$OUT/$name.json"
+  }
+  ddrun seqwrite_1m write if=/dev/zero of="$WORK/bench.dat" bs=1M count="$MB" oflag=direct conv=fsync
+  ddrun seqread_1m  read  if="$WORK/bench.dat" of=/dev/null bs=1M iflag=direct
+  # translog 처럼 4KiB 를 쓸 때마다 디스크 기록 완료를 기다린다 (oflag=dsync). 한 건당 평균 지연을 기록
+  N_SYNC=2000
+  echo "  ▸ fsync_4k (dd oflag=dsync, 4KiB x $N_SYNC)"
+  t0=$(date +%s%N)
+  timeout $(( RT * 4 + 30 )) dd if=/dev/zero of="$WORK/sync.dat" bs=4k count=$N_SYNC oflag=dsync 2>"$OUT/fsync_4k.err"
+  t1=$(date +%s%N)
+  done_n=$(awk '/records out/ {split($1, a, "+"); print a[1]; exit}' "$OUT/fsync_4k.err")
+  awk -v n="${done_n:-0}" -v ns="$(( t1 - t0 ))" 'BEGIN {
+    avg = (n > 0) ? ns / n / 1e6 : 0
+    printf "{\"engine\": \"dd\", \"jobs\": [{\"jobname\": \"fsync_4k\", \"write\": {\"iops\": %.1f, \"bw\": %.1f}}], \"sync_avg_ms\": %.3f}\n", (ns > 0 ? n / (ns / 1e9) : 0), (ns > 0 ? n * 4 / (ns / 1e9) : 0), avg
+  }' > "$OUT/fsync_4k.json"
+  echo "완료: $OUT"
+  echo "ES 를 다시 올린 뒤 같은 서버에서 es_disk_collect.sh 를 실행하면 이 결과가 리포트에 자동으로 들어갑니다."
+  exit 0
+fi
 
 # 검색: 작은 무작위 읽기, 동시 요청 많음
 run randread_4k  --rw=randread  --bs=4k  --ioengine=libaio --iodepth=32 --numjobs=4

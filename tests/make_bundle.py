@@ -18,11 +18,12 @@ import json, os, sys
 # ─────────────────────────────────────────────────────────────────────────────
 def dev(name, rot="0", qd=None, host=None, vendor="", model="", sched="none [mq-deadline] kyber bfq",
         ra="128", timeout=None, wcache="write back", lat_r=0.5, lat_w=0.8, iops_r=300, iops_w=300,
-        aqu=1.0, inflight=1, util=30.0, extra=None, hctl=None, pattern=None):
+        aqu=1.0, inflight=1, util=30.0, extra=None, hctl=None, pattern=None, flush_ps=0, flush_ms=0.0):
     # pattern: 구간별 (IOPS 배율, aqu) 목록. 한도에 걸린 모양처럼 구간마다 다른 부하를 만들 때 쓴다
     return dict(name=name, rot=rot, qd=qd, host=host, vendor=vendor, model=model, sched=sched, ra=ra,
                 timeout=timeout, wcache=wcache, lat_r=lat_r, lat_w=lat_w, iops_r=iops_r, iops_w=iops_w,
-                aqu=aqu, inflight=inflight, util=util, extra=extra or {}, hctl=hctl, pattern=pattern)
+                aqu=aqu, inflight=inflight, util=util, extra=extra or {}, hctl=hctl, pattern=pattern,
+                flush_ps=flush_ps, flush_ms=flush_ms)
 
 VM_VIRT = ("detect_virt=vmware\nsys_vendor=VMware, Inc.\nproduct_name=VMware Virtual Platform\n"
            "tools_version=12.1.5.20735 (build-20735119)\nstat_balloon=0 MB\nstat_swap=0 MB\n"
@@ -266,6 +267,28 @@ SCEN["bm_ceph_rbd"] = dict(virt=BM_VIRT, hostdrv={"host0": "ahci"}, governor="pe
     datadev=[("/usr/share/elasticsearch/data", "252:0", "rbd0", "ext4", "/dev/rbd0", "/usr/share/elasticsearch/data")],
     meta_extra="es_in_container=1\n")
 
+# 20) bare-metal, OS 기본 도구만으로 보이는 문제 모음:
+#     LVM thin pool 92%, nobarrier, swap·snapshot 저장소가 data 디스크, 옆집 프로세스, 느린 flush,
+#     megaraid 커널 로그 이벤트(벤더 도구 없음), SCSI 타임아웃 카운터
+SCEN["bm_os_only"] = dict(virt=BM_VIRT, hostdrv={"host0": "megaraid_sas"}, governor="performance", tuned="throughput-performance",
+    devs=[dev("sda", rot="0", qd="256", host="host0", vendor="DELL", model="PERC H330 Mini", hctl="0:2:0:0", iops_r=20, iops_w=30),
+          dev("sdb", rot="0", qd="256", host="host0", vendor="DELL", model="PERC H330 Mini", hctl="0:2:1:0",
+              lat_r=1.2, lat_w=2.0, iops_r=1500, iops_w=1200, aqu=3, inflight=3, util=70, flush_ps=40, flush_ms=9.0,
+              extra={"device/iotmo_cnt": "0x3", "device/ioerr_cnt": "0x5", "device/state": "running"})],
+    dm={"dm-3": {"name": "vg-esdata", "slaves": ["sdb"], "table": "vg-esdata: 0 2097152000 thin 253:2 1"}},
+    mount_src="/dev/mapper/vg-esdata",
+    meta_extra="es_pid=4242\n",
+    klog=["2026-09-27T02:10:11+0900 kernel: megaraid_sas 0000:18:00.0: 8812 (812345678s/0x0008/CRIT) - Battery has failed and cannot support data retention. Please replace the battery"],
+    raw={"dmsetup_status": "vg-pool-tpool: 0 2097152000 thin-pool 12 1200/4096 9420/10240 - rw no_discard_passdown queue_if_no_space - 1024\n"
+                           "vg-esdata: 0 2097152000 thin 1932735283 2097151999\n",
+         "swaps": "Filename Type Size Used Priority\n/var/lib/elasticsearch/swapfile file 8388604 0 -2\n",
+         "es_yml": "path.data: /var/lib/elasticsearch\npath.repo: [\"/var/lib/elasticsearch/backup\"]\npath.logs: /var/log/elasticsearch\n",
+         "procio_start": "/proc/4242/io:read_bytes: 1000\n/proc/4242/io:write_bytes: 1000\n/proc/4242/comm:java\n"
+                         "/proc/777/io:read_bytes: 0\n/proc/777/io:write_bytes: 0\n/proc/777/comm:backup-agent\n",
+         "procio_end": "/proc/4242/io:read_bytes: 104858600\n/proc/4242/io:write_bytes: 209716200\n/proc/4242/comm:java\n"
+                       "/proc/777/io:read_bytes: 524288000\n/proc/777/io:write_bytes: 1048576\n/proc/777/comm:backup-agent\n"})
+SCEN["bm_os_only"]["mounts_opts"] = "rw,noatime,nobarrier"
+
 # ─────────────────────────────────────────────────────────────────────────────
 def build(name, out):
     sc = SCEN[name]
@@ -289,7 +312,8 @@ def build(name, out):
         # 컨테이너 안 ES: 호스트에는 data 가 다른 경로(kubelet PV 등)로 마운트돼 있다
         w(S("mounts"), "{} / xfs rw,relatime 0 0\n{} {} xfs rw,noatime 0 0\n".format(root_src, data_src, sc["host_data_mnt"]))
     else:
-        w(S("mounts"), "{} / xfs rw,relatime 0 0\n{} /var/lib/elasticsearch xfs rw,noatime 0 0\n".format(root_src, data_src))
+        w(S("mounts"), "{} / xfs rw,relatime 0 0\n{} /var/lib/elasticsearch ext4 {} 0 0\n".format(root_src, data_src, sc.get("mounts_opts", "rw,noatime")) if sc.get("mounts_opts")
+          else "{} / xfs rw,relatime 0 0\n{} /var/lib/elasticsearch xfs rw,noatime 0 0\n".format(root_src, data_src))
     w(S("df"), "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
                "{} 104857600 10485760 94371840 10% /\n{} 1048576000 419430400 629145600 40% /var/lib/elasticsearch\n".format(root_src, data_src))
     lines = []
@@ -393,6 +417,7 @@ def build(name, out):
                 a[0] += rio; a[2] += rio * 16; a[3] += int(rio * d["lat_r"])
                 a[4] += wio; a[6] += wio * 64; a[7] += int(wio * d["lat_w"])
                 a[9] += int(d["util"] * dt * 10); a[10] += int(aq * dt * 1000)
+                a[15] += int(d["flush_ps"] * dt); a[16] += int(d["flush_ps"] * dt * d["flush_ms"])
             a[8] = d["inflight"]
             maj = 259 if d["name"].startswith("nvme") else 8
             txt.append(" {} 0 {} {}".format(maj, d["name"], " ".join(str(x) for x in a)))

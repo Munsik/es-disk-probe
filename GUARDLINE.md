@@ -78,6 +78,11 @@ Storage I/O Control·디스크 IOPS 한도, ESXi 경로 정책(Round Robin 등)�
 | open-vm-tools | VMware만. 설치 | `vmware-toolbox-cmd -v` | [VMware] |
 | 소프트웨어 RAID 점검 일정 | bare-metal md: 정기 check를 서비스 피크 밖으로 | `cat /proc/mdstat`, `/etc/cron.d/raid-check` | [OS] |
 | PSI | RHEL 8은 부트 파라미터 `psi=1`로 켜 두면 포화 진단이 정확해짐 | `cat /proc/pressure/io` | [OS] |
+| write barrier | `nobarrier`, `barrier=0` 금지. 전원이 끊기면 파일시스템이 깨질 수 있음 (xfs 는 커널 4.19부터 옵션 자체가 없어짐) | `findmnt -o OPTIONS -T <path.data>` | [OS] |
+| LVM thin pool | ES data 는 thick LV 권장. thin 이면 데이터·메타 사용률 80% 전에 확장, 100%면 쓰기가 멈춤 | `lvs -o lv_name,data_percent,metadata_percent` | [OS] Red Hat |
+| LVM snapshot | ES data LV 에 snapshot 을 오래 두지 않음. 원본에 쓸 때마다 복사가 일어나 쓰기가 느려짐 | `lvs -o lv_name,origin` | [OS] Red Hat |
+| 같은 디스크 공유 | swap, path.repo(스냅샷 저장소), path.logs 는 ES data 와 다른 디스크 | `swapon --show`, `findmnt -T <경로>` | [Elastic] |
+| 장치 오류 카운터 | `iotmo_cnt`·`ioerr_cnt` 가 늘면 경로·장치 점검 | `cat /sys/block/sdX/device/iotmo_cnt` | [OS] |
 
 **PVSCSI queue depth 상향(cmd_per_lun=254, ring_pages=32)은 VMware에서도 기본 적용 대상이 아닙니다.** 진단 리포트에서 "Guest 큐 포화"가 확인됐을 때만 적용합니다. 재부팅이 필요합니다. [VMware KB 2053145]
 

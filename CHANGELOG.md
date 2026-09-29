@@ -79,6 +79,23 @@ VMware 판정은 그대로다 (합성 번들 3종에서 0.9.5 와 판정 목록 
 - 도구가 없으면 무엇을 설치하면 되는지 안내
 - 쓰기만 느릴 때 안내가 컨트롤러 조회 결과를 반영 (write-back 정상이면 캐시 문제가 아니라고 명시)
 
+### 서버에서는 셸만으로 끝나게 (OS 기본 도구)
+- `es_disk_summary.sh` 추가: bash + awk(mawk·gawk 모두)만으로 요약 판정. 수집이 끝나면 자동 실행하고 summary.txt 로 남김.
+  Python 이 없는 서버에서도 판정·조치·담당자를 바로 봄. 판정 규칙은 HTML 과 같고, 테스트가 20개 시나리오에서 두 판정이 같은지 매번 확인
+- `es_disk_bench.sh`: fio 가 없으면 dd 로 순차 쓰기·읽기(direct I/O)와 4KiB fsync 지연을 잼. 결과는 다음 수집 때 자동 포함
+- 수집기의 모든 수집은 /proc, /sys, coreutils, util-linux 기본 명령. 컨트롤러 도구·smartctl 은 있을 때만 씀
+
+### 제로베이스 재점검으로 추가한 항목 (OS 기본 정보만 사용)
+- flush(장치 캐시 비우기) 지연: /proc/diskstats 확장 필드(커널 5.5+). fsync 가 느린 원인을 직접 봄
+- I/O 모양: 평균 I/O 크기, merge 비율. 작은 랜덤 I/O 위주인지 순차인지
+- 이웃 프로세스: /proc/<pid>/io 로 ES 가 아닌 프로세스의 디스크 사용량. 백업·로그 수집기 같은 원인을 짚음
+- LVM 계층: thin pool 사용률(데이터·메타), snapshot 원본(쓰기마다 복사), dm-crypt, dm-cache
+- 파일시스템: inode 사용률, `nobarrier`·`sync`·`data=journal` 마운트 옵션
+- 같은 디스크 공유: swap, path.repo(스냅샷 저장소), path.logs 가 ES data 디스크에 있는지
+- 장치 상태: SCSI 장치 state, 명령 타임아웃·오류 카운터(iotmo_cnt·ioerr_cnt), PCIe AER 오류, NVMe controller state
+- md: mismatch_cnt. RAID 컨트롤러 커널 로그 이벤트(megaraid AEN FATAL·CRIT 등)는 도구 없이도 판정
+- ECK·컨테이너: ES 프로세스의 마운트 네임스페이스로 data 경로를 찾아 호스트 장치와 연결
+
 ### SMART
 - bare-metal 에서는 기본으로 조회 (`--no-hw` 로 끔). VM 에서는 가상 장치라 건너뜀. RAID 컨트롤러 뒤 디스크는 컨트롤러 도구가 대신 봄
 

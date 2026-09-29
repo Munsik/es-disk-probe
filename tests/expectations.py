@@ -97,3 +97,12 @@ EXPECT += [
      [(None, None, "네트워크 블록 스토리지 기준"), (None, "스토리지 관리자", "네트워크 블록 스토리지(Ceph RBD 등)")],
      [(None, None, "NVMe")]),
 ]
+
+EXPECT += [
+    ("bm_os_only", "baremetal", "성능 저하",
+     [("warn", None, "flush(장치 캐시 비우기)가 느림"), ("caution", None, "ES 가 아닌 프로세스"),
+      ("warn", None, "barrier"), ("warn", None, "thin pool 위에 있음 (데이터 92%"),
+      ("caution", None, "swap 이 ES data 디스크"), ("caution", "ES 설정", "path.repo"),
+      ("caution", None, "명령 타임아웃 기록 (sdb 3회)"), ("warn", None, "RAID 컨트롤러 이벤트")],
+     [(None, "VMware 관리자", "")]),
+]

@@ -34,6 +34,11 @@
 #                   조회는 모두 읽기 전용이고 모니터링 에이전트가 주기적으로 하는 것과 같은 명령입니다
 #     --smart       VM 에서도 SMART 를 읽음 (보통은 필요 없음. 가상 디스크의 SMART 는 의미가 없음)
 #
+# 끝나면:
+#   - 화면에 셸 요약 판정을 바로 보여 주고 summary.txt 로 남깁니다 (bash + awk 만 사용. Python 불필요)
+#   - Python 3.6+ 가 있으면 HTML 리포트(es_disk_report.html)도 만듭니다
+#   - 번들(tar.gz)을 PC 로 가져가 es_disk_render.py 로 HTML 을 다시 만들 수 있습니다
+#
 # 부하 (실측, 300초/5초 간격 기준):
 #   CPU 약 1.2초 (측정 시간 대비 CPU 1개의 0.4%), 메모리 12MB 미만,
 #   디스크 읽기 최대 약 13MB (--light 사용 시 1MB 미만), 쓰기 1MB 미만.
@@ -236,7 +241,9 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
              queue/minimum_io_size queue/optimal_io_size queue/nomerges queue/rq_affinity \
              queue/write_cache queue/discard_max_bytes queue/add_random \
              queue/wbt_lat_usec queue/iostats queue/max_hw_sectors_kb queue/io_poll \
-             device/queue_depth device/timeout device/vendor device/model device/raid_level dm/name md/level; do
+             device/queue_depth device/timeout device/vendor device/model device/raid_level \
+             device/state device/ioerr_cnt device/iotmo_cnt device/iorequest_cnt \
+             dm/name md/level md/array_state md/sync_action md/mismatch_cnt md/degraded md/raid_disks; do
       [[ -r "$d/$f" ]] && printf 'ATTR|%s|%s|%s\n' "$n" "$f" "$(tr -d '\n' < "$d/$f" 2>/dev/null)"
     done
     for s in "$d"/slaves/*;  do [[ -e "$s" ]] && printf 'SLAVE|%s|%s\n'  "$n" "${s##*/}"; done
@@ -246,6 +253,20 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
     [[ -n "$host" ]] && printf 'SCSIHOST|%s|%s\n' "$n" "$host"
     # SCSI 주소 H:C:T:L (RAID 컨트롤러의 논리 디스크 번호와 OS 장치를 잇는 보조 근거)
     hctl=${real##*/}; [[ "$hctl" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+$ ]] && printf 'HCTL|%s|%s\n' "$n" "$hctl"
+    # SCSI 디스크 캐시 모드(커널이 장치에서 받은 값)와 FUA 지원
+    for sd in "$d"/device/scsi_disk/*; do
+      [[ -d "$sd" ]] || continue
+      printf 'ATTR|%s|cache_type|%s\n' "$n" "$(catf "$sd/cache_type")"
+      printf 'ATTR|%s|FUA|%s\n' "$n" "$(catf "$sd/FUA")"
+    done
+    # 장치가 매달린 PCIe 장치(HBA·RAID 컨트롤러·NVMe)의 AER 오류 카운터 (커널 4.17+)
+    pci=$(echo "$real" | grep -oE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]' | tail -1)
+    if [[ -n "$pci" && -r "/sys/bus/pci/devices/$pci/aer_dev_fatal" ]]; then
+      printf 'AER|%s|%s|cor=%s|nonfatal=%s|fatal=%s\n' "$n" "$pci" \
+        "$(awk '/TOTAL_ERR_COR/{print $2}' "/sys/bus/pci/devices/$pci/aer_dev_correctable" 2>/dev/null)" \
+        "$(awk '/TOTAL_ERR_NONFATAL/{print $2}' "/sys/bus/pci/devices/$pci/aer_dev_nonfatal" 2>/dev/null)" \
+        "$(awk '/TOTAL_ERR_FATAL/{print $2}' "/sys/bus/pci/devices/$pci/aer_dev_fatal" 2>/dev/null)"
+    fi
     # 파티션
     for p in "$d"/"$n"*; do
       [[ -r "$p/start" ]] && printf 'PART|%s|%s|%s\n' "${p##*/}" "$n" "$(cat "$p/start")"
@@ -440,14 +461,20 @@ echo "hw=$HW" >> "$OUT/meta"
 save tuned  tuned-adm active
 save fstrim sh -c "systemctl is-enabled fstrim.timer 2>&1; systemctl is-active fstrim.timer 2>&1"
 cp /proc/interrupts "$S/interrupts_start" 2>/dev/null
+# 프로세스별 디스크 I/O 누적값 (측정 시작). 끝에서 한 번 더 읽어 차이로 "ES 말고 누가 디스크를 쓰는지"를 본다.
+# /proc/<pid>/io 는 메모리에서 만들어지는 값이고, 사라진 프로세스는 grep 이 조용히 건너뛴다
+procio() { grep -HE '^(read_bytes|write_bytes):' /proc/[0-9]*/io 2>/dev/null; grep -H . /proc/[0-9]*/comm 2>/dev/null; }
+procio > "$S/procio_start"
 save dmsetup_table dmsetup table
+# thin pool 사용률, snapshot 채움 정도 (device-mapper 상태 조회, 읽기 전용)
+save dmsetup_status dmsetup status
 save udev_rules sh -c "grep -rhsE 'scheduler|read_ahead|queue/|timeout' /etc/udev/rules.d/ /usr/lib/udev/rules.d/ /lib/udev/rules.d/ 2>/dev/null | grep -v '^#' | head -100"
 
 # 커널 로그: I/O 오류, SCSI 리셋, hung task (최근 7일, 가능한 범위)
 # -n 으로 상한을 둔다: 장애가 반복되는 노드는 커널 메시지가 수십만 줄이 될 수 있고,
 # 그만큼 journal 파일을 읽으면 그 자체가 디스크 부하가 된다. 최근 것부터 보므로 상한으로 충분.
 KLOG_MAX_LINES=${KLOG_MAX_LINES:-20000}
-KPAT='I/O error|blk_update_request|Buffer I/O error|critical medium error|Medium Error|rejecting I/O|hung_task|blocked for more than [0-9]+ seconds|remount.*read-only|XFS \(.*\).*(error|shutdown|[Cc]orruption)|EXT4-fs (error|warning)|Sense Key|(scsi|sd [0-9]|pvscsi|mptscsih|mptbase|nvme|ata[0-9]|megaraid|mpt3sas|mpt2sas|hpsa|smartpqi|aacraid|qla2xxx|lpfc).*(\<abort|\<reset\>|timed out|timing out|timeout|failed|FATAL|fault)|controller is down|AER:.*(error|Error)|md/raid.*(Disk failure|not operational)|multipath.*(Failing path|remaining active paths: 0)'
+KPAT='I/O error|blk_update_request|Buffer I/O error|critical medium error|Medium Error|rejecting I/O|hung_task|blocked for more than [0-9]+ seconds|remount.*read-only|XFS \(.*\).*(error|shutdown|[Cc]orruption)|EXT4-fs (error|warning)|Sense Key|(scsi|sd [0-9]|pvscsi|mptscsih|mptbase|nvme|ata[0-9]|megaraid|mpt3sas|mpt2sas|hpsa|smartpqi|aacraid|qla2xxx|lpfc).*(\<abort|\<reset\>|timed out|timing out|timeout|failed|FATAL|fault)|controller is down|AER:.*(error|Error)|md/raid.*(Disk failure|not operational)|multipath.*(Failing path|remaining active paths: 0)|megaraid_sas.*/0x[0-9a-fA-F]+/(FATAL|CRIT|DEAD|WARN)|(megaraid|mpt3sas|hpsa|smartpqi|aacraid).*([Bb]attery|BBU|CacheVault|degraded|[Dd]egraded|offline|lockup|[Pp]redictive|[Rr]ebuild)|thin.*(out of data space|switching pool to|read-only mode)|device-mapper: snapshots: Invalidating'
 if [[ $NO_KLOG -eq 0 ]]; then
   {
     command -v journalctl >/dev/null 2>&1 && journalctl -k --since "7 days ago" -n "$KLOG_MAX_LINES" -o short-iso --no-pager 2>/dev/null
@@ -726,6 +753,7 @@ if [[ $ES_OK -eq 1 ]]; then
 fi
 cat /proc/meminfo > "$S/meminfo_end" 2>/dev/null
 cp /proc/interrupts "$S/interrupts_end" 2>/dev/null
+procio > "$S/procio_end"
 
 # ── 수집기 자체 자원 사용량 ────────────────────────────────────────────────
 # bash 내장 times: 자신 / 자식 프로세스의 user·sys CPU 누적
@@ -768,19 +796,26 @@ fi
 # =============================================================================
 # 4. 번들 + HTML
 # =============================================================================
-msg "[4/4] 번들 생성"
+msg "[4/4] 요약 판정과 번들 생성"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# 셸(awk)만으로 만드는 요약 판정. Python 이 없는 서버에서도 결과를 바로 본다 (summary.txt 로도 남김)
+echo >&2
+if [[ -f "$HERE/es_disk_summary.sh" ]]; then
+  bash "$HERE/es_disk_summary.sh" "$OUT" >&2 || true
+fi
+echo >&2
 tar -C "$OUT_BASE" -czf "$OUT.tar.gz" "$(basename "$OUT")" 2>/dev/null
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
 PY=""
 for c in python3 /usr/libexec/platform-python python; do
   command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info>=(3,6) else 1)' 2>/dev/null && { PY="$c"; break; }
 done
 if [[ $NO_RENDER -eq 0 && -n "$PY" && -f "$HERE/es_disk_render.py" ]]; then
-  "$PY" "$HERE/es_disk_render.py" "$OUT" -o "$OUT/es_disk_report.html" && \
+  "$PY" "$HERE/es_disk_render.py" "$OUT" -o "$OUT/es_disk_report.html" >/dev/null && \
     msg "HTML 리포트: $OUT/es_disk_report.html"
 else
-  msg "HTML은 생성하지 않았습니다. 번들을 PC로 옮겨 실행하세요:"
-  msg "  python3 es_disk_render.py $(basename "$OUT").tar.gz"
+  msg "이 서버에는 Python 3.6+ 가 없어 HTML 리포트는 만들지 않았습니다. 위 요약이 셸 판정 결과입니다."
+  msg "전체 리포트는 번들을 PC 로 옮겨: python3 es_disk_render.py $(basename "$OUT").tar.gz"
 fi
+msg "요약: $OUT/summary.txt"
 msg "완료. 번들: $OUT.tar.gz"

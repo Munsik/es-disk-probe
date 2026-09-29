@@ -156,7 +156,9 @@ ES가 segment를 열거나 닫을 때(`mmap`, `munmap`) 잠깐 경합하는 정�
 
 ### 부하를 거는 도구는 따로 있습니다
 
-`es_disk_bench.sh`는 fio로 실제 부하를 겁니다. 위 내용은 이 스크립트에 해당하지 않습니다.
+`es_disk_bench.sh`는 실제 부하를 겁니다. 위 내용은 이 스크립트에 해당하지 않습니다.
+fio 가 있으면 무작위 읽기·순차 쓰기·순차 읽기·혼합·동기 쓰기 5가지를, 없으면 `dd` 로 순차 쓰기·순차 읽기·동기 쓰기(`oflag=dsync`, 4KiB) 3가지를 잽니다.
+동기 쓰기 지연은 translog fsync 한 번의 비용과 같은 성격이라 fio 가 없어도 꼭 재 두는 편이 좋습니다.
 
 - ES가 떠 있으면 실행을 거부합니다. `--force-with-es`로만 우회됩니다
 - vSAN, SAN 어레이 같은 공유 스토리지는 같은 스토리지를 쓰는 다른 VM·서버에도 영향이 갈 수 있습니다. VMware·스토리지 관리자와 시간을 맞추세요
@@ -272,14 +274,33 @@ sudo ./es_disk_collect.sh
 ```
 
 ES가 인증을 요구하면 사용자와 비밀번호를 물어봅니다. 조회 전용 권한(`monitor`)이면 충분합니다.
-끝나면 리포트 경로와 판정이 출력됩니다.
+끝나면 셸(awk)이 만든 요약 판정이 바로 화면에 나옵니다. Python 3가 없는 서버(RHEL 7 등)에서도 같습니다.
 
 ```
-[14:17:02] ES 주소 자동 탐지: https://10.10.1.21:9200
-[14:22:31] HTML 리포트: /var/tmp/esdisk_es-hot-01_20260923_142031/es_disk_report.html
-플랫폼: bare-metal · 판정 기준: NVMe (자동 판정)
-판정: 디스크 성능 저하 징후가 있습니다 · 조치 필요 7건
+=== es-disk-probe 요약 판정 (셸) ===
+호스트 es-warm-01 · bare-metal · 대상 디스크 sdb
+판정 기준 SSD (추정) · 응답시간 주의 3 / 경고 6 / 위험 15 ms
+
+판정: 디스크 성능 저하 징후가 있습니다
+
+응답시간 p95  읽기 1.20 ms · 쓰기 2.00 ms  → 정상
+부하 p95      IOPS 2700.0 · 49.2 MB/s · aqu-sz 3.0 / queue_depth 256 · %util 70.0
+flush         초당 40.0회 · 평균 9.00 ms
+포화          PSI io full p95 0.4% · ES D 상태 스레드 p95 0
+
+확인할 항목 (심각한 순)
+  [경고] flush(장치 캐시 비우기) 평균 9.00 ms, 초당 40.0회
+         → 전원 차단 보호가 있는 SSD, 배터리 보호 RAID 캐시인지 확인
+  [경고] 커널 로그: RAID 컨트롤러 이벤트 1건 (최근 7일)
+         → 번들의 static/klog_io 원문 시각을 담당자에게 전달
+  [경고] LVM thin pool vg-pool-tpool 데이터 92% 사용
+         → pool 확장(lvextend) 또는 정리. 가득 차면 쓰기 중단
+  [주의] ES 가 아닌 프로세스의 디스크 I/O 비중 62% (상위: backup-agent(pid 777) 501MB)
+         → 그 프로세스가 ES data 디스크를 쓰는지 확인
 ```
+
+같은 내용이 번들 안 `summary.txt` 로 남습니다. 서버에 Python 3.6+ 가 있으면 HTML 리포트도 같이 만듭니다.
+HTML 리포트에는 병목 위치 판정, 클러스터 비교, 인덱스별 분포, 항목마다 근거와 출처가 더 들어 있습니다.
 
 ### 알아서 판단하는 것
 
@@ -313,11 +334,26 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | 구분 | 내용 |
 |---|---|
 | OS | RHEL / CentOS / Rocky 7·8·9, Ubuntu 20.04+ |
-| 수집기 | bash 4.2+, awk, coreutils. `curl`은 ES 조회할 때만 |
-| 분석기 | Python 3.6+ 표준 라이브러리만 (RHEL 8의 `/usr/libexec/platform-python` 자동 인식) |
+| 수집기·요약 판정 | bash 4.2+, awk(gawk·mawk), coreutils, util-linux, procps. `curl`은 ES 조회할 때만. 모두 OS 기본 설치 |
+| HTML 분석기 | Python 3.6+ 표준 라이브러리만 (RHEL 8의 `/usr/libexec/platform-python` 자동 인식). 서버에 없으면 번들을 PC로 옮겨 실행 |
 | 권한 | root 권장 (ES 프로세스 I/O, 커널 로그, VMware 정보) |
 | ES 권한 | `cluster monitor` (`monitoring_user` 수준). 관리자 계정 필요 없음 |
-| 선택 | `sysstat`(과거 이력), `ethtool`(NIC ring), `open-vm-tools`(VMware 자원), `smartmontools`(SMART), RAID 컨트롤러 도구(`storcli`·`perccli`, `ssacli`, `arcconf`), `fio` + `libaio`(최대 성능 측정) |
+| 선택 (있으면 더 봄) | `sysstat`(과거 이력), `ethtool`(NIC ring), `open-vm-tools`(VMware 자원), `smartmontools`(SMART), RAID 컨트롤러 도구(`storcli`·`perccli`, `ssacli`, `arcconf`), `fio` + `libaio`(무작위 I/O 최대 성능. 없으면 `dd` 로 순차·동기 쓰기만) |
+
+### 서버에서 쓰는 명령
+
+선택 도구가 하나도 없어도 모든 판정의 기본은 동작합니다. 선택 도구는 같은 항목을 더 자세히 볼 때만 씁니다.
+
+| 명령 | 패키지 | 기본 설치 | 용도 |
+|---|---|---|---|
+| bash, awk, grep, sed, sort, find, stat, df, tar, timeout, date | bash, gawk/mawk, coreutils, findutils, tar | 예 | 수집, 요약 판정 |
+| lsblk, lscpu, ionice, dmesg | util-linux | 예 | 장치 구성, 우선순위 낮추기, 커널 로그 |
+| pgrep, sysctl, renice | procps | 예 | ES 프로세스, 커널 설정 |
+| journalctl, systemd-detect-virt | systemd | 예 | 커널 로그, 플랫폼 판별 |
+| dmsetup | device-mapper (lvm2) | 예 (RHEL, Ubuntu 서버) | LVM·multipath·thin pool 구성과 상태 |
+| curl | curl | 예 | ES 조회 API |
+| dd | coreutils | 예 | fio 가 없을 때의 벤치 |
+| python3 | python3 / platform-python | RHEL 8·9, Ubuntu 예. RHEL 7 아니오 | HTML 리포트 (없으면 셸 요약만) |
 
 `es_disk_collect.sh`와 `es_cluster_probe.sh`는 기본적으로 `curl -k`로 동작합니다.
 자체 서명 인증서 환경을 감안한 기본값입니다. 수집기는 localhost만 보므로 그대로 두어도 무리가 없습니다.
@@ -366,13 +402,37 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | 파일 | 역할 | 서버 영향 |
 |---|---|---|
 | `es_disk_collect.sh` | 수집 전부. 로컬 + 클러스터 + 인덱스별 분포 | 읽기만. 설정 변경 없음 |
-| `es_disk_render.py` | 분석, 판정, HTML 생성 (서버 또는 PC) | 서버에서 안 돌려도 됨 |
+| `es_disk_summary.sh` | 셸(awk)만으로 핵심 판정 요약. 수집기가 끝날 때 자동 실행, `summary.txt` | 번들만 읽음 |
+| `es_disk_render.py` | 전체 분석, 판정, HTML 생성 (서버 또는 PC) | 서버에서 안 돌려도 됨 |
 | `es_cluster_probe.sh` | (선택) 노드 접속 없이 클러스터만 원격 조회 | 조회 API GET만 |
 | `es_disk_bench.sh` | (선택) 최대 성능 측정 | 부하를 검. 점검 시간에만 |
 | `GUARDLINE.md` | 설계, 구성, 상시 감시 기준과 변경 원칙 | 문서 |
-| `tests/` | 합성 번들 생성기와 판정 테스트 (플랫폼·매체·RAID 도구별 19개 시나리오) | 서버에서 안 돌림 |
+| `tests/` | 합성 번들 생성기와 판정 테스트 (플랫폼·매체·RAID 도구별 20개 시나리오) | 서버에서 안 돌림 |
 
 ---
+
+## 자동으로 점검하는 항목 전체
+
+"어떤 환경에서든 디스크 부하가 어느 수준인지, 무엇이 문제이고, 누가 어떻게 조치해야 하는지"를 한 번 실행으로 판정하려고
+아래 항목을 봅니다. 출처 열에서 굵게 표시하지 않은 것은 모두 OS 기본 도구와 `/proc`·`/sys` 입니다.
+
+| 영역 | 점검 항목 | 출처 |
+|---|---|---|
+| 부하 수준 | 응답시간 p95(읽기·쓰기), IOPS, 처리량, 요청 크기, 병합 비율, 대기 I/O(aqu-sz), inflight, %util | /proc/diskstats |
+| 포화 | PSI io some/full, ES 스레드 D 상태, iowait, 큐 사용률(aqu-sz ÷ queue_depth), 한도에 걸린 모양(IOPS·처리량 평평 + 대기 증가) | /proc/pressure, /proc/&lt;pid&gt;/task, /sys/block |
+| fsync 비용 | flush 요청 수와 평균 시간 (커널 5.5+), 벤치의 동기 쓰기 지연 | /proc/diskstats, es_disk_bench.sh |
+| 원인 위치 | 병목 위치(플랫폼별), 쓰기만 느림, 묶음 안 한 장치만 느림, 여러 노드 동시 고부하 | 위 지표 조합, _nodes/stats |
+| 옆집 부하 | ES 가 아닌 프로세스의 디스크 I/O 상위 목록 | /proc/&lt;pid&gt;/io |
+| 오류 | 커널 로그(I/O error, abort/reset, timeout, hung task, FS 오류, 컨트롤러·PCIe, RAID 컨트롤러 이벤트, multipath, md, thin pool), 장치 상태·타임아웃·오류 카운터, PCIe AER, NVMe 컨트롤러 상태 | journalctl/dmesg, /sys |
+| 하드웨어 | RAID 레벨(hpsa·smartpqi), raid_class 볼륨 상태, 컨트롤러 펌웨어 크래시, md degraded·resync·mismatch, NVMe 온도·PCIe 링크, CPU governor, SMART, 컨트롤러 캐시·배터리·구성 디스크 | /sys, /proc/mdstat, **smartctl**, **storcli·perccli·ssacli·arcconf** |
+| 블록 장치 설정 | readahead, scheduler, iostats, wbt, SCSI timeout, queue_depth, 파티션 정렬, 쓰기 캐시 보고값 | /sys/block |
+| 저장 구조 | LVM linear·stripe, thin pool 사용률, LVM snapshot, dm-crypt, dm-cache, multipath, OS·swap·snapshot 저장소·로그와 같은 디스크인지 | dmsetup table/status, /proc/swaps, ES 설정 |
+| 파일시스템 | 종류(NFS 등), atime, discard, barrier, sync, data=journal, 사용률·watermark, inode | /proc/mounts, df |
+| 메모리 | swap 사용·설정, heap 비중, page cache 여유, major fault, dirty page, VMware balloon·host swap | /proc/meminfo, /proc/vmstat, **vmware-toolbox-cmd** |
+| ES | 인덱싱 스로틀, write·search 거절, indexing pressure, flush·refresh·merge 시간, translog durability, merge 스레드, store type, 파일 핸들, mmap 여유, ES 로그의 스로틀·watermark·flush 실패 | ES 조회 API, /proc/&lt;pid&gt;, ES 로그 |
+| 클러스터 | 노드 간 쏠림(같은 tier), watermark 근접, 복구·이동·snapshot 진행, awareness, 샤드 쏠림, 인덱스별 쓰기 집중, ILM phase | ES 조회 API |
+| 플랫폼 | VMware(컨트롤러, NIC, 예약·limit), 그 밖의 VM(steal), 클라우드 볼륨, Ceph RBD, 컨테이너 안 ES | systemd-detect-virt, DMI, mountinfo |
+| 과거 | 최근 7일 응답시간 이력 | **sar** (sysstat 이 이미 기록한 것) |
 
 ## 한 번 실행으로 얻는 것
 
@@ -534,7 +594,8 @@ RAID 컨트롤러 캐시는 커널의 `queue/write_cache` 값으로 판단하지
 실제 서버 없이 플랫폼·매체·부하 조합별 판정을 확인할 수 있습니다. Python 표준 라이브러리만 씁니다.
 
 ```bash
-python3 tests/run_tests.py                 # 19개 시나리오 기대 판정 검사
+python3 tests/run_tests.py                 # 20개 시나리오 기대 판정 검사
+./es_disk_summary.sh <번들 디렉터리>         # 셸 요약 판정만 따로
 python3 tests/run_tests.py --dump /tmp/t   # 시나리오별 HTML 리포트와 판정 목록(JSON) 저장
 python3 tests/make_bundle.py --list        # 시나리오 목록
 ```
@@ -551,7 +612,8 @@ python3 tests/make_bundle.py --list        # 시나리오 목록
 | `path.data` 표기 5종 파싱 | 통과 |
 | HTML과 차트 | 태그 검증 + 가짜 DOM 실행 검증 통과 |
 | 호환성 | Python 3.6 문법, bash 4.2, mawk 검사 통과 |
-| 플랫폼별 판정 | 합성 번들 19종 통과 (`python3 tests/run_tests.py`): VMware 5(vSAN·기본·VMFS), bare-metal NVMe 2, HDD RAID, md SSD stripe, FC SAN, Ceph RBD, RAID 도구 4(perccli·ssacli·arcconf·도구 없음), KVM, AWS EBS 한도, ECK, 컨테이너 |
+| 셸 요약 판정 | 합성 번들 20종 모두 HTML 판정과 결론 일치. `tests/run_tests.py` 가 매번 비교 (gawk 없는 mawk 환경에서도 확인) |
+| 플랫폼별 판정 | 합성 번들 20종 통과 (`python3 tests/run_tests.py`): VMware 5(vSAN·기본·VMFS), bare-metal NVMe 2, HDD RAID, md SSD stripe, FC SAN, Ceph RBD, RAID 도구 4(perccli·ssacli·arcconf·도구 없음), KVM, AWS EBS 한도, ECK, 컨테이너 |
 | RAID 도구 출력 해석 | storcli JSON 키는 Prometheus storcli exporter 가 쓰는 키, ssacli·arcconf 는 공개된 출력 레이블을 기준으로 만든 합성 출력으로만 검증. 실제 장비 출력 확인 필요 |
 | 0.9.x → 0.10 회귀 | VMware 합성 번들 3종의 판정 목록이 0.9.5와 동일 |
 | 실제 vSphere Guest | 미검증 |
