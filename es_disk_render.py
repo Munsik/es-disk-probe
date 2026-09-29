@@ -708,6 +708,25 @@ def load_hwraid(S, topo):
         res.append(r)
     return res, absent
 
+def flat_settings(cs):
+    """_cluster/settings 응답을 그룹별 "a.b.c": 값 형태로. flat_settings=true 응답과 중첩 응답을 모두 받는다.
+    (flat_settings=true 에서는 filter_path 가 점이 든 키 이름과 맞지 않아 빈 응답이 오므로 수집은 중첩으로 한다)"""
+    out = {}
+    def walk(o, pre, dst):
+        for k, v in (o or {}).items():
+            key = "{}.{}".format(pre, k) if pre else str(k)
+            if isinstance(v, dict):
+                walk(v, key, dst)
+            else:
+                dst[key] = v
+    for grp in ("defaults", "persistent", "transient"):
+        g = (cs or {}).get(grp)
+        if isinstance(g, dict):
+            out[grp] = {}
+            walk(g, "", out[grp])
+    return out
+
+
 def wm_high(groups, total_bytes):
     """실제로 적용되는 high watermark 사용률(%)과 표시 문구.
     ES 8.5+ 는 비율을 직접 지정하지 않았으면 max_headroom(high 기본 150GB)도 함께 적용해, 큰 디스크에서는
@@ -1260,7 +1279,7 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
 
     # ── 용량·watermark ───────────────────────────────────────────────────
     settings = {}
-    cs = j("cluster_settings.json") or {}
+    cs = flat_settings(j("cluster_settings.json") or {})
     for grp in ("defaults", "persistent", "transient"):
         settings.update(cs.get(grp) or {})
     over = []
@@ -1396,7 +1415,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
     es_root = rjson(S, "es_root.json")
     nodeinfo = rjson(S, "es_nodeinfo.json")
     st0, st1 = rjson(S, "es_stats_start.json"), rjson(S, "es_stats_end.json")
-    csettings = rjson(S, "es_cluster_settings.json")
+    csettings = flat_settings(rjson(S, "es_cluster_settings.json"))
     health = rjson(S, "es_health.json")
     node_i = list((nodeinfo or {}).get("nodes", {}).values())[0] if (nodeinfo or {}).get("nodes") else {}
     n0 = list((st0 or {}).get("nodes", {}).values())[0] if (st0 or {}).get("nodes") else None
@@ -1897,7 +1916,11 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
             "ES 가 컨테이너(ECK, Docker)로 떠 있다면 이 도구는 컨테이너가 아니라 그 노드(호스트)에서 root 로 실행하세요. "
             "ES data 경로는 호스트에서 본 volume 경로(-p)로 지정합니다.",
             "systemd-detect-virt -c")
-    if meta.get("es_in_container") == "1":
+    # 0.10.0 초기 수집기는 mount namespace 만 달라도(systemd PrivateTmp) 컨테이너로 기록했다. cgroup 으로 한 번 더 본다
+    cg_es = rd(S, "es_cgroup")
+    in_cont = meta.get("es_in_container") == "1" and not (
+        cg_es and re.search(r'system\.slice/[^/\s]*\.service', cg_es) and not re.search(r'docker|kubepods|containerd|libpod|lxc|crio', cg_es))
+    if in_cont:
         add("info", "측정 환경", "참고", "ES 가 컨테이너(Docker·Kubernetes) 안에서 실행 중",
             "data 장치: " + (", ".join("{} → {} ({})".format(pm["path"], pm["kname"] or "?", pm.get("via")) for pm in path_map) or "미확인"),
             "호스트에서 실행해 컨테이너 안 ES 의 mount 정보로 data 장치를 찾았습니다. Kubernetes 라면 이 장치가 로컬 PV 인지 "

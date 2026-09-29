@@ -115,6 +115,16 @@ VMware 판정은 그대로다 (합성 번들 3종에서 0.9.5 와 판정 목록 
 - 셸 요약의 thin pool 파싱을 컬럼 위치 고정 대신 thin-pool 다음 칸 기준으로
 - 남은 업데이트 항목과 버전별 재확인 기준을 `docs/UPDATE_NOTES.md` 로 정리
 
+### 실제 환경 검증에서 찾은 문제 (UTM, Rocky Linux 9.8 aarch64 + Elasticsearch 8.19.21)
+- `_cluster/settings` 가 빈 `{}` 로 오던 문제: `flat_settings=true` 에서는 filter_path 가 점이 든 키 이름과 맞지 않음.
+  중첩 응답으로 받고 분석기에서 펼치도록 수정. 예전 번들(flat 형식)도 그대로 읽음. watermark·복구·awareness 설정이 이제 실제로 들어옴
+- `_ilm/explain` 405: 대상 인덱스가 경로에 있어야 하는 API. `_all/_ilm/explain` 으로 수정
+- RHEL 패키지로 설치한 ES 를 컨테이너로 오판: systemd PrivateTmp 때문에 mount namespace 만 다른 경우였음.
+  루트 디렉터리(장치·inode)가 다를 때만 컨테이너로 보고, 분석기도 cgroup(system.slice/*.service)으로 한 번 더 확인
+- HTML 리포트가 번들(tar.gz)에 빠지던 문제: 번들을 묶기 전에 HTML 을 만들도록 순서 변경
+- 셸 요약에 swap 판정 3가지 추가(측정 중 swap 입출력, swap 켜짐 + memory_lock 꺼짐, swap 이 data 디스크에 있음). HTML 과 같은 규칙
+- 회귀 테스트: PrivateTmp 서비스 시나리오, 중첩·flat cluster settings 해석
+
 ### 구축 전 점검과 형식 변형 대응
 - 구축 전 점검: ES 부하가 없을 때 `es_disk_bench.sh` 결과로 "부하 전 점검" 판정(충족 / 확인할 항목 있음 / 기준보다 느림).
   동기 쓰기(translog fsync) 한 건, 무작위 읽기(cache miss 검색) 한 건 지연을 매체별 응답시간 기준으로 판정. 셸 요약·HTML 모두

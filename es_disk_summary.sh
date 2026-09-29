@@ -49,7 +49,8 @@ FILENAME ~ /\/static\/sysfs$/ {
 FILENAME ~ /\/static\/datadev$/ { split($0, p, "|"); if (p[4] != "" && p[4] != "?") { datak[p[4]] = 1; datap[p[4]] = p[2] } next }
 FILENAME ~ /\/static\/data_paths$/ { if ($0 != "") dpath[++ndp] = $0; next }
 FILENAME ~ /\/static\/mounts$/ { mnt_src[++nm] = $1; mnt_pt[nm] = $2; mnt_fs[nm] = $3; mnt_opt[nm] = $4; next }
-FILENAME ~ /\/static\/swaps$/ { if (FNR > 1 && NF) swaps++; next }
+FILENAME ~ /\/static\/swaps$/ { if (FNR > 1 && NF) { swaps++; swdev[swaps] = $1 } next }
+FILENAME ~ /\/static\/es_nodeinfo\.json$/ { if ($0 ~ /"mlockall" *: *true/) mlock = "true"; else if ($0 ~ /"mlockall" *: *false/) mlock = "false"; next }
 FILENAME ~ /\/static\/klog_io$/ {
   l = tolower($0)
   if (l ~ /i\/o error|blk_update_request|medium error|rejecting i\/o/) kl["I/O 오류"]++
@@ -135,6 +136,7 @@ FILENAME ~ /samples\.raw$/ {
   if (sec == "/proc/diskstats" && NF >= 14) { for (i = 4; i <= NF; i++) ds[ns, $3, i - 3] = $i; devseen[$3] = 1 }
   else if (sec == "/proc/pressure/io" && $1 == "full") { split($NF, q, "="); psi[ns] = q[2] }
   else if (sec == "DSTATE") dst[ns] = $1
+  else if (sec == "/proc/vmstat" && ($1 == "pswpin" || $1 == "pswpout")) vmsw[ns] += $2
   next }
 END {
   # ── ES data 물리 디스크 ─────────────────────────────────────────────
@@ -273,7 +275,22 @@ END {
     if (d ~ /^nvme/ && nv[c, "temp"] != "" && nv[c, "temp_max"] != "" && nv[c, "temp"] + 0 >= nv[c, "temp_max"] + 0)
       add("경고", c " 온도 " int(nv[c, "temp"] / 1000) "C, 경고 온도 도달", "냉각·공기 흐름 점검")
   }
-  if (swaps > 0) add("참고", "swap 이 켜져 있음 (" swaps "개)", "Elastic 권고: swap 끄기 > memory_lock > swappiness=1")
+  # swap: HTML 과 같은 규칙. 측정 중 swap 입출력, swap 켜짐 + memory_lock 꺼짐, swap 이 data 디스크에 있음
+  swmax = 0
+  for (s = 2; s <= ns; s++) if (((s - 1) in vmsw) && (s in vmsw) && t[s] > t[s - 1]) { r_ = (vmsw[s] - vmsw[s - 1]) / (t[s] - t[s - 1]); if (r_ > swmax) swmax = r_ }
+  if (swmax > 0) add("경고", "측정 중 swap 입출력 발생 (최대 " f1(swmax) " pages/s)", "swap 끄기(swapoff -a, /etc/fstab 정리) 또는 bootstrap.memory_lock: true")
+  if (swaps > 0 && mlock != "true") {
+    swp_ = sysctl["vm.swappiness"]
+    add((swp_ != "" && swp_ + 0 <= 1) ? "주의" : "경고", "swap 이 켜져 있고 memory_lock 도 " (mlock == "false" ? "꺼져 있음" : "확인 안 됨") " (swappiness " (swp_ == "" ? "-" : swp_) ")", "Elastic 권고 순서: swap 끄기 > bootstrap.memory_lock: true > vm.swappiness=1")
+  }
+  if (!guess) for (i = 1; i <= swaps; i++) {
+    k = swdev[i]; if (k !~ /^\/dev\//) continue
+    sub(/^\/dev\//, "", k); if (k ~ /^mapper\//) { sub(/^mapper\//, "", k); k = dmname[k] }
+    sp = phys(k, 0); n_ = split(sp, spa, " ")
+    hit_ = 0
+    for (j = 1; j <= n_; j++) for (q_ = 1; q_ <= ndev; q_++) if (spa[j] != "" && spa[j] == dev[q_]) hit_ = 1
+    if (hit_) add("주의", "swap 이 ES data 디스크에 있음 (" swdev[i] ")", "swap 을 다른 디스크로 옮기거나 끄기")
+  }
   for (i = 1; i <= ndp; i++) if (dmount[dpath[i]]) {
     o = mnt_opt[dmount[dpath[i]]]; fs_ = mnt_fs[dmount[dpath[i]]]
     if (o ~ /(^|,)(nobarrier|barrier=0)(,|$)/) add("경고", dpath[i] " barrier 꺼짐 (" o ")", "전원 차단 시 데이터 손실 위험. 옵션 제거")
@@ -352,4 +369,5 @@ END {
    $( [[ -r "$S/procio_start" ]] && echo "$S/procio_start" "$S/procio_end" ) \
    $( [[ -s "$S/ebs_stats_start" && -s "$S/ebs_stats_end" ]] && echo "$S/ebs_stats_start" "$S/ebs_stats_end" ) \
    $( ls "$B"/bench/*.json 2>/dev/null ) \
+   $( [[ -r "$S/es_nodeinfo.json" ]] && echo "$S/es_nodeinfo.json" ) \
    "$B/samples.raw" 2>/dev/null | tee "$B/summary.txt"

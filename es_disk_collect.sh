@@ -112,9 +112,12 @@ N_ES=$(for p in $(pgrep -x java 2>/dev/null); do grep -qa 'org.elasticsearch.boo
 ES_CMDLINE=""; [[ -n "$ES_PID" ]] && ES_CMDLINE=$(tr '\0' ' ' < /proc/$ES_PID/cmdline 2>/dev/null)
 CONF_DIR=$(printf '%s' "$ES_CMDLINE" | grep -oE 'es\.path\.conf=[^ ]+' | head -1 | cut -d= -f2)
 CONF_DIR=${CONF_DIR:-${ES_PATH_CONF:-/etc/elasticsearch}}
-# ES 가 컨테이너(ECK, Docker) 안에 있으면 경로는 컨테이너 기준이다. 호스트에서는 /proc/<pid>/root 를 거쳐 읽는다
+# ES 가 컨테이너(ECK, Docker) 안에 있으면 경로는 컨테이너 기준이다. 호스트에서는 /proc/<pid>/root 를 거쳐 읽는다.
+# mount namespace 만 다른 경우(systemd 의 PrivateTmp 등, RHEL 의 elasticsearch.service 가 그렇다)는 컨테이너가 아니다.
+# 루트 디렉터리 자체(장치·inode)가 다를 때만 컨테이너로 본다
 ES_ROOT=""
-if [[ -n "$ES_PID" && "$(readlink /proc/$ES_PID/ns/mnt 2>/dev/null)" != "$(readlink /proc/self/ns/mnt 2>/dev/null)" ]]; then
+if [[ -n "$ES_PID" && -r /proc/$ES_PID/root/ ]] && \
+   [[ "$(stat -L -c '%d:%i' /proc/$ES_PID/root/ 2>/dev/null)" != "$(stat -L -c '%d:%i' / 2>/dev/null)" ]]; then
   ES_ROOT="/proc/$ES_PID/root"
   msg "ES 가 컨테이너 안에서 실행 중입니다 (pid $ES_PID). 컨테이너의 mount 정보로 data 디스크를 찾습니다"
 fi
@@ -681,7 +684,7 @@ if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
   if [[ "$c" == "200" ]]; then
     ES_OK=1
     es_get "_nodes/_local?filter_path=nodes.*.name,nodes.*.version,nodes.*.roles,nodes.*.process.mlockall,nodes.*.settings.path,nodes.*.jvm.mem,nodes.*.jvm.using_compressed_ordinary_object_pointers,nodes.*.os.allocated_processors" "$S/es_nodeinfo.json" >/dev/null
-    es_get "_cluster/settings?include_defaults=true&flat_settings=true&filter_path=**.cluster.routing.allocation.disk*,**.cluster.routing.allocation.awareness*" "$S/es_cluster_settings.json" >/dev/null
+    es_get "_cluster/settings?include_defaults=true&filter_path=**.cluster.routing.allocation.disk*,**.cluster.routing.allocation.awareness*" "$S/es_cluster_settings.json" >/dev/null
     es_get "_cluster/health?filter_path=status,number_of_nodes,active_shards,relocating_shards,initializing_shards,unassigned_shards" "$S/es_health.json" >/dev/null
   elif [[ "$c" == "401" ]]; then
     msg "⚠ ES 인증 필요 (401). --es-user + ES_PASSWORD 또는 ES_API_KEY 지정 시 ES 지표 포함"
@@ -741,9 +744,9 @@ if [[ $ES_OK -eq 1 && $NO_CLUSTER -eq 0 ]]; then
   es_get "_cat/recovery?format=json&active_only=true&h=index,shard,type,stage,source_node,target_node,bytes_total,bytes_percent,time" "$C/cat_recovery.json" >/dev/null
   es_get "_cat/pending_tasks?format=json" "$C/pending_tasks.json" >/dev/null
   es_get "_snapshot/_status" "$C/snapshot_status.json" >/dev/null
-  es_get "_cluster/settings?include_defaults=true&flat_settings=true&filter_path=**.disk.watermark*,**.disk.threshold*,**.indices.recovery*,**.node_concurrent*,**.cluster_concurrent_rebalance*,**.allocation.awareness*" "$C/cluster_settings.json" >/dev/null
+  es_get "_cluster/settings?include_defaults=true&filter_path=**.disk.watermark*,**.disk.threshold*,**.indices.recovery*,**.node_concurrent*,**.cluster_concurrent_rebalance*,**.allocation.awareness*" "$C/cluster_settings.json" >/dev/null
   es_get "_nodes?filter_path=nodes.*.name,nodes.*.roles,nodes.*.attributes,nodes.*.host,nodes.*.ip,nodes.*.settings.path" "$C/nodes_info.json" >/dev/null
-  [[ $NO_IDXSTATS -eq 0 ]] && es_get "_ilm/explain?only_managed=true&filter_path=indices.*.phase,indices.*.policy,indices.*.action" "$C/ilm_explain.json" >/dev/null
+  [[ $NO_IDXSTATS -eq 0 ]] && es_get "_all/_ilm/explain?only_managed=true&filter_path=indices.*.phase,indices.*.policy,indices.*.action" "$C/ilm_explain.json" >/dev/null
 fi
 
 SAMPLES="$OUT/samples.raw"
@@ -844,18 +847,20 @@ if [[ -f "$HERE/es_disk_summary.sh" ]]; then
   bash "$HERE/es_disk_summary.sh" "$OUT" >&2 || true
 fi
 echo >&2
-tar -C "$OUT_BASE" -czf "$OUT.tar.gz" "$(basename "$OUT")" 2>/dev/null
-
+# HTML 은 번들을 묶기 전에 만든다. 번들 하나만 전달해도 리포트가 같이 가도록
 PY=""
 for c in python3 /usr/libexec/platform-python python; do
   command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info>=(3,6) else 1)' 2>/dev/null && { PY="$c"; break; }
 done
-if [[ $NO_RENDER -eq 0 && -n "$PY" && -f "$HERE/es_disk_render.py" ]]; then
+if [[ $NO_RENDER -eq 1 ]]; then
+  :
+elif [[ -n "$PY" && -f "$HERE/es_disk_render.py" ]]; then
   "$PY" "$HERE/es_disk_render.py" "$OUT" -o "$OUT/es_disk_report.html" >/dev/null && \
     msg "HTML 리포트: $OUT/es_disk_report.html"
 else
   msg "이 서버에는 Python 3.6+ 가 없어 HTML 리포트는 만들지 않았습니다. 위 요약이 셸 판정 결과입니다."
   msg "전체 리포트는 번들을 PC 로 옮겨: python3 es_disk_render.py $(basename "$OUT").tar.gz"
 fi
+tar -C "$OUT_BASE" -czf "$OUT.tar.gz" "$(basename "$OUT")" 2>/dev/null
 msg "요약: $OUT/summary.txt"
 msg "완료. 번들: $OUT.tar.gz"

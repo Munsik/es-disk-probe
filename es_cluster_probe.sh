@@ -107,10 +107,10 @@ es_get "_cluster/health" "$OUT/health.json" >/dev/null
 es_get "_cat/recovery?format=json&active_only=true&h=index,shard,type,stage,source_node,target_node,bytes_total,bytes_percent,time" "$OUT/cat_recovery.json" >/dev/null
 es_get "_cat/pending_tasks?format=json" "$OUT/pending_tasks.json" >/dev/null
 es_get "_snapshot/_status" "$OUT/snapshot_status.json" >/dev/null
-es_get "_cluster/settings?include_defaults=true&flat_settings=true&filter_path=**.disk.watermark*,**.disk.threshold*,**.indices.recovery*,**.node_concurrent*,**.cluster_concurrent_rebalance*,**.allocation.awareness*,**.max_shards_per_node*" "$OUT/cluster_settings.json" >/dev/null
+es_get "_cluster/settings?include_defaults=true&filter_path=**.disk.watermark*,**.disk.threshold*,**.indices.recovery*,**.node_concurrent*,**.cluster_concurrent_rebalance*,**.allocation.awareness*,**.max_shards_per_node*" "$OUT/cluster_settings.json" >/dev/null
 es_get "_nodes?filter_path=nodes.*.name,nodes.*.roles,nodes.*.attributes,nodes.*.settings.path,nodes.*.process.mlockall,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.os.available_processors,nodes.*.os.name,nodes.*.host,nodes.*.ip" "$OUT/nodes_info.json" >/dev/null
 # ILM phase: 인덱스별 분포 리포트에서 hot/warm 구분에 사용. read_ilm 권한이 없으면 건너뜀
-es_get "_ilm/explain?only_managed=true&filter_path=indices.*.phase,indices.*.policy,indices.*.action" "$OUT/ilm_explain.json" >/dev/null
+es_get "_all/_ilm/explain?only_managed=true&filter_path=indices.*.phase,indices.*.policy,indices.*.action" "$OUT/ilm_explain.json" >/dev/null
 [[ $DEEP -eq 1 ]] && es_get "_cat/indices?format=json&bytes=b&h=index,health,pri,rep,docs.count,store.size,pri.store.size&s=store.size:desc" "$OUT/cat_indices.json" >/dev/null
 
 sleep "$GAP"

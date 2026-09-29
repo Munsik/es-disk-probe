@@ -153,3 +153,9 @@ EXPECT += [
      [("info", "VMware 관리자", "vSAN Hybrid(OSA) 는 향후 VCF 릴리스에서 중단 예정")],
      []),
 ]
+
+EXPECT += [
+    ("rhel_service_ns", "vm", "",
+     [],
+     [(None, None, "컨테이너(Docker·Kubernetes) 안에서 실행 중"), (None, None, "컨테이너 안에서 실행됨")]),
+]

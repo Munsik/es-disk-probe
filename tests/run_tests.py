@@ -52,6 +52,16 @@ if __name__ == "__main__":
             got = {k: y.get(k, 0) - x.get(k, 0) for k in ("vol_iops", "vol_tp", "inst_iops", "inst_tp")}
             if got != {"vol_iops": 30000000, "vol_tp": 0, "inst_iops": 0, "inst_tp": 300000}:
                 fails.append("EBS 통계 형식 변형 해석 오류: {}".format(got))
+        # _cluster/settings: 중첩 응답(현재 수집 방식)과 flat 응답(예전 번들)이 같은 값으로 읽혀야 한다.
+        # flat_settings=true 에 filter_path 를 쓰면 실제 ES 가 {} 를 돌려준다 (UTM Rocky 9 + ES 8.19 에서 확인)
+        nested = {"defaults": {"cluster": {"routing": {"allocation": {"disk": {"watermark": {
+            "high": "90%", "high.max_headroom": "150gb"}}}}}}, "persistent": {}}
+        flat = {"defaults": {"cluster.routing.allocation.disk.watermark.high": "90%",
+                             "cluster.routing.allocation.disk.watermark.high.max_headroom": "150gb"}}
+        for cs_ in (nested, flat):
+            lim_, _ = R.wm_high(R.flat_settings(cs_), 4 * 1024 ** 4)
+            if not lim_ or abs(lim_ - 96.34) > 0.1:
+                fails.append("cluster settings 해석 오류 ({}): {}".format("nested" if cs_ is nested else "flat", lim_))
         # 셸 요약도 같은 초 단위 값을 내야 한다
         for name in ("aws_ebs_throttle", "aws_ebs_v2", "aws_ebs_v3"):
             if "한도 초과 30.0초" not in out[name].get("shell_text", ""):

@@ -646,9 +646,10 @@ python3 tests/make_bundle.py --list        # 시나리오 목록
 | AWS EBS 통계 해석 | JSON(한 줄·여러 줄), ebsnvme 텍스트, "이름 : 값" 표, 단위(us) 붙은 텍스트 4종으로 검증. 실제 nvme-cli 출력은 미확인 |
 | 구축 전 판정 | fio JSON(동기 쓰기·단건 읽기)과 dd 결과로 검증. 이 컨테이너에서 dd 벤치 → `--no-es` 수집 실제 실행으로 셸·HTML 판정 일치 확인 |
 | 0.9.x → 0.10 회귀 | VMware 합성 번들 3종의 판정 목록이 0.9.5와 동일 |
+| 실제 Linux VM + 실제 ES | UTM(QEMU, Apple Silicon) Rocky Linux 9.8 aarch64 + Elasticsearch 8.19.21 에서 수집·셸 요약·HTML 확인. 여기서 찾은 문제 4건 수정 (CHANGELOG) |
 | 실제 vSphere Guest | 미검증 |
 | 실제 bare-metal (NVMe, RAID, SAN), 클라우드, Kubernetes | 미검증 |
-| 운영 클러스터 `fs.io_stats` | 미검증 (모의 서버 기준) |
+| 운영 클러스터 `fs.io_stats` | 단일 노드 실제 ES 8.19 에서 확인. 다중 노드 운영 클러스터는 미검증 |
 
 ---
 

@@ -427,6 +427,11 @@ SCEN["bm_es_merge_vector"] = dict(SCEN["bm_nvme_ok"], raw={
 # 30) VMware vSAN Hybrid (OSA): 향후 중단 예정 안내
 SCEN["vmware_hybrid"] = dict(SCEN["vmware_ok"], storage="hybrid")
 
+# 31) RHEL 패키지 설치 ES (systemd PrivateTmp 로 mount namespace 만 다름): 컨테이너로 오판하면 안 됨.
+#     실제 UTM Rocky 9 + ES 8.19 번들에서 발견. 0.10.0 초기 수집기는 es_in_container=1 로 기록했다
+SCEN["rhel_service_ns"] = dict(SCEN["kvm_slow"], meta_extra="es_in_container=1\n",
+    raw={"es_cgroup": "0::/system.slice/elasticsearch.service\n"})
+
 # 20) bare-metal, OS 기본 도구만으로 보이는 문제 모음:
 #     LVM thin pool 92%, nobarrier, swap·snapshot 저장소가 data 디스크, 옆집 프로세스, 느린 flush,
 #     megaraid 커널 로그 이벤트(벤더 도구 없음), SCSI 타임아웃 카운터
