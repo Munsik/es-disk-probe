@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_collect.sh  (v0.9.4)
+# es_disk_collect.sh  (v0.9.5)
 # Elasticsearch 노드 Disk I/O 진단: 데이터 수집기 (READ-ONLY)
 #
 #  - 시스템 설정을 바꾸지 않습니다. /proc, /sys 읽기와 ES 조회 API 호출만 합니다.
@@ -39,7 +39,7 @@ set -u
 umask 077
 export LC_ALL=C
 
-VERSION="0.9.4"
+VERSION="0.9.5"
 DUR=300; INT=5; OUT_BASE="/tmp"; STORAGE="allflash"
 ES_URL=""; ES_USER=""; NO_ES=0; NO_RENDER=0; NO_CLUSTER=0
 NO_ESLOG=0; NO_KLOG=0; NO_SAR=0; NO_MAPS=0; NO_IDXSTATS=0

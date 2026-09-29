@@ -5,7 +5,7 @@ Read-only disk I/O diagnostics for Elasticsearch nodes on VMware vSAN (guest OS 
 Elasticsearch 노드의 디스크가 지금 정상인지, 문제라면 원인이 VM 안인지 밖인지를 Guest OS에서 판정합니다.
 측정 결과를 Elastic·VMware 공식 권장값과 대조해 담당자별 조치 항목까지 HTML 리포트로 냅니다.
 
-v0.9.4 · 비공식 도구 · 읽기 전용 · 한 시점을 보는 진단 도구 (상시 모니터링 도구가 아닙니다)
+v0.9.5 · 비공식 도구 · 읽기 전용 · 한 시점을 보는 진단 도구 (상시 모니터링 도구가 아닙니다)
 
 ---
 
@@ -453,4 +453,4 @@ VM snapshot, ES 노드의 호스트 배치(anti-affinity), vSAN 네트워크와 
 
 ## 라이선스
 
-Apache License 2.0
+MIT License

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-es_disk_render.py (v0.9.4)
+es_disk_render.py (v0.9.5)
 es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 지표 계산 → 판정 → HTML 리포트를 생성합니다.
 
@@ -14,7 +14,7 @@ es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 """
 import argparse, html, json, os, re, sys, tarfile, tempfile, datetime
 
-TOOL_VERSION = "0.9.4"
+TOOL_VERSION = "0.9.5"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 기준값 (출처를 함께 표기. 리포트에도 그대로 노출)
