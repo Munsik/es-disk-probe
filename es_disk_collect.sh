@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_collect.sh  (v0.9.5)
+# es_disk_collect.sh  (v0.10.0)
 # Elasticsearch 노드 Disk I/O 진단: 데이터 수집기 (READ-ONLY)
 #
 #  - 시스템 설정을 바꾸지 않습니다. /proc, /sys 읽기와 ES 조회 API 호출만 합니다.
@@ -14,7 +14,10 @@
 #     -i SEC        샘플 간격 (기본 5초, 최소 1초)
 #     -p PATH       ES data 경로 (여러 번 지정 가능, 미지정 시 자동 탐지)
 #     -o DIR        결과 저장 위치 (기본 /tmp)
-#     -s TYPE       vSAN 스토리지 유형: allflash | hybrid (기본 allflash)
+#     -s TYPE       스토리지 유형 (기본 auto: 플랫폼과 장치를 보고 자동 판정)
+#                   VMware vSAN: allflash | hybrid
+#                   bare-metal·SAN: nvme | ssd | hdd (RAID 컨트롤러 뒤라 매체를 못 읽을 때 지정)
+#     --platform P  플랫폼 강제 지정: auto | vmware | baremetal | vm (기본 auto)
 #     --es-url URL  ES 주소 (기본 자동: http://localhost:9200 → https 순서)
 #     --es-user U   ES 사용자 (비밀번호는 환경변수 ES_PASSWORD)
 #                   API Key 사용 시 환경변수 ES_API_KEY (base64 인코딩 값)
@@ -26,6 +29,8 @@
 #     --no-eslog    ES 서버 로그 읽기만 생략 (부가 수집 중 읽기량이 가장 큰 항목)
 #     --no-index-stats  인덱스 수에 비례해 커지는 ES 조회 2건 생략
 #                   (_nodes/_local/stats?level=indices, _ilm/explain)
+#     --smart       smartctl 로 디스크 상태(SMART) 읽기. 기본은 꺼짐
+#                   읽기 전용 명령이지만 /proc·/sys 가 아니라 장치에 직접 명령을 보내므로 선택 사항
 #
 # 부하 (실측, 300초/5초 간격 기준):
 #   CPU 약 1.2초 (측정 시간 대비 CPU 1개의 0.4%), 메모리 12MB 미만,
@@ -39,8 +44,8 @@ set -u
 umask 077
 export LC_ALL=C
 
-VERSION="0.9.5"
-DUR=300; INT=5; OUT_BASE="/tmp"; STORAGE="allflash"
+VERSION="0.10.0"
+DUR=300; INT=5; OUT_BASE="/tmp"; STORAGE="auto"; PLATFORM="auto"; SMART=0
 ES_URL=""; ES_USER=""; NO_ES=0; NO_RENDER=0; NO_CLUSTER=0
 NO_ESLOG=0; NO_KLOG=0; NO_SAR=0; NO_MAPS=0; NO_IDXSTATS=0
 USER_PATHS=()
@@ -60,6 +65,8 @@ while [[ $# -gt 0 ]]; do
     --no-eslog)  NO_ESLOG=1; shift ;;
     --light)     NO_ESLOG=1; NO_KLOG=1; NO_SAR=1; NO_MAPS=1; NO_IDXSTATS=1; shift ;;
     --no-index-stats) NO_IDXSTATS=1; shift ;;
+    --platform)  PLATFORM="$2"; shift 2 ;;
+    --smart)     SMART=1; shift ;;
     -h|--help) awk 'NR>1 && /^#/{print;next} NR>1{exit}' "$0"; exit 0 ;;
     *) echo "알 수 없는 옵션: $1"; exit 1 ;;
   esac
@@ -68,7 +75,8 @@ ES_PASSWORD="${ES_PASSWORD:-}"; ES_API_KEY="${ES_API_KEY:-}"
 
 [[ "$INT" =~ ^[0-9]+$ && "$INT" -ge 1 ]] || { echo "-i 는 1 이상 정수"; exit 1; }
 [[ "$DUR" =~ ^[0-9]+$ && "$DUR" -ge $((INT*3)) ]] || { echo "-d 는 간격의 3배 이상"; exit 1; }
-case "$STORAGE" in allflash|hybrid) ;; *) echo "-s 는 allflash|hybrid"; exit 1 ;; esac
+case "$STORAGE" in auto|allflash|hybrid|nvme|ssd|hdd) ;; *) echo "-s 는 auto|allflash|hybrid|nvme|ssd|hdd"; exit 1 ;; esac
+case "$PLATFORM" in auto|vmware|baremetal|vm) ;; *) echo "--platform 은 auto|vmware|baremetal|vm"; exit 1 ;; esac
 ES_URL="${ES_URL%/}"        # 뒤 슬래시 제거. 붙어 있으면 //_cluster/health 로 요청이 나감
 
 msg() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
@@ -78,7 +86,7 @@ renice -n 19 -p $$ >/dev/null 2>&1 || true
 command -v ionice >/dev/null 2>&1 && ionice -c 3 -p $$ >/dev/null 2>&1 || true
 
 IS_ROOT=0; [[ $EUID -eq 0 ]] && IS_ROOT=1
-[[ $IS_ROOT -eq 0 ]] && msg "⚠ root가 아닙니다. ES 프로세스 I/O, dmesg, VMware 정보 일부가 빠질 수 있습니다."
+[[ $IS_ROOT -eq 0 ]] && msg "⚠ root가 아닙니다. ES 프로세스 I/O, dmesg, 가상화·장치 정보 일부가 빠질 수 있습니다."
 
 HOST=$(hostname 2>/dev/null || echo unknown)
 TS=$(date +%Y%m%d_%H%M%S)
@@ -98,6 +106,7 @@ start_epoch=$(date +%s)
 duration=$DUR
 interval=$INT
 storage=$STORAGE
+platform=$PLATFORM
 is_root=$IS_ROOT
 user_paths=${USER_PATHS[*]:-}
 EOF
@@ -170,11 +179,31 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
   [[ -r /proc/pressure/io ]] && echo "psi=available" || echo "psi=unavailable"
 } > "$S/sysctl"
 
-# 가상화 / VMware
+# 플랫폼 판별 원자료 / VMware
+# 판정은 분석기가 한다. 여기서는 판단 근거가 되는 값만 모은다 (번들을 PC 에서 다시 렌더링해도 같은 결과가 나오게)
+# systemd-detect-virt 는 가상화가 없으면 "none" 을 찍고 1 로 끝난다. 명령이 없을 때만 unknown
 {
-  echo "detect_virt=$(systemd-detect-virt 2>/dev/null || echo unknown)"
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    echo "detect_virt=$(systemd-detect-virt 2>/dev/null)"
+    echo "detect_virt_vm=$(systemd-detect-virt -v 2>/dev/null)"
+    echo "detect_virt_container=$(systemd-detect-virt -c 2>/dev/null)"
+  else
+    echo "detect_virt=unknown"
+  fi
   echo "sys_vendor=$(catf /sys/class/dmi/id/sys_vendor)"
   echo "product_name=$(catf /sys/class/dmi/id/product_name)"
+  echo "board_vendor=$(catf /sys/class/dmi/id/board_vendor)"
+  echo "bios_vendor=$(catf /sys/class/dmi/id/bios_vendor)"
+  echo "chassis_asset_tag=$(catf /sys/class/dmi/id/chassis_asset_tag)"
+  echo "sys_hypervisor=$(catf /sys/hypervisor/type)"
+  # CPUID hypervisor 비트. 가상 머신이면 1. detect-virt 가 없는 오래된 배포판의 보조 근거
+  echo "cpu_hypervisor_flag=$(grep -m1 -cE '^flags.*[[:space:]]hypervisor([[:space:]]|$)' /proc/cpuinfo 2>/dev/null)"
+  # 컨테이너 안에서 실행 중인지 (detect-virt 가 없을 때의 보조 근거)
+  [[ -f /.dockerenv ]] && echo "dockerenv=1"
+  [[ -n "${KUBERNETES_SERVICE_HOST:-}" ]] && echo "kubernetes=1"
+  # CPU 주파수 정책. bare-metal 에서 powersave 면 I/O 완료 처리까지 늦어진다 (VM 에는 보통 없음)
+  echo "cpu_governor=$(catf /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+  echo "cpu_scaling_driver=$(catf /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver)"
   if command -v vmware-toolbox-cmd >/dev/null 2>&1; then
     echo "tools_version=$(vmware-toolbox-cmd -v 2>/dev/null)"
     for k in balloon swap memlimit memres cpulimit cpures; do
@@ -188,6 +217,61 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
   done
 } > "$S/virt" 2>/dev/null
 
+# 스토리지 연결 방식과 장치 상태 (bare-metal·SAN 판정용). 전부 sysfs/proc 읽기
+{
+  # NVMe 컨트롤러: 모델, 펌웨어, 연결 방식(pcie 가 아니면 NVMe-oF, 즉 원격), 온도, PCIe 링크
+  # hwmon 온도를 읽으면 커널이 장치에 SMART log 를 한 번 요청한다. 읽기 전용이고 실행당 1회
+  for c in /sys/class/nvme/nvme*; do
+    [[ -d "$c" ]] || continue
+    n=${c##*/}
+    for f in model firmware_rev transport state numa_node; do
+      [[ -r "$c/$f" ]] && printf 'NVME|%s|%s|%s\n' "$n" "$f" "$(tr -d '\n' < "$c/$f" 2>/dev/null | sed 's/ *$//')"
+    done
+    for hw in "$c"/hwmon*/ "$c"/device/hwmon/hwmon*/; do
+      [[ -r "${hw}temp1_input" ]] || continue
+      for f in temp1_input:temp temp1_max:temp_max temp1_crit:temp_crit temp1_alarm:temp_alarm; do
+        [[ -r "${hw}${f%%:*}" ]] && printf 'NVME|%s|%s|%s\n' "$n" "${f##*:}" "$(cat "${hw}${f%%:*}" 2>/dev/null)"
+      done
+      break
+    done
+    for f in current_link_speed:link_speed max_link_speed:max_link_speed current_link_width:link_width max_link_width:max_link_width; do
+      [[ -r "$c/device/${f%%:*}" ]] && printf 'NVME|%s|%s|%s\n' "$n" "${f##*:}" "$(cat "$c/device/${f%%:*}" 2>/dev/null)"
+    done
+  done
+  # FC HBA 포트 (SAN 판정)
+  for h in /sys/class/fc_host/host*; do
+    [[ -d "$h" ]] || continue
+    printf 'FCHOST|%s|port_state=%s|speed=%s\n' "${h##*/}" "$(catf "$h/port_state")" "$(catf "$h/speed")"
+  done
+  # iSCSI 세션 수
+  n_is=$(ls -d /sys/class/iscsi_session/session* 2>/dev/null | wc -l)
+  echo "ISCSI|sessions|$n_is"
+} > "$S/storage" 2>/dev/null
+# 소프트웨어 RAID 상태 (resync·degraded). 메모리에서 만들어지는 값
+[[ -r /proc/mdstat ]] && cat /proc/mdstat > "$S/mdstat" 2>/dev/null
+
+# SMART (선택, --smart). smartctl 은 장치에 SMART 읽기 명령을 보낸다. 쓰기·self-test 는 하지 않는다.
+# -n standby: 절전 중인 HDD 는 깨우지 않고 건너뛴다. 장치 하나에 15초 상한
+# RAID 컨트롤러 뒤의 논리 디스크는 -d megaraid,N 같은 지정이 필요해 대개 실패한다. 실패는 그대로 기록만 한다
+SMART_N=0
+if [[ $SMART -eq 1 ]]; then
+  if command -v smartctl >/dev/null 2>&1; then
+    for d in /sys/block/*; do
+      n=${d##*/}
+      case "$n" in loop*|ram*|sr*|zram*|dm-*|md*|nbd*|rbd*) continue ;; esac
+      dev="/dev/$n"; [[ "$n" == nvme*n* ]] && dev="/dev/${n%n*}"
+      [[ $SMART_N -ge 32 ]] && break
+      echo "#DEV $n $dev"
+      timeout 15 smartctl -H -A -i -n standby "$dev" 2>&1 | head -120
+      SMART_N=$((SMART_N+1))
+    done > "$S/smart"
+  else
+    echo "#SMARTCTL_ABSENT" > "$S/smart"
+    msg "⚠ --smart 를 줬지만 smartctl 이 없습니다 (smartmontools 패키지). SMART 판정은 빠집니다"
+  fi
+fi
+echo "smart=$SMART" >> "$OUT/meta"
+
 save tuned  tuned-adm active
 save fstrim sh -c "systemctl is-enabled fstrim.timer 2>&1; systemctl is-active fstrim.timer 2>&1"
 cp /proc/interrupts "$S/interrupts_start" 2>/dev/null
@@ -198,7 +282,7 @@ save udev_rules sh -c "grep -rhsE 'scheduler|read_ahead|queue/|timeout' /etc/ude
 # -n 으로 상한을 둔다: 장애가 반복되는 노드는 커널 메시지가 수십만 줄이 될 수 있고,
 # 그만큼 journal 파일을 읽으면 그 자체가 디스크 부하가 된다. 최근 것부터 보므로 상한으로 충분.
 KLOG_MAX_LINES=${KLOG_MAX_LINES:-20000}
-KPAT='I/O error|blk_update_request|Buffer I/O error|critical medium error|rejecting I/O|hung_task|blocked for more than [0-9]+ seconds|remount.*read-only|XFS \(.*\).*(error|shutdown|[Cc]orruption)|EXT4-fs (error|warning)|Sense Key|(scsi|sd [0-9]|pvscsi|mptscsih|mptbase|nvme|ata[0-9]).*(\<abort|\<reset\>|timed out|timing out|timeout|failed)'
+KPAT='I/O error|blk_update_request|Buffer I/O error|critical medium error|Medium Error|rejecting I/O|hung_task|blocked for more than [0-9]+ seconds|remount.*read-only|XFS \(.*\).*(error|shutdown|[Cc]orruption)|EXT4-fs (error|warning)|Sense Key|(scsi|sd [0-9]|pvscsi|mptscsih|mptbase|nvme|ata[0-9]|megaraid|mpt3sas|mpt2sas|hpsa|smartpqi|aacraid|qla2xxx|lpfc).*(\<abort|\<reset\>|timed out|timing out|timeout|failed|FATAL|fault)|controller is down|AER:.*(error|Error)|md/raid.*(Disk failure|not operational)|multipath.*(Failing path|remaining active paths: 0)'
 if [[ $NO_KLOG -eq 0 ]]; then
   {
     command -v journalctl >/dev/null 2>&1 && journalctl -k --since "7 days ago" -n "$KLOG_MAX_LINES" -o short-iso --no-pager 2>/dev/null
