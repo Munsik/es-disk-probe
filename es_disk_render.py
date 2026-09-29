@@ -1131,7 +1131,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
                     "가상 디스크를 여러 개로 나눠 LVM stripe로 묶는 방법이 가장 효과적입니다. 가상 컨트롤러의 큐 설정은 하이퍼바이저마다 다르므로 {}와 함께 검토하세요.".format(OUT), GSRC)
         elif qratio >= 0.4:
             add(hi_sev, "지연", "원인 분리 필요",
-                "병목 위치: 큐도 깊고 지연도 높음. {}과 {}을 함께 확인 (큐 사용률 {:.0f}%)".format(WHERE_IN, WHERE_OUT, qratio * 100), q_ev,
+                "병목 위치: 큐도 깊고 지연도 높음. {} 쪽과 {} 쪽을 함께 확인 (큐 사용률 {:.0f}%)".format(WHERE_IN, WHERE_OUT, qratio * 100), q_ev,
                 "큐가 절반 이상 차 있으면서 응답시간도 높습니다. 장치 쪽이 느려서 요청이 밀린 것일 수도 있고, 큐가 좁아서 대기가 길어진 것일 수도 있어 한쪽으로 단정할 수 없습니다.",
                 {"san": "스토리지 관리자에게 같은 시각의 어레이 쪽 응답시간(호스트 포트·볼륨 단위)을 요청해 서버에서 본 값과 비교하세요. "
                         "어레이 값이 낮으면 서버 쪽 큐·경로, 높으면 어레이 쪽입니다.",
@@ -2718,9 +2718,9 @@ def render(R, out_path):
                 fmt(sync.get("sync_p99") or sync.get("w_p99"), 2, " ms")))
     else:
         h.append('<h2>한계 추정</h2><p class="lead">부하 테스트 없이 계산할 수 있는 것은 "{} 큐 기준 상한"까지입니다. 동시에 처리할 수 있는 요청 수(queue_depth 합계)를 1건 평균 처리 시간으로 나눈 값입니다. '
-                 '실제로는 부하가 늘면 처리 시간도 늘고 {}이 먼저 막히므로, 이 값은 <b>넘을 수 없는 상한</b>이지 도달 가능한 값이 아닙니다.</p>'.format(
+                 '실제로는 부하가 늘면 처리 시간도 늘고 {} 먼저 막히므로, 이 값은 <b>넘을 수 없는 상한</b>이지 도달 가능한 값이 아닙니다.</p>'.format(
                      "장치" if kind == "baremetal" else "가상 디스크",
-                     {"vmware": "vSAN 쪽", "baremetal": "디스크 자체"}.get(kind, "스토리지 백엔드")))
+                     {"vmware": "vSAN 쪽이", "baremetal": "디스크 자체가"}.get(kind, "스토리지 백엔드가")))
         if R.get("q_ceiling"):
             use = 100.0 * (A["iops_p95"] or 0) / R["q_ceiling"]
             h.append('<table><tr><th>항목</th><th>값</th></tr><tr><td>{} 큐 기준 이론 상한</td><td class="n">{}</td></tr>'
@@ -2788,7 +2788,7 @@ def render(R, out_path):
         st = R["dev_stats"].get(d) or R["log_stats"].get(d) or {}
         host = topo.scsihost.get(d, "")
         h.append('<tr><td><b>{}</b>{}</td><td>{}</td><td class="n">{}</td><td>{}</td><td class="n">{}KB</td><td class="n">{}s</td><td>{}/{}</td>'
-                 '<td class="n">{}</td><td class="n">{}</td><td class="n">{}</td><td class="n">{}</td><td class="n">{}</td></tr>'.format(
+                 '<td class="n">{}</td><td class="n">{}</td><td class="n">{}</td><td class="n">{}</td><td class="n">{}</td><td class="n">{}</td></tr>'.format(
                      E(d), " <span class='note'>(" + E(a.get("dm/name")) + ")</span>" if a.get("dm/name") else "",
                      E((host + " " + topo.hostdrv.get(host, "")).strip() or "-"), E(a.get("device/queue_depth", "-")),
                      E(a.get("queue/scheduler", "-")), E(a.get("queue/read_ahead_kb", "-")), E(a.get("device/timeout", "-")),
@@ -2892,7 +2892,7 @@ def render(R, out_path):
         ("과거 이력", "sysstat sar 파일 (이미 기록된 것)", "측정 창 밖의 피크", "주의 알림"),
         ("ES 서버 로그", "/var/log/elasticsearch/*.log (최근 7일, 관련 줄만)", "ES가 직접 남긴 스로틀·watermark·flush 실패 기록", "ES 영향 판정"),
         ("mmap 사용량", "/proc/<pid>/maps 줄 수 vs vm.max_map_count", "segment 매핑 한도 여유", "설정 판정"),
-        ("스토리지 인터럽트 분포", "/proc/interrupts 시작·종료 스냅샷", "I/O 완료 처리가 vCPU 한 개에 몰리는지", "설정 판정"),
+        ("스토리지 인터럽트 분포", "/proc/interrupts 시작·종료 스냅샷", "I/O 완료 처리가 {} 한 개에 몰리는지".format("CPU" if kind == "baremetal" else "vCPU"), "설정 판정"),
         ("노드 간 비교", "_nodes/stats fs.io_stats (측정과 같은 창으로 2회)", "이 노드만인지 클러스터 전체인지", "클러스터 판정"),
         ("인덱스별 분포", "_nodes/_local/stats/indices?level=indices + _ilm/explain", "이 노드 디스크를 쓰는 인덱스와 ILM phase", "쓰기 집중 판정"),
         ("샤드 배분", "_cat/allocation", "샤드가 이 노드에 몰렸는지", "교차 판정"),
@@ -2919,7 +2919,7 @@ def render(R, out_path):
     elif kind == "baremetal":
         gaps.append(("스트라이프 구성원별 비교", "디스크별 지표는 있으나 비교 판정 없음", "같은 묶음 안에서 한 디스크만 느린지", "불량 디스크 하나가 전체 묶음을 늦춥니다"))
     gaps += [
-        ("스토리지 IRQ 편중", "없음", "측정 구간 IRQ 분포", "vCPU 한 개에 몰리면 IOPS가 거기서 막힙니다"),
+        ("스토리지 IRQ 편중", "없음", "측정 구간 IRQ 분포", "{} 한 개에 몰리면 IOPS가 거기서 막힙니다".format("CPU" if kind == "baremetal" else "vCPU")),
         ("mmap 여유", "없음", "현재 매핑 수 / max_map_count", "한도에 닿으면 인덱싱이 실패합니다"),
         ("인덱스별 쓰기 분포", "인덱스 지표는 있으나 노드 로컬 관점 아님", "이 노드 샤드의 인덱스별 delta + ILM phase", "디스크를 쓰는 주체를 인덱스까지 좁힘"),
         ("Best practice 대조", "없음", "공식 문서 기준 전수 대조표", "경보가 아니라 사전 예방"),

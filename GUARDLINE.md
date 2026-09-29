@@ -1,4 +1,4 @@
-# Elasticsearch on VMware vSAN 디스크 Guardline
+# Elasticsearch 노드 디스크 Guardline (VMware vSAN · bare-metal)
 
 이 문서는 디스크 때문에 Elasticsearch가 불안정해지는 일을 **미리 막기 위한 기준**입니다.
 진단 도구(`es_disk_collect.sh`)이 점검하는 항목과 기준값이 같습니다. 리포트의 "Best practice 대조표"와 나란히 보면 됩니다.
@@ -9,6 +9,8 @@
 - **[VMware]** VMware/Broadcom 문서의 권고
 - **[OS]** 커널·배포판 문서
 - **[실무]** 공식 수치가 없어 운영 경험으로 정한 기준. 환경에 맞게 조정 가능
+
+1장은 VMware, 1-B장은 bare-metal 설계 기준입니다. 2장부터는 공통이고, 플랫폼마다 다른 항목은 표 안에 따로 적었습니다.
 
 ---
 
@@ -34,13 +36,33 @@ Guest OS에서는 바꿀 수 없고, 나중에 바꾸려면 VM 정지나 데이�
 
 ---
 
-## 2. Guest OS 구성 (서버 담당자 영역)
+## 1-B. 설계 단계: bare-metal 서버와 스토리지 (서버·하드웨어 담당자 영역)
+
+나중에 바꾸려면 데이터 이전이나 장비 교체가 필요한 항목입니다.
+
+| 항목 | 기준 | 이유 | 출처 |
+|---|---|---|---|
+| 매체 | SSD, 가능하면 NVMe. HDD는 warm·cold 계층에만 | SSD가 회전 디스크보다 일반적으로 빠릅니다. ES는 여러 파일을 동시에 순차·무작위로 읽고 씁니다 | [Elastic] |
+| 연결 | 로컬 직결 스토리지 우선. SAN을 쓰면 실제 부하로 벤치마크 | 직결 스토리지가 지연이 낮습니다. 일부 원격 스토리지는 ES 부하에서 매우 느립니다 | [Elastic] |
+| 여러 디스크 묶기 | RAID 0 또는 LVM stripe | ES replica가 이중화를 맡습니다. RAID 1/10과 겹치면 같은 문서를 여러 벌 씁니다 | [Elastic] |
+| RAID 5/6 | hot 노드에는 피함 | 쓰기마다 읽기-수정-쓰기가 생깁니다 | [실무] |
+| 컨트롤러 캐시 | 배터리(또는 flash) 보호 write-back. 배터리 상태 정기 점검 | 캐시가 write-through로 바뀌면 fsync마다 디스크까지 가서 쓰기 지연이 크게 늘어납니다 | [실무] |
+| NVMe 냉각 | 드라이브 베이 공기 흐름 확보, 빈 슬롯 블랭크 장착 | 경고 온도(WCTEMP)를 넘으면 장치가 스스로 성능을 낮춥니다 | [OS] NVMe 규격 |
+| NVMe 슬롯 | 장치가 지원하는 PCIe 세대·레인 수로 연결되는 슬롯 | 링크가 낮게 잡히면 최대 처리량이 그만큼 줄어듭니다 | [OS] |
+| BIOS 전원 정책 | 성능 우선 프로파일 검토 (벤더 가이드 확인) | 절전 상태에서 깨어나는 시간이 I/O 완료 처리에 더해집니다 | [실무] |
+| 랙·전원 분산 | ES 노드를 여러 랙·전원 계통에 나누고 awareness 설정 | 한 랙 장애로 primary와 replica를 동시에 잃지 않게 합니다 | [Elastic] |
+
+---
+
+## 2. OS 구성 (서버 담당자 영역)
 
 | 항목 | 기준 | 확인 명령 | 출처 |
 |---|---|---|---|
 | readahead | ES data 장치 128KiB 이하 (LVM이면 dm 장치도) | `lsblk -o NAME,RA` | [Elastic] |
-| I/O 스케줄러 | mq-deadline 또는 none (cfq/bfq 피함) | `cat /sys/block/sdX/queue/scheduler` | [OS] |
-| SCSI 타임아웃 | 60초 이상. open-vm-tools 설치 시 180초로 자동 설정 | `cat /sys/block/sdX/device/timeout` | [VMware] |
+| I/O 스케줄러 | VM: mq-deadline 또는 none (cfq/bfq 피함). bare-metal: NVMe·SSD none 또는 kyber, HDD mq-deadline 또는 bfq | `cat /sys/block/sdX/queue/scheduler` | [OS] Red Hat |
+| tuned profile | VM: virtual-guest. bare-metal: throughput-performance | `tuned-adm active` | [OS] Red Hat |
+| CPU governor | bare-metal: performance (throughput-performance가 설정) | `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor` | [OS] Red Hat |
+| SCSI 타임아웃 | VMware: 60초 이상. open-vm-tools 설치 시 180초로 자동 설정. bare-metal 로컬 디스크는 커널 기본 30초, SAN은 multipath 벤더 권고 | `cat /sys/block/sdX/device/timeout` | [VMware] |
 | I/O 통계 | `queue/iostats` = 1 | `cat /sys/block/sdX/queue/iostats` | [OS] |
 | 파일시스템 | xfs 또는 ext4, 로컬 블록 장치. NFS 금지 | `findmnt -T <path.data>` | [Elastic] |
 | 마운트 옵션 | noatime 또는 relatime. `discard` 대신 `fstrim.timer` | `findmnt -o OPTIONS` | [OS] |
@@ -49,10 +71,11 @@ Guest OS에서는 바꿀 수 없고, 나중에 바꾸려면 VM 정지나 데이�
 | vm.max_map_count | 최소 262144, 권장 1048576 | `sysctl vm.max_map_count` | [Elastic] |
 | swap | 비활성 권장. 불가하면 `bootstrap.memory_lock: true`, 최소한 `vm.swappiness=1` | `swapon --show` | [Elastic] |
 | 파일 핸들 | 65535 이상 | `cat /proc/<pid>/limits` | [Elastic] |
-| open-vm-tools | 설치 | `vmware-toolbox-cmd -v` | [VMware] |
+| open-vm-tools | VMware만. 설치 | `vmware-toolbox-cmd -v` | [VMware] |
+| 소프트웨어 RAID 점검 일정 | bare-metal md: 정기 check를 서비스 피크 밖으로 | `cat /proc/mdstat`, `/etc/cron.d/raid-check` | [OS] |
 | PSI | RHEL 8은 부트 파라미터 `psi=1`로 켜 두면 포화 진단이 정확해짐 | `cat /proc/pressure/io` | [OS] |
 
-**PVSCSI queue depth 상향(cmd_per_lun=254, ring_pages=32)은 기본 적용 대상이 아닙니다.** 진단 리포트에서 "Guest 큐 포화"가 확인됐을 때만 적용합니다. 재부팅이 필요합니다. [VMware KB 2053145]
+**PVSCSI queue depth 상향(cmd_per_lun=254, ring_pages=32)은 VMware에서도 기본 적용 대상이 아닙니다.** 진단 리포트에서 "Guest 큐 포화"가 확인됐을 때만 적용합니다. 재부팅이 필요합니다. [VMware KB 2053145]
 
 ---
 
@@ -63,10 +86,11 @@ Guest OS에서는 바꿀 수 없고, 나중에 바꾸려면 VM 정지나 데이�
 | JVM heap | RAM의 50% 이하, 약 31GB 이하 | 나머지 RAM이 page cache가 되어 segment 읽기를 받아 줍니다 | [Elastic] |
 | path.data | 경로 하나 (여러 디스크는 OS에서 LVM stripe로 묶음) | 다중 data path는 7.13부터 deprecated | [Elastic] |
 | disk watermark | 기본값(85/90/95%) 유지, 사용률은 high보다 10%p 이상 여유 | high를 넘으면 샤드 이동 자체가 큰 디스크 부하가 됩니다 | [Elastic] |
-| shard allocation awareness | ESXi 호스트 단위 attribute로 설정 | ES는 VM이 어느 호스트에 있는지 모릅니다 | [Elastic] |
+| shard allocation awareness | VMware: ESXi 호스트 단위. bare-metal: 랙·전원 계통 단위. 클라우드: 가용 영역 단위 | ES는 노드가 어느 호스트·랙에 있는지 모릅니다 | [Elastic] |
 | 복구 속도 | `indices.recovery.max_bytes_per_sec` 기본 40mb 유지. 복구가 서비스를 방해할 때만 조정 | 올리면 복구는 빨라지지만 그동안 디스크를 더 씁니다 | [Elastic] |
 | 인덱싱 위주 인덱스 | `refresh_interval` 연장 검토 (예: 30s) | refresh마다 작은 segment가 생기고 merge 부하가 늘어납니다 | [Elastic] |
 | translog | `durability: request`(기본) 유지 | `async`는 fsync를 줄이지만 장애 시 최근 데이터를 잃을 수 있습니다. 디스크 문제를 이 설정으로 덮지 않습니다 | [Elastic] |
+| merge 스레드 | HDD(bare-metal) 또는 Hybrid vSAN이면 `index.merge.scheduler.max_thread_count: 1` | 회전 디스크에서는 동시 merge가 오히려 느립니다 | [Elastic] |
 | 샤드 크기 | 샤드당 10~50GB 범위 | 너무 작으면 segment·mmap이 늘고, 너무 크면 복구가 오래 걸립니다 | [Elastic] |
 
 ---
@@ -88,12 +112,14 @@ Guest OS에서는 바꿀 수 없고, 나중에 바꾸려면 VM 정지나 데이�
 
 | 경보 | 필드 | 주의 | 경고 | 출처 |
 |---|---|---|---|---|
-| 읽기 응답시간 | `system.diskio.iostat.read.await` | All-Flash 5ms / Hybrid 10ms | 10ms / 20ms | [실무] Broadcom KB 389082 기반 |
-| 쓰기 응답시간 | `system.diskio.iostat.write.await` | 위와 같음 | 위와 같음 | [실무] |
+| 읽기 응답시간 (vSAN) | `system.diskio.iostat.read.await` | All-Flash 5ms / Hybrid 10ms | 10ms / 20ms | [실무] Broadcom KB 389082 기반 |
+| 읽기 응답시간 (bare-metal·SAN) | 위와 같음 | NVMe 1ms / SSD 3ms / HDD 25ms | 3ms / 6ms / 30ms | [실무] Broadcom KB 424485 장치별 경보 기준 기반 |
+| 쓰기 응답시간 | `system.diskio.iostat.write.await` | 읽기와 같음 | 읽기와 같음 | [실무] |
 | 대기 I/O | `system.diskio.iostat.queue.avg_size` | queue_depth의 50% | 80% | [실무] |
 
 - 5분 평균처럼 창을 두고 걸어야 순간 튐에 경보가 난무하지 않습니다.
-- `busy`(%util)에는 경보를 걸지 않습니다. vSAN처럼 병렬 처리하는 장치는 100%여도 여유가 있을 수 있습니다.
+- `busy`(%util)에는 경보를 걸지 않습니다. vSAN, NVMe, RAID처럼 병렬 처리하는 장치는 100%여도 여유가 있을 수 있습니다.
+- stripe로 묶은 디스크는 묶음 장치(md, dm)와 구성원 디스크 양쪽에 경보를 거세요. 한 디스크만 느린 경우는 묶음 장치 지표에서 희석됩니다.
 - Elastic Agent의 Linux iostat은 beta라 필드나 동작이 바뀔 수 있습니다. 운영 경보로 쓰기 전에 사용 중인 버전의 문서를 확인하세요.
 
 ### 4-2. ES 지표 (Stack Monitoring)
@@ -115,7 +141,7 @@ Guest OS에서는 바꿀 수 없고, 나중에 바꾸려면 VM 정지나 데이�
 2. 바꾸기 전과 후에 같은 시간대로 이 도구를 돌려 비교합니다. 측정 없는 변경은 추측입니다.
 3. **되돌리는 방법을 먼저 적어 둡니다.** sysctl·udev·마운트 옵션 모두 이전 값을 기록한 뒤 바꿉니다.
 4. **재부팅이 필요한 항목**(PVSCSI 파라미터, psi=1, 컨트롤러 변경)은 롤링 재시작 계획과 함께 진행합니다. 한 노드씩, 클러스터가 green으로 돌아온 걸 확인한 뒤 다음 노드로 넘어갑니다.
-5. **벤치(`es_disk_bench.sh`)는 서비스 중 실행하지 않습니다.** vSAN은 공용 스토리지라 다른 VM에도 영향이 갑니다. VMware 관리자와 시간을 맞춥니다.
+5. **벤치(`es_disk_bench.sh`)는 서비스 중 실행하지 않습니다.** vSAN, SAN 어레이는 공용 스토리지라 다른 VM·서버에도 영향이 갑니다. VMware·스토리지 관리자와 시간을 맞춥니다.
 
 ---
 
@@ -147,4 +173,36 @@ Guest에서 원리상 볼 수 없는 항목입니다. 진단 리포트와 함께
 □ 측정 시각 resync 진행 여부
 □ vSAN 네트워크: 전용 대역 / 속도 ___ / 재전송·지연 이상 유무
 □ Skyline Health 경고 유무
+```
+
+---
+
+## 7-B. 하드웨어 담당자 요청 체크리스트 (bare-metal, 복사해서 사용)
+
+RAID 컨트롤러 뒤 상태처럼 OS에서 볼 수 없는 항목입니다. 진단 리포트와 함께 전달하세요.
+
+```
+[ES 노드 서버: ______________]  측정 시각: ______________
+
+□ RAID 컨트롤러 모델 ___ / 펌웨어 ___ / 드라이버 ___
+□ 논리 디스크 RAID 레벨 ___ / stripe 크기 ___
+□ 캐시 정책: 현재 write-back / write-through (설정값과 실제 적용값 모두)
+□ 배터리·캐시 모듈 상태, 학습 주기(learn cycle) 일정
+□ 측정 시각 전후 컨트롤러 이벤트: 재구성, 일관성 검사, patrol read, 디스크 오류
+□ 구성원 물리 디스크 상태: predictive failure, media error 수
+□ BIOS System Profile (성능 / 절전)
+□ BMC(iDRAC·iLO·XCC) 온도·전원 이벤트
+```
+
+## 7-C. 스토리지 관리자 요청 체크리스트 (SAN, 복사해서 사용)
+
+```
+[ES 노드 서버: ______________]  측정 시각: ______________  LUN/볼륨: ______________
+
+□ 측정 시각 볼륨 응답시간(읽기/쓰기) ___ / 호스트 포트 응답시간 ___
+□ 어레이 컨트롤러 사용률 ___ / 같은 시각 다른 호스트 부하
+□ 볼륨 QoS(IOPS·처리량 한도) 유무 ___
+□ SAN 스위치 포트 오류(CRC, 버퍼 부족) 유무
+□ 어레이 복제(동기/비동기)·스냅샷 일정
+□ 경로 수와 multipath 정책 권고값
 ```

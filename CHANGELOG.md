@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.10.0] - 2026-09-29
+
+VMware vSAN Guest 전용이던 판정을 bare-metal, SAN, 그 밖의 hypervisor·클라우드까지 넓혔다.
+플랫폼을 실행한 서버에서 자동으로 판별하고, 플랫폼마다 기준값과 병목 위치 해석, 담당자를 바꾼다.
+VMware 판정은 그대로다 (합성 번들 3종에서 0.9.5 와 판정 목록 동일).
+
+### 플랫폼 판별
+- `systemd-detect-virt -v/-c`, DMI, `/sys/hypervisor`, CPU hypervisor 플래그로 vmware / baremetal / vm / 미확정 구분.
+  bare-metal 은 "가상화 없음"이 확인될 때만 판정하고, 근거가 없으면 공통 기준으로 판정하며 `--platform` 지정을 안내
+- ES data 디스크별 매체와 연결 방식: NVMe(PCIe), NVMe-oF, FC·iSCSI HBA, 어레이 벤더, dm-multipath,
+  RAID 컨트롤러 논리 디스크, 로컬 SSD·HDD. RAID 논리 디스크는 매체를 "추정"으로 표시
+- 클라우드(AWS, Azure, Google Cloud)와 컨테이너 실행 여부 표시. 컨테이너 안이면 호스트에서 다시 실행하도록 경고
+
+### 판정 기준
+- bare-metal·SAN 응답시간: Broadcom KB 424485 장치별 경보 기준을 주의 선으로 (NVMe 1ms, SSD 3ms, HDD 25ms).
+  경고·위험 단계는 실무 기준. await 에 block layer 대기가 포함되므로 "정상 범위"가 아니라 "경보 기준"을 씀
+- 그 밖의 VM: 백엔드를 모르므로 vSAN All-Flash 수치를 공통 기준으로 차용 [실무 기준]
+- `-s` 기본값 auto. `nvme|ssd|hdd` 추가. 매체가 섞이면 가장 느린 매체 기준.
+  0.9.x 번들의 `storage=allflash` 는 사용자 선택과 구분이 안 돼 auto 로 해석
+
+### 병목 위치와 담당자
+- bare-metal 로컬: 큐가 차면 디스크 구성 포화(서버 담당자), 큐가 비었는데 느리면 디스크·컨트롤러 이상(하드웨어 담당자)
+- SAN: 서버 LUN 큐 대 어레이·SAN 경로(스토리지 관리자)
+- 그 밖의 VM: VM 안 대 VM 바깥(가상화·클라우드 관리자)
+- NVMe 와 virtio-blk 처럼 queue_depth 가 없는 장치를 권한 문제와 구분
+- 쓰기만 느림: RAID 컨트롤러 캐시, SSD write cliff, 스토리지 쓰기 경로로 플랫폼별 해석
+
+### 새로 점검하는 항목
+- 묶음(RAID 0, LVM stripe, md, multipath 경로) 안에서 한 장치만 느린 경우 (모든 플랫폼).
+  stripe 는 가장 느린 구성원 속도로 움직이는데 합산 지표에서는 희석되어 보이지 않았다
+- NVMe 온도(hwmon WCTEMP 도달·근접), PCIe 링크 속도·폭 저하
+- /proc/mdstat degraded, resync·recovery·check 진행
+- CPU governor 절전 정책, FC HBA 포트 상태
+- SMART (`--smart`, 기본 꺼짐): 자가 진단 실패, 보류·미정정 섹터, NVMe critical warning 등
+- 커널 로그 패턴: RAID·HBA 드라이버 오류, Medium Error, NVMe controller down, PCIe AER, md 디스크 장애, multipath 경로 소실
+
+### VMware 전용으로 한정한 항목
+- SCSI timeout 180초, PVSCSI·컨트롤러 분리, open-vm-tools, VMXNET3, vSAN 네트워크, vSAN TRIM, balloon 문구
+- 스케줄러는 Red Hat 용도별 권고(HDD mq-deadline/bfq, SSD·NVMe none/kyber), tuned 는 bare-metal 에서 throughput-performance
+- merge 스레드 1 권고를 bare-metal HDD 에도 적용
+- awareness 안내: ESXi 호스트 / 랙·전원 / 호스트·가용 영역
+
+### 리포트
+- 헤더에 플랫폼, 판정 기준 줄에 기준 매체와 임계값
+- 장치 종류·연결 방식·근거·모델 표, "원리상 볼 수 없는 것" 표를 플랫폼별로
+- 담당자 그룹에 가상화·클라우드 관리자, 하드웨어 담당자, 스토리지 관리자 추가
+
+### 수집기
+- 플랫폼 판별 원자료, NVMe·FC·iSCSI·mdstat, CPU governor 수집 (모두 /proc·/sys 읽기)
+- `--platform`, `--smart` 옵션. 분석기에도 `--platform`, `--storage auto|allflash|hybrid|nvme|ssd|hdd`
+
+### 문서·테스트
+- README: 플랫폼별 판정 절, 병목 위치 표를 플랫폼별로, 기준값 출처 보강, 트러블슈팅
+- GUARDLINE: bare-metal 설계 기준(1-B), 하드웨어·스토리지 담당자 체크리스트(7-B, 7-C)
+- `tests/`: 합성 번들 생성기와 10개 시나리오 판정 테스트
+
 ## [0.9.5] - 2026-09-29
 
 ### 수정

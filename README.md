@@ -1,11 +1,12 @@
 # es-disk-probe
 
-Read-only disk I/O diagnostics for Elasticsearch nodes on VMware vSAN (guest OS level)
+Read-only disk I/O diagnostics for Elasticsearch nodes (VMware vSAN guest, bare-metal, SAN, other hypervisors) at OS level
 
-Elasticsearch 노드의 디스크가 지금 정상인지, 문제라면 원인이 VM 안인지 밖인지를 Guest OS에서 판정합니다.
-측정 결과를 Elastic·VMware 공식 권장값과 대조해 담당자별 조치 항목까지 HTML 리포트로 냅니다.
+Elasticsearch 노드의 디스크가 지금 정상인지, 문제라면 원인이 어디에 있는지를 OS에서 판정합니다.
+VMware Guest면 VM 안과 밖을, bare-metal이면 부하 포화와 디스크·컨트롤러 이상을, SAN이면 서버와 스토리지 어레이를 가릅니다.
+플랫폼은 실행한 서버에서 자동으로 판별하고, 측정 결과를 Elastic·VMware·Red Hat 공식 권장값과 대조해 담당자별 조치 항목까지 HTML 리포트로 냅니다.
 
-v0.9.5 · 비공식 도구 · 읽기 전용 · 한 시점을 보는 진단 도구 (상시 모니터링 도구가 아닙니다)
+v0.10.0 · 비공식 도구 · 읽기 전용 · 한 시점을 보는 진단 도구 (상시 모니터링 도구가 아닙니다)
 
 ---
 
@@ -42,9 +43,11 @@ cron이나 systemd timer로 반복 실행하도록 만들지 마세요. 측정 �
 쓸 만한 상황입니다.
 
 - ES 노드에서 디스크 관련 장애나 경보가 났고, 원인이 VM 안인지 vSAN·호스트 쪽인지 갈라야 할 때
+- bare-metal 노드에서 부하가 디스크 능력을 넘은 것인지, 디스크·RAID 컨트롤러가 이상한 것인지 갈라야 할 때
+- SAN을 쓰는 노드에서 서버 쪽(HBA 큐, 경로) 문제인지 스토리지 어레이 문제인지 갈라야 할 때
 - 인덱싱 지연이나 검색 지연의 원인이 디스크인지 확인해야 할 때
-- VMware 관리자에게 "느리다"가 아니라 측정 근거를 들고 가야 할 때
-- 신규 구축이나 증설 직전에 Guest OS 설정과 VM 구성이 권고에 맞는지 한 번 훑을 때
+- VMware·스토리지 관리자나 하드웨어 유지보수 쪽에 "느리다"가 아니라 측정 근거를 들고 가야 할 때
+- 신규 구축이나 증설 직전에 OS 설정과 서버·VM 구성이 권고에 맞는지 한 번 훑을 때
 - 폐쇄망이라 외부 도구를 들이기 어려울 때
 
 이럴 때는 쓰지 마세요.
@@ -53,7 +56,7 @@ cron이나 systemd timer로 반복 실행하도록 만들지 마세요. 측정 �
 - 상시 감시 목적. 위 표를 봐 주세요
 - 용량 사이징 근거. 최대 성능을 재는 쪽은 `es_disk_bench.sh`(부하 발생)이고, 기본 수집은 현재 부하만 봅니다
 - 디스크 밖의 성능 문제. CPU, heap, GC, 쿼리 튜닝은 범위가 아닙니다. 다만 "디스크가 원인이 아니다"까지는 판정합니다
-- 물리 서버(베어메탈). 동작은 하지만 판정 기준이 vSAN 지연값(All-Flash 5ms)이라 VMware 관련 항목이 전부 의미가 없어집니다
+- 컨테이너(ECK, Docker) 안에서 실행. 컨테이너가 아니라 그 노드(호스트)에서 실행하세요. 컨테이너 안에서 돌리면 리포트가 경고합니다
 
 ### 서버에서 하는 일과 하지 않는 일
 
@@ -70,6 +73,10 @@ cron이나 systemd timer로 반복 실행하도록 만들지 마세요. 측정 �
 - `/proc`, `/sys` 읽기, ES 조회 API 호출, 결과 디렉터리(기본 `/tmp`)에 파일 쓰기
 - ES 서버 로그와 sar 기록의 끝부분 읽기 (아래 부하 표를 봐 주세요)
 - 자기 자신의 우선순위를 낮추는 `renice 19`, `ionice idle`. 프로세스가 끝나면 사라집니다
+- NVMe 온도 읽기. `/sys/class/nvme/*/hwmon` 을 읽으면 커널이 장치에 SMART log 를 한 번 요청합니다. 읽기 전용 명령이고 실행당 1회입니다
+
+`--smart` 를 줄 때만 하는 일도 있습니다. `smartctl -H -A -i -n standby` 로 디스크의 SMART 값을 읽습니다.
+장치에 읽기 명령을 보내는 것이라 기본은 꺼 두었습니다. 잠든 HDD는 깨우지 않고 건너뛰며, 장치당 15초 상한이 있습니다.
 
 ---
 
@@ -139,8 +146,8 @@ ES가 segment를 열거나 닫을 때(`mmap`, `munmap`) 잠깐 경합하는 정�
 `es_disk_bench.sh`는 fio로 실제 부하를 겁니다. 위 내용은 이 스크립트에 해당하지 않습니다.
 
 - ES가 떠 있으면 실행을 거부합니다. `--force-with-es`로만 우회됩니다
-- vSAN은 여러 호스트가 공유하는 스토리지라서 같은 클러스터의 다른 VM에도 영향이 갈 수 있습니다. VMware 관리자와 시간을 맞추세요
-- 테스트 파일이 vSAN 캐시 계층에 들어가면 결과가 실제보다 좋게 나옵니다. 상한으로만 해석하세요
+- vSAN, SAN 어레이 같은 공유 스토리지는 같은 스토리지를 쓰는 다른 VM·서버에도 영향이 갈 수 있습니다. VMware·스토리지 관리자와 시간을 맞추세요
+- 테스트 파일이 vSAN 캐시 계층이나 RAID 컨트롤러·어레이 캐시에 들어가면 결과가 실제보다 좋게 나옵니다. 상한으로만 해석하세요
 
 ### 결과물에 들어가는 정보
 
@@ -165,8 +172,45 @@ Elasticsearch에서 디스크는 클러스터 안정성을 좌우하는데, 이 
 느린 이유가 어디에 있는지 가려내기 어렵습니다.
 VMware 관리자의 협조를 바로 받기 어려운 현장이 많다는 것도 이 도구를 만든 이유입니다.
 
-Guest OS에서 볼 수 있는 것을 최대한 모아 판정하고, Guest에서 원리상 볼 수 없는 것은
-VMware 관리자 요청 항목으로 따로 분리합니다.
+bare-metal도 사정은 비슷합니다. RAID 컨트롤러 뒤의 디스크 상태나 SAN 어레이 쪽 응답시간은 OS에서 보이지 않고,
+하드웨어 유지보수나 스토리지 담당이 따로 있는 경우가 많습니다.
+
+그래서 OS에서 볼 수 있는 것을 최대한 모아 판정하고, OS에서 원리상 볼 수 없는 것은
+VMware 관리자, 하드웨어 담당자, 스토리지 관리자 요청 항목으로 따로 분리합니다.
+
+---
+
+## 플랫폼별 판정
+
+수집기는 판단 근거만 모으고, 판정은 분석기가 합니다. 번들을 PC로 옮겨 다시 렌더링해도 같은 결과가 나옵니다.
+
+### 판별 순서
+
+1. `systemd-detect-virt -v`(VM), `-c`(컨테이너)
+2. 명령이 없으면 DMI(`/sys/class/dmi/id`), `/sys/hypervisor/type`, `/proc/cpuinfo` 의 hypervisor 플래그
+3. bare-metal 은 "가상화 없음"이 확인될 때만 판정합니다. 근거가 없으면 "플랫폼 미확정"으로 두고 공통 기준을 씁니다
+4. ES data 디스크마다 연결 방식과 매체를 봅니다. NVMe(PCIe), NVMe-oF, FC·iSCSI HBA, 어레이 벤더 이름, dm-multipath, RAID 컨트롤러 드라이버, `rotational`
+
+### 플랫폼별로 달라지는 것
+
+| | VMware Guest | bare-metal 로컬 | bare-metal SAN | 그 밖의 VM·클라우드 |
+|---|---|---|---|---|
+| 판별 | detect-virt = vmware | detect-virt = none | FC·iSCSI HBA, multipath, 어레이 벤더 | kvm, microsoft, xen, amazon, google 등 |
+| 응답시간 기준 (주의) | All-Flash 5ms / Hybrid 10ms | NVMe 1ms / SSD 3ms / HDD 25ms | SSD 3ms (어레이가 HDD면 `-s hdd`) | 5ms |
+| 병목 위치 | VM 안의 큐 대 VM 바깥 | 디스크 구성 포화 대 디스크·컨트롤러 이상 | 서버 LUN 큐 대 어레이·SAN 경로 | VM 안의 큐 대 VM 바깥 |
+| "바깥" 담당자 | VMware 관리자 | 하드웨어 담당자 | 스토리지 관리자 | 가상화·클라우드 관리자 |
+| 전용 점검 | PVSCSI, balloon, 메모리 예약, SCSI timeout 180초, VMXNET3 | NVMe 온도·PCIe 링크, md RAID, CPU governor, SMART(`--smart`) | FC 포트 상태, multipath 경로별 지연 | CPU steal |
+| 스케줄러 권고 | mq-deadline 또는 none | NVMe·SSD none/kyber, HDD mq-deadline/bfq | mq-deadline 또는 none | mq-deadline 또는 none |
+| tuned 권고 | virtual-guest | throughput-performance | throughput-performance | virtual-guest |
+
+같은 묶음(RAID 0, LVM stripe, md, multipath 경로) 안에서 한 장치만 느린 경우는 모든 플랫폼에서 따로 판정합니다.
+stripe는 가장 느린 구성원 속도로 움직이는데, 합산 지표에서는 그 차이가 희석되어 보이지 않기 때문입니다.
+
+### 매체를 확정할 수 없는 경우
+
+RAID 컨트롤러(megaraid_sas, hpsa, smartpqi 등) 뒤의 논리 디스크는 `rotational` 값이 실제 매체와 다를 수 있습니다.
+이때는 "추정"으로 표시하고 리포트에 `-s` 지정을 안내합니다. SAN도 서버에서 어레이 매체를 알 수 없어 SSD 기준을 기본으로 씁니다.
+ES data 디스크의 매체가 섞여 있으면 가장 느린 매체 기준으로 판정합니다. 빠른 매체 기준을 느린 디스크에 대면 정상인데도 경고가 나기 때문입니다.
 
 ---
 
@@ -174,6 +218,7 @@ VMware 관리자 요청 항목으로 따로 분리합니다.
 
 | 원칙 | 구현 |
 |---|---|
+| 플랫폼 자동 판별 | VMware, bare-metal(로컬·SAN), 그 밖의 hypervisor·클라우드를 구분해 기준값과 담당자를 바꿈. [플랫폼별 판정](#플랫폼별-판정) |
 | 시스템을 바꾸지 않음 | `/proc`, `/sys` 읽기와 ES 조회 API(GET)만. 쓰기는 결과 디렉터리 안에만 |
 | 서비스에 영향 없음 | 실측 CPU 0.97초(300초 측정 시 CPU 1개의 0.32%), 메모리 4.2MB, 디스크 읽기 12MB, `nice 19` + `ionice idle`. [부하 실측 상세](#이-도구가-서버에-주는-부하) |
 | 부하 테스트는 분리 | `es_disk_bench.sh`에만 있음. ES 실행 중이면 실행 거부 |
@@ -221,7 +266,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | 분석기 | Python 3.6+ 표준 라이브러리만 (RHEL 8의 `/usr/libexec/platform-python` 자동 인식) |
 | 권한 | root 권장 (ES 프로세스 I/O, 커널 로그, VMware 정보) |
 | ES 권한 | `cluster monitor` (`monitoring_user` 수준). 관리자 계정 필요 없음 |
-| 선택 | `sysstat`(과거 이력), `ethtool`(NIC ring), `open-vm-tools`(VMware 자원), `fio` + `libaio`(최대 성능 측정) |
+| 선택 | `sysstat`(과거 이력), `ethtool`(NIC ring), `open-vm-tools`(VMware 자원), `smartmontools`(`--smart`), `fio` + `libaio`(최대 성능 측정) |
 
 `es_disk_collect.sh`와 `es_cluster_probe.sh`는 기본적으로 `curl -k`로 동작합니다.
 자체 서명 인증서 환경을 감안한 기본값입니다. 수집기는 localhost만 보므로 그대로 두어도 무리가 없습니다.
@@ -236,7 +281,11 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 -i SEC        샘플 간격 (기본 5)
 -p PATH       ES data 경로 (여러 번 지정 가능, 안 주면 자동 탐지)
 -o DIR        결과 저장 위치 (기본 /tmp)
--s TYPE       vSAN 유형: allflash | hybrid (기본 allflash)
+-s TYPE       스토리지 유형 (기본 auto)
+              VMware vSAN: allflash | hybrid
+              bare-metal·SAN: nvme | ssd | hdd  (RAID 컨트롤러 뒤라 매체를 못 읽을 때 지정)
+--platform P  플랫폼 강제 지정: auto | vmware | baremetal | vm (기본 auto)
+--smart       smartctl 로 SMART 읽기 (기본 꺼짐)
 --es-url URL  ES 주소 (기본 자동 탐지)
 --es-user U   ES 사용자 (비밀번호는 환경변수 ES_PASSWORD, API Key는 ES_API_KEY)
 --no-es       ES API 조회 생략
@@ -255,6 +304,9 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 
 클러스터 조회에 실패해도 경고만 남기고 로컬 결과로 리포트를 만듭니다.
 
+`-s` 와 `--platform` 은 분석기(`es_disk_render.py --storage ... --platform ...`)에도 있습니다.
+번들을 다시 수집하지 않고 기준만 바꿔 리포트를 다시 만들 수 있습니다.
+
 ---
 
 ## 구성
@@ -266,6 +318,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | `es_cluster_probe.sh` | (선택) 노드 접속 없이 클러스터만 원격 조회 | 조회 API GET만 |
 | `es_disk_bench.sh` | (선택) 최대 성능 측정 | 부하를 검. 점검 시간에만 |
 | `GUARDLINE.md` | 설계, 구성, 상시 감시 기준과 변경 원칙 | 문서 |
+| `tests/` | 합성 번들 생성기와 판정 테스트 (플랫폼·매체별 10개 시나리오) | 서버에서 안 돌림 |
 
 ---
 
@@ -273,7 +326,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 
 | 관점 | 내용 |
 |---|---|
-| 로컬 (커널) | 응답시간 p95, aqu-sz, PSI, D 상태, 설정 전수, 커널 로그, VMware 자원 |
+| 로컬 (커널) | 응답시간 p95, aqu-sz, PSI, D 상태, 설정 전수, 커널 로그, VMware 자원 또는 하드웨어 상태 |
 | 클러스터 | 노드별 디스크 사용량 비교, 샤드·용량 쏠림, recovery·snapshot 같은 클러스터발 부하 |
 | 인덱스 | 이 노드 샤드의 인덱스별 쓰기, merge, 검색 분포, ILM phase |
 
@@ -289,7 +342,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 
 ## 리포트 구성
 
-맨 위에 한 문장 판정과 9개 항목 요약(지연, 포화, 오류, ES 영향, 메모리·캐시, 설정, VMware 자원,
+맨 위에 한 문장 판정과 9개 항목 요약(지연, 포화, 오류, ES 영향, 메모리·캐시, 설정, 플랫폼 자원,
 네트워크, 클러스터)이 오고, 이어서 담당자를 표시한 "먼저 할 일" 최대 3개가 나옵니다.
 그다음은 아래 순서입니다.
 
@@ -306,6 +359,9 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 
 클러스터 조회나 sar 기록이 없으면 해당 섹션은 빠집니다.
 
+샘플 리포트: `docs/sample_node_report.html`(VMware Guest), `docs/sample_baremetal_report.html`(bare-metal, HDD RAID 쓰기 지연),
+`docs/sample_cluster_report.html`(클러스터 원격 조회). 모두 합성 데이터입니다.
+
 ---
 
 ## 판정 읽는 법
@@ -319,14 +375,17 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | 성능 판정 보류 | 측정한 시간대의 부하가 낮아 판단 근거가 부족. 피크 때 다시 측정 |
 
 병목 위치는 응답시간이 기준을 넘었을 때만 판정합니다.
-큐 사용률(aqu-sz ÷ queue_depth 합계)로 세 구간으로 나눕니다.
+큐 사용률(aqu-sz ÷ queue_depth 합계)로 세 구간으로 나눕니다. 구간은 같고, 각 구간의 뜻과 담당자는 플랫폼마다 다릅니다.
 
-| 큐 사용률 | 판정 | 다음 단계 |
-|---|---|---|
-| 80% 이상 | Guest 쪽 큐가 가득 참 | 서버 담당자. VMDK 분할 + 별도 PVSCSI 컨트롤러, queue depth 상향 |
-| 40 ~ 80% | 큐도 깊고 지연도 높음 | 단정하지 않습니다. esxtop의 DAVG(백엔드)와 KAVG(큐 대기)를 나눠 확인 |
-| 40% 미만 | VM 바깥 가능성 높음 | VMware 관리자. vSAN, 호스트 경합, resync 확인 |
-| queue_depth 미확인 | 판정 보류 | root 권한으로 다시 측정 |
+| 큐 사용률 | VMware Guest | bare-metal 로컬 | bare-metal SAN |
+|---|---|---|---|
+| 80% 이상 | Guest 쪽 큐가 가득 참. 서버 담당자: VMDK 분할 + 별도 PVSCSI 컨트롤러, queue depth 상향 | 디스크 구성이 동시 처리 한계. 서버 담당자: 디스크 추가 후 stripe, 더 빠른 매체 | 서버 LUN 큐가 가득 참. 서버 담당자: LUN 분할 후 stripe, 경로 확인 |
+| 40 ~ 80% | 단정하지 않음. esxtop DAVG와 KAVG 분리 확인 | 단정하지 않음. 커널 로그·SMART·컨트롤러 이벤트 확인 | 단정하지 않음. 어레이 쪽 응답시간과 비교 |
+| 40% 미만 | VM 바깥. VMware 관리자: vSAN, 호스트 경합, resync | 디스크·컨트롤러 자체가 느림. 하드웨어 담당자: 불량 디스크, RAID 재구성, 캐시·배터리 | 어레이·SAN 경로. 스토리지 관리자: 어레이 부하, 포트 오류 |
+| queue_depth 없음 | root 권한으로 다시 측정 | NVMe는 큐 기준 대신 온도·링크·SMART로 안내 | root 권한으로 다시 측정 |
+
+그 밖의 VM(KVM, Hyper-V, 클라우드)은 VMware와 같은 구도로 판정하되 백엔드를 특정하지 않습니다.
+virtio-blk처럼 queue_depth가 없는 가상 디스크는 권한 문제가 아니라는 점을 구분해 안내합니다.
 
 `aqu-sz`는 block layer에서 대기하는 요청까지 포함한 시간 평균이라 queue_depth를 넘을 수 있습니다.
 그래서 장치에 실제로 넘어간 I/O 수(`inflight`)를 함께 표시하고, 둘 중 하나라도 80%를 넘으면 큐 포화로 봅니다.
@@ -353,6 +412,14 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | 인덱싱용 스토리지 | SSD 권장, RAID 0 stripe, 원격 스토리지 회피 | [Elastic 공식] Tune for indexing speed |
 | vSAN 지연 (VM 관점) | All-Flash 5ms / Hybrid 20ms 미만을 정상으로 제시 | [VMware 공식] Broadcom KB 389082 |
 | vSAN 지연 (장치 관점) | NVMe 0.5ms 미만, SAS/SATA SSD 1ms 내외, HDD 10~20ms | [VMware 공식] Broadcom KB 424485 |
+| bare-metal·SAN 지연 (주의 선) | NVMe 1ms, 엔터프라이즈 SSD 3ms, HDD 25ms 초과 | [VMware 공식] Broadcom KB 424485 의 장치별 경보 기준. HDD 30ms 초과는 KB가 critical로 제시 |
+| bare-metal·SAN 지연 (경고·위험) | NVMe 3/10ms, SSD 6/15ms, HDD 30/50ms | [실무 기준] |
+| 그 밖의 VM 지연 | 5 / 10 / 20ms | [실무 기준] KB 389082 VM 관점 수치를 공통 기준으로 차용 |
+| I/O scheduler (bare-metal) | 고성능 SSD·NVMe none/kyber, 기존 HDD mq-deadline/bfq | [Red Hat 공식] Disk schedulers for different use cases |
+| tuned profile (bare-metal) | throughput-performance. 설치 시 컴퓨트 노드에 자동 선택, 절전 기능을 끔 | [Red Hat 공식] TuneD profiles |
+| merge 스레드 (bare-metal HDD) | 회전 디스크면 `max_thread_count` 1 | [Elastic 공식] Merge settings |
+| 로컬 대 원격 스토리지 | 직결 로컬 스토리지가 일반적으로 더 빠르고, 일부 원격 스토리지는 ES 부하에서 매우 느림 | [Elastic 공식] Tune for indexing/search speed |
+| NVMe 온도 | hwmon temp1_max(WCTEMP) 도달 시 경고 | Linux nvme hwmon, NVMe 규격 |
 | Guest와 VMDK 지연 차이 | queue depth 낮은 컨트롤러의 큐 고갈 가능성 | [VMware 공식] Troubleshooting vSAN Performance |
 | PVSCSI 큐 | 기본 64(device) / 254(adapter), ring_pages 8에서 32로 | [VMware 공식] KB 2053145 |
 | 가상 SCSI 컨트롤러 | 레거시 어댑터는 queue depth 32, PVSCSI는 64 | [VMware 공식] Troubleshooting vSAN Performance |
@@ -360,15 +427,16 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | vSAN 네트워크 | 패킷 손실 2%면 스토리지 성능 32% 저하 | [VMware 공식] Troubleshooting vSAN Performance |
 | I/O scheduler | mq-deadline 또는 none | [Red Hat 공식] Setting the disk scheduler |
 | tuned profile | VM은 virtual-guest. throughput-performance 기반이고 dirty_ratio를 올림 | [Red Hat 공식] TuneD profiles |
-| 응답시간 3단계 구분 | 주의 / 경고 / 위험 | [실무 기준] KB 389082를 기준으로 단계화. Elastic 공식 수치 없음 |
+| 응답시간 3단계 구분 | 주의 / 경고 / 위험 | [실무 기준] KB 389082(vSAN), KB 424485(장치)를 기준으로 단계화. Elastic 공식 수치 없음 |
 | 큐 사용률 구간 | 40% / 80% | [실무 기준] 공식 수치 없음 |
 | PSI 단계 | 5% / 20% | [실무 기준] 커널 문서에 임계값 제시 없음 |
 | THP | madvise 또는 never | [참고] DB 벤더 운영 관행. Elastic 필수 항목 아님 |
 
-vSAN 지연 기준이 둘인 이유가 있습니다. 이 도구가 재는 것은 Guest OS에서 본 지연이고, 여기에는
-vSAN 백엔드와 hypervisor, 가상 SCSI를 지나온 시간이 모두 들어 있습니다. 그래서 판정 기준은
-VM 관점 수치(KB 389082)를 씁니다. 장치 관점 수치(KB 424485)는 VMware 관리자에게 백엔드 확인을
-요청할 때 "어느 정도가 정상인지" 함께 전달하려고 실었습니다.
+지연 기준이 둘인 이유가 있습니다. 이 도구가 재는 것은 OS에서 본 지연입니다.
+VMware Guest에서는 여기에 vSAN 백엔드와 hypervisor, 가상 SCSI를 지나온 시간이 모두 들어 있어 VM 관점 수치(KB 389082)를 씁니다.
+bare-metal에는 그 계층이 없어 장치 관점 수치(KB 424485)가 곧 기대치가 됩니다.
+다만 OS에서 본 await 에는 block layer에서 기다린 시간도 들어 있어 부하가 몰리면 장치 자체 지연보다 크게 나옵니다.
+그래서 장치의 "정상 범위"가 아니라 KB가 제시한 "경보 기준"을 주의 선으로 두었습니다.
 
 ---
 
@@ -391,13 +459,31 @@ VM 관점 수치(KB 389082)를 씁니다. 장치 관점 수치(KB 424485)는 VMw
 
 ---
 
-## Guest에서 볼 수 없는 것
+## OS에서 볼 수 없는 것
 
-리포트에 "VMware 관리자 확인 항목"으로 따로 출력합니다.
+리포트의 "원리상 볼 수 없는 것" 표에 플랫폼별로 따로 출력합니다.
 
-vSAN 스토리지 정책(RAID, FTT, stripe, IOPS 제한), ES replica와 vSAN 복제가 겹쳐 생기는 쓰기 증폭,
-VM snapshot, ES 노드의 호스트 배치(anti-affinity), vSAN 네트워크와 resync, 캐시 사용률,
-물리 디스크 상태, vNUMA.
+| 플랫폼 | 항목 |
+|---|---|
+| VMware | vSAN 스토리지 정책(RAID, FTT, stripe, IOPS 제한), ES replica와 vSAN 복제가 겹쳐 생기는 쓰기 증폭, VM snapshot, ES 노드의 호스트 배치(anti-affinity), vSAN 네트워크와 resync, 캐시 사용률, 물리 디스크 상태, vNUMA |
+| bare-metal 로컬 | RAID 컨트롤러 캐시 정책과 배터리 상태, RAID 레벨과 재구성·patrol read 일정, RAID 뒤 개별 디스크 SMART, BIOS 전원 정책 |
+| bare-metal SAN | 어레이 쪽 응답시간과 컨트롤러 부하, 같은 어레이의 다른 서버, 볼륨 QoS 한도, SAN 스위치 포트 오류, 어레이 복제·스냅샷 일정 |
+| 그 밖의 VM·클라우드 | 호스트 스토리지 백엔드와 캐시, 볼륨 IOPS·처리량 한도, 같은 호스트의 다른 VM, ES 노드 배치 |
+
+RAID 컨트롤러 캐시는 커널의 `queue/write_cache` 값으로 판단하지 않습니다.
+배터리로 보호되는 캐시를 "write through"로 보고하는 컨트롤러가 있어서, 그 값만으로는 캐시가 켜졌는지 알 수 없습니다.
+
+---
+
+## 테스트
+
+실제 서버 없이 플랫폼·매체·부하 조합별 판정을 확인할 수 있습니다. Python 표준 라이브러리만 씁니다.
+
+```bash
+python3 tests/run_tests.py                 # 10개 시나리오 기대 판정 검사
+python3 tests/run_tests.py --dump /tmp/t   # 시나리오별 HTML 리포트와 판정 목록(JSON) 저장
+python3 tests/make_bundle.py --list        # 시나리오 목록
+```
 
 ---
 
@@ -411,7 +497,10 @@ VM snapshot, ES 노드의 호스트 배치(anti-affinity), vSAN 네트워크와 
 | `path.data` 표기 5종 파싱 | 통과 |
 | HTML과 차트 | 태그 검증 + 가짜 DOM 실행 검증 통과 |
 | 호환성 | Python 3.6 문법, bash 4.2, mawk 검사 통과 |
+| 플랫폼별 판정 | 합성 번들 10종 통과 (`python3 tests/run_tests.py`): VMware 3, bare-metal NVMe 2, HDD RAID, md SSD stripe, FC SAN, KVM, 컨테이너 |
+| 0.9.x → 0.10 회귀 | VMware 합성 번들 3종의 판정 목록이 0.9.5와 동일 |
 | 실제 vSphere Guest | 미검증 |
+| 실제 bare-metal (NVMe, RAID, SAN) | 미검증 |
 | 운영 클러스터 `fs.io_stats` | 미검증 (모의 서버 기준) |
 
 ---
@@ -431,6 +520,14 @@ VM snapshot, ES 노드의 호스트 배치(anti-affinity), vSAN 네트워크와 
 커널에 들어 있지만 기본 비활성입니다. 부트 파라미터에 `psi=1`을 넣고 재부팅하면 포화 판정이 정확해집니다.
 없어도 D 상태, 큐, 지연으로 판정합니다.
 
+**플랫폼이 다르게 판별됨, 또는 "플랫폼 미확정"**
+리포트 부록의 "플랫폼 판정 근거"를 확인하세요. `systemd-detect-virt` 가 없는 오래된 배포판이나 DMI를 못 읽는 환경에서 생깁니다.
+`--platform baremetal|vmware|vm` 으로 지정하면 됩니다. 번들만 있으면 `python3 es_disk_render.py <번들> --platform baremetal` 로 다시 만들 수 있습니다.
+
+**SSD RAID인데 HDD 기준으로 판정됨**
+RAID 컨트롤러가 논리 디스크의 `rotational` 을 1로 보고하는 경우입니다. 리포트에 "추정"으로 표시됩니다.
+`-s ssd` 로 다시 수집하거나, 번들에 `es_disk_render.py --storage ssd` 로 다시 분석하세요.
+
 **리포트가 생성되지 않음**
 서버에 Python 3.6 이상이 없는 경우입니다. 번들(`.tar.gz`)을 PC로 옮겨 `es_disk_render.py`를 실행하세요.
 
@@ -438,7 +535,9 @@ VM snapshot, ES 노드의 호스트 배치(anti-affinity), vSAN 네트워크와 
 
 ## 로드맵
 
-- [ ] 실제 vSphere 환경 검증 후 v1.0.0
+- [ ] 실제 vSphere 환경과 bare-metal(NVMe, 하드웨어 RAID, FC SAN) 검증 후 v1.0.0
+- [ ] 클라우드 볼륨(EBS, Azure Disk, PD)의 IOPS·처리량 한도 대비 사용률 판정
+- [ ] RAID 컨트롤러 벤더 도구(storcli, perccli, ssacli) 출력이 있으면 캐시·배터리 상태 판정
 - [ ] esxtop 출력 대조 가이드
 - [ ] baseline 비교 모드. 이전 번들과의 차이 표시
 - [ ] 리포트 영문 출력 옵션
@@ -449,7 +548,7 @@ VM snapshot, ES 노드의 호스트 배치(anti-affinity), vSAN 네트워크와 
 
 - Elastic이나 VMware의 공식 제품이 아닙니다.
 - 진단 결과와 조치 안내만 제공하고 설정은 바꾸지 않습니다. 조치는 담당자가 검토하고 적용합니다.
-- `es_disk_bench.sh`만 예외로 실제 부하를 겁니다. vSAN은 공유 스토리지라 같은 클러스터의 다른 VM에도 영향이 갈 수 있습니다.
+- `es_disk_bench.sh`만 예외로 실제 부하를 겁니다. vSAN, SAN 어레이, 클라우드 볼륨처럼 공유 스토리지라면 같은 스토리지를 쓰는 다른 VM·서버에도 영향이 갈 수 있습니다.
 
 ## 라이선스
 
