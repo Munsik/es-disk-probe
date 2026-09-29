@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-es_disk_render.py (v0.9.5)
+es_disk_render.py (v0.10.0)
 es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 지표 계산 → 판정 → HTML 리포트를 생성합니다.
 
@@ -10,20 +10,42 @@ es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 
 사용:
   python3 es_disk_render.py <번들 디렉터리 | 번들.tar.gz> [-o report.html]
-                            [--storage allflash|hybrid] [--bench <es_disk_bench 결과 디렉터리>]
+                            [--platform auto|vmware|baremetal|vm]
+                            [--storage auto|allflash|hybrid|nvme|ssd|hdd] [--bench <es_disk_bench 결과 디렉터리>]
 """
 import argparse, html, json, os, re, sys, tarfile, tempfile, datetime
 
-TOOL_VERSION = "0.9.5"
+TOOL_VERSION = "0.10.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 기준값 (출처를 함께 표기. 리포트에도 그대로 노출)
 # ─────────────────────────────────────────────────────────────────────────────
-# Guest에서 관측한 디스크 응답시간(ms). Broadcom vSAN KB 389082(All-Flash <5ms, Hybrid <20ms 정상)
-# 를 기준으로 삼고 단계는 실무 기준으로 나눔. Elastic이 공식 수치를 제시하지는 않음.
+# OS에서 관측한 디스크 응답시간(ms). Elastic이 공식 수치를 제시하지는 않는다.
+# - vSAN(allflash/hybrid): Broadcom KB 389082 의 VM 관점 정상 범위(All-Flash <5ms, Hybrid <20ms)를 기준
+# - bare-metal·SAN(nvme/ssd/hdd): Broadcom KB 424485 의 장치 관점 경보 기준
+#   (NVMe >1ms, 엔터프라이즈 SSD >3ms, HDD >25ms, HDD 30ms 초과는 critical)을 '주의' 선으로 둔다.
+#   bare-metal 에는 hypervisor·가상 SCSI 계층이 없어 장치 관점 수치가 곧 OS 관점 기대치다.
+#   단, await 에는 block layer 대기 시간이 포함되므로 부하가 몰리면 장치 지연보다 크게 나온다.
+# - vm(KVM, Hyper-V, 클라우드 등): 백엔드를 알 수 없어 vSAN All-Flash 수치를 공통 기준으로 빌려 쓴다.
+# 주의 위 단계(경고·위험)는 모두 실무 기준이다.
 LAT_TH = {
     "allflash": {"caution": 5.0, "warn": 10.0, "crit": 20.0},
     "hybrid":   {"caution": 10.0, "warn": 20.0, "crit": 30.0},
+    "nvme":     {"caution": 1.0, "warn": 3.0, "crit": 10.0},
+    "ssd":      {"caution": 3.0, "warn": 6.0, "crit": 15.0},
+    "hdd":      {"caution": 25.0, "warn": 30.0, "crit": 50.0},
+    "vm":       {"caution": 5.0, "warn": 10.0, "crit": 20.0},
+}
+STORAGE_LABEL = {"allflash": "vSAN All-Flash", "hybrid": "vSAN Hybrid", "nvme": "NVMe", "ssd": "SSD",
+                 "hdd": "HDD", "vm": "가상 디스크 공통"}
+LAT_SRC = {
+    "vsan": "[VMware 공식] Broadcom KB 389082. All-Flash 5ms 미만 / Hybrid 20ms 미만을 정상으로 제시. "
+            "주의·경고·위험 3단계 구분은 실무 기준이며 Elastic 공식 수치는 없음",
+    "device": "[VMware 공식] Broadcom KB 424485 의 장치 관점 경보 기준(NVMe 1ms, 엔터프라이즈 SSD 3ms, HDD 25ms 초과, "
+              "HDD 30ms 초과 critical)을 주의 선으로 사용. vSAN 문서지만 수치는 장치 자체의 기대치. "
+              "경고·위험 단계는 실무 기준이며 Elastic 공식 수치는 없음",
+    "vm": "[실무 기준] 하이퍼바이저·스토리지 백엔드를 알 수 없어 Broadcom KB 389082 의 VM 관점 수치(5ms)를 공통 기준으로 차용. "
+          "Elastic 공식 수치는 없음",
 }
 MIN_IOS_PER_INTERVAL = 20      # 이보다 I/O가 적은 구간은 응답시간 통계에서 제외 (소수 I/O 노이즈 방지)
 LOW_LOAD_IOPS = 50             # p95 IOPS 가 이보다 낮고
@@ -185,6 +207,157 @@ class Topo(object):
 
     def whole(self, k):
         return self.parts[k][0] if k in self.parts else k
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 플랫폼 판별
+#   kind   : vmware | baremetal | vm (그 밖의 hypervisor·클라우드) | unknown
+#   attach : virtual | local | san | nvmeof | cloud
+# 수집기는 근거만 모으고 여기서 판정한다. 확실한 근거가 없으면 bare-metal 로 단정하지 않는다.
+# ─────────────────────────────────────────────────────────────────────────────
+CONTAINER_IDS = ("docker", "podman", "lxc", "lxc-libvirt", "systemd-nspawn", "openvz", "rkt", "wsl", "proot", "pouch")
+HV_LABEL = {"vmware": "VMware", "kvm": "KVM", "qemu": "QEMU", "microsoft": "Hyper-V", "xen": "Xen",
+            "amazon": "AWS Nitro", "google": "Google Compute Engine", "oracle": "VirtualBox", "powervm": "IBM PowerVM",
+            "zvm": "IBM z/VM", "parallels": "Parallels", "bhyve": "bhyve", "unknown-vm": "알 수 없는 hypervisor"}
+FC_DRV = ("qla2xxx", "lpfc", "bfa", "qedf", "bnx2fc", "fnic", "zfcp", "csiostor")
+ISCSI_DRV = ("iscsi_tcp", "be2iscsi", "bnx2i", "qedi", "cxgb3i", "cxgb4i", "ib_iser")
+RAID_DRV = ("megaraid_sas", "hpsa", "smartpqi", "aacraid", "arcmsr", "3w-9xxx", "3w-sas", "mpt2sas", "mpt3sas", "mptsas")
+# mpt*sas 는 IT(HBA) 모드면 디스크를 그대로 넘기므로 모델명으로 RAID 논리 디스크인지 한 번 더 본다
+RAID_MODEL = re.compile(r'PERC|LOGICAL VOLUME|MR9\d|MegaRAID|ServeRAID|RAID|Virtual Disk|AVAGO|SmartArray|ThinkSystem R', re.I)
+SAN_VENDOR = re.compile(r'^(PURE|NETAPP|3PARdata|HITACHI|HP HSV|EMC|DGC|IBM\s+2145|IBM\s+2107|HUAWEI|Nimble|NEXSAN|FUJITSU|DataCore|COMPELNT|Dell EMC|XtremIO|INFINIDAT|LIO-ORG|TrueNAS)', re.I)
+VM_DISK_VENDOR = re.compile(r'^(VMware|QEMU|Msft|Virtual|Google|Amazon|0x1af4|RHEV|Xen|NUTANIX)', re.I)
+CLOUD_BLOCK_MODEL = re.compile(r'Amazon Elastic Block Store|PersistentDisk|nvme_card-pd|Virtual Disk', re.I)
+
+def parse_storage(text):
+    nv, fc, iscsi = {}, [], 0
+    for line in text.splitlines():
+        p = line.split("|")
+        if p[0] == "NVME" and len(p) >= 4:
+            nv.setdefault(p[1], {})[p[2]] = "|".join(p[3:]).strip()
+        elif p[0] == "FCHOST" and len(p) >= 4:
+            fc.append({"host": p[1], "state": p[2].split("=", 1)[-1], "speed": p[3].split("=", 1)[-1]})
+        elif p[0] == "ISCSI" and len(p) == 3 and p[1] == "sessions":
+            iscsi = int(num(p[2], 0) or 0)
+    return {"nvme": nv, "fc": fc, "iscsi": iscsi}
+
+def nvme_ctrl(dev):
+    """nvme0n1 → nvme0"""
+    m = re.match(r'^(nvme\d+)', dev or "")
+    return m.group(1) if m else None
+
+def detect_platform(virt, override="auto"):
+    ev = []
+    dv = (virt.get("detect_virt") or "").strip()
+    dvm = (virt.get("detect_virt_vm") or "").strip()
+    dvc = (virt.get("detect_virt_container") or "").strip()
+    vendor = (virt.get("sys_vendor") or "").strip()
+    prod = (virt.get("product_name") or "").strip()
+    flag = (virt.get("cpu_hypervisor_flag") or "").strip()
+    container = ""
+    if dvc and dvc != "none":
+        container = dvc
+    elif dv in CONTAINER_IDS:
+        container = dv
+    elif virt.get("dockerenv") == "1":
+        container = "docker"
+    if virt.get("kubernetes") == "1":
+        container = (container or "container") + " (Kubernetes)"
+    hv = ""
+    if dvm and dvm != "none":
+        hv = dvm; ev.append("systemd-detect-virt -v = {}".format(dvm))
+    elif dvm == "none":
+        ev.append("systemd-detect-virt -v = none")
+    elif dv and dv not in CONTAINER_IDS and dv not in ("none", "unknown"):
+        hv = dv; ev.append("systemd-detect-virt = {}".format(dv))
+    elif dv == "none":
+        ev.append("systemd-detect-virt = none")
+    if not hv:                       # detect-virt 가 없거나 컨테이너만 보고한 경우의 보조 근거
+        xp = (vendor + " " + prod).lower()
+        if "vmware" in xp:
+            hv = "vmware"
+        elif (virt.get("sys_hypervisor") or "").strip() == "xen" or "hvm domu" in xp:
+            hv = "xen"
+        elif "microsoft" in vendor.lower() and "virtual machine" in prod.lower():
+            hv = "microsoft"
+        elif "google" in xp:
+            hv = "google"
+        elif vendor == "Amazon EC2" and not prod.endswith(".metal"):
+            hv = "amazon"
+        elif re.search(r'\b(kvm|qemu|standard pc|bochs|openstack|rhev|ovirt|proxmox|nutanix|ahv)\b', xp):
+            hv = "kvm"
+        elif flag == "1" and dvm != "none" and dv != "none":
+            hv = "unknown-vm"
+        if hv:
+            ev.append("DMI/CPU 플래그: {}".format((vendor + " " + prod).strip() or "hypervisor 플래그"))
+    bare_evidence = (dvm == "none" or dv == "none" or flag == "0")
+    if hv == "vmware":
+        kind = "vmware"
+    elif hv:
+        kind = "vm"
+    elif bare_evidence:
+        kind = "baremetal"
+        if vendor or prod:
+            ev.append("DMI: {}".format((vendor + " " + prod).strip()))
+    else:
+        kind = "unknown"
+    cloud = ""
+    tag = (virt.get("chassis_asset_tag") or "").strip()
+    if vendor == "Amazon EC2" or hv == "amazon":
+        cloud = "AWS"
+    elif tag == "7783-7084-3265-9085-8269-3286-77":
+        cloud = "Azure"
+    elif hv == "google" or "Google" in vendor:
+        cloud = "Google Cloud"
+    forced = override not in (None, "", "auto")
+    if forced:
+        ev.append("사용자 지정 --platform {}".format(override))
+        kind = override
+    return {"kind": kind, "hv": hv, "container": container, "cloud": cloud, "evidence": ev, "forced": forced}
+
+def classify_devices(phys, topo, sto, dmtable):
+    """ES data 물리 디스크별 매체·연결 방식. bare-metal·SAN 기준값 선택에 쓴다."""
+    out = {}
+    for d in phys:
+        a = topo.attr.get(d, {})
+        drv = topo.hostdrv.get(topo.scsihost.get(d, ""), "")
+        vendor, model = (a.get("device/vendor") or "").strip(), (a.get("device/model") or "").strip()
+        info = {"drv": drv, "vendor": vendor, "model": model, "rot": a.get("queue/rotational"),
+                "raid": False, "attach": "local", "media": None, "sure": True, "why": ""}
+        c = nvme_ctrl(d)
+        if c:
+            nv = sto["nvme"].get(c, {})
+            info["model"] = nv.get("model", model)
+            tr = (nv.get("transport") or "pcie").lower()
+            if tr != "pcie":
+                info["attach"], info["media"], info["why"] = "nvmeof", "ssd", "NVMe-oF ({})".format(tr)
+            elif CLOUD_BLOCK_MODEL.search(info["model"] or ""):
+                info["attach"], info["media"], info["why"] = "cloud", "ssd", "클라우드 블록 볼륨"
+            else:
+                info["media"], info["why"] = "nvme", "NVMe"
+        elif drv in FC_DRV or drv in ISCSI_DRV or SAN_VENDOR.search(vendor):
+            info["attach"], info["media"], info["sure"] = "san", "ssd", False
+            info["why"] = "FC HBA" if drv in FC_DRV else ("iSCSI" if drv in ISCSI_DRV else "외부 스토리지 벤더 " + vendor)
+        else:
+            if drv in RAID_DRV and (drv not in ("mpt2sas", "mpt3sas", "mptsas") or RAID_MODEL.search(model)):
+                info["raid"] = True
+            elif RAID_MODEL.search(model) and not VM_DISK_VENDOR.search(vendor):
+                info["raid"] = True
+            info["media"] = "hdd" if info["rot"] == "1" else "ssd"
+            info["sure"] = not info["raid"]
+            info["why"] = ("RAID 논리 디스크 ({}), rotational={}".format(drv or model, info["rot"]) if info["raid"]
+                           else "rotational={}".format(info["rot"]))
+        out[d] = info
+    # dm-multipath 로 묶인 장치는 SAN (로컬 디스크를 multipath 로 묶는 경우는 드물다)
+    mp_members = set()
+    for line in (dmtable or "").splitlines():
+        if " multipath " in line:
+            k = topo.dmname.get(line.split(":", 1)[0].strip())
+            mp_members.update(topo.slaves.get(k, []))
+    for d in out:
+        if d in mp_members and out[d]["attach"] == "local":
+            out[d]["attach"], out[d]["sure"] = "san", False
+            out[d]["media"] = "ssd"
+            out[d]["why"] = "dm-multipath"
+    return out
 
 def parse_mounts(text):
     out = []
@@ -480,7 +653,7 @@ def load_bench(d):
 # ─────────────────────────────────────────────────────────────────────────────
 # 클러스터 관점 분석 (es_cluster_probe.sh 결과)
 # ─────────────────────────────────────────────────────────────────────────────
-def analyze_cluster(cdir, add, th):
+def analyze_cluster(cdir, add, th, kind="unknown"):
     """노드별 디스크 지표를 비교해 '이 노드만'인지 '클러스터 전체'인지 가른다."""
     if not cdir or not os.path.isdir(cdir):
         return None
@@ -608,16 +781,33 @@ def analyze_cluster(cdir, add, th):
     if len(thr_nodes) >= 2:
         add("warn", "클러스터", "원인 분리 필요", "여러 노드에서 동시에 인덱싱 스로틀 발생",
             "{}개 노드: {}".format(len(thr_nodes), ", ".join(thr_nodes[:8])),
-            "한 노드만이면 그 노드의 디스크 문제지만, 여러 노드가 동시라면 공용 스토리지(vSAN) 또는 인입량 자체가 원인일 가능성이 큽니다.",
-            "vSAN 클러스터 단위 지표를 VMware 관리자와 함께 확인하고, 동시에 인입량·bulk 크기·샤드 수도 점검하세요.",
+            {"vmware": "한 노드만이면 그 노드의 디스크 문제지만, 여러 노드가 동시라면 공용 스토리지(vSAN) 또는 인입량 자체가 원인일 가능성이 큽니다.",
+             "baremetal": "한 노드만이면 그 노드의 디스크 문제지만, 여러 노드가 동시라면 인입량 자체가 원인일 가능성이 큽니다. 노드들이 같은 SAN 어레이를 쓴다면 어레이도 후보입니다."
+             }.get(kind, "한 노드만이면 그 노드의 디스크 문제지만, 여러 노드가 동시라면 공용 스토리지 또는 인입량 자체가 원인일 가능성이 큽니다."),
+            {"vmware": "vSAN 클러스터 단위 지표를 VMware 관리자와 함께 확인하고, 동시에 인입량·bulk 크기·샤드 수도 점검하세요.",
+             "baremetal": "인입량·bulk 크기·샤드 수를 먼저 점검하고, 공용 SAN 이라면 같은 시각의 어레이 지표를 스토리지 관리자에게 요청하세요."
+             }.get(kind, "스토리지 백엔드 지표를 인프라 관리자와 함께 확인하고, 동시에 인입량·bulk 크기·샤드 수도 점검하세요."),
             "_nodes/stats indices.indexing.throttle_time")
     aw = settings.get("cluster.routing.allocation.awareness.attributes")
     if not aw and len(data_rows) >= 3:
-        add("info", "클러스터", "VMware 관리자", "shard allocation awareness 미설정",
-            "cluster.routing.allocation.awareness.attributes 없음 · data 노드 {}개".format(len(data_rows)),
-            "ESXi 호스트 한 대에 primary와 replica를 가진 VM이 같이 올라가 있으면, 호스트 한 대가 죽을 때 두 벌을 동시에 잃습니다. ES는 VM이 어느 호스트에 있는지 모릅니다.",
-            "노드에 호스트 정보를 attribute로 넣고 awareness를 설정하는 방법과, VMware 쪽 DRS anti-affinity 규칙을 함께 검토하세요.",
-            "[Elastic 공식] Shard allocation awareness")
+        if kind == "vmware":
+            add("info", "클러스터", "VMware 관리자", "shard allocation awareness 미설정",
+                "cluster.routing.allocation.awareness.attributes 없음 · data 노드 {}개".format(len(data_rows)),
+                "ESXi 호스트 한 대에 primary와 replica를 가진 VM이 같이 올라가 있으면, 호스트 한 대가 죽을 때 두 벌을 동시에 잃습니다. ES는 VM이 어느 호스트에 있는지 모릅니다.",
+                "노드에 호스트 정보를 attribute로 넣고 awareness를 설정하는 방법과, VMware 쪽 DRS anti-affinity 규칙을 함께 검토하세요.",
+                "[Elastic 공식] Shard allocation awareness")
+        elif kind == "baremetal":
+            add("info", "클러스터", "ES 설정", "shard allocation awareness 미설정",
+                "cluster.routing.allocation.awareness.attributes 없음 · data 노드 {}개".format(len(data_rows)),
+                "같은 랙·같은 전원 계통에 있는 서버들이 한꺼번에 멈추면 primary와 replica를 동시에 잃을 수 있습니다. ES는 서버가 어느 랙에 있는지 모릅니다.",
+                "노드에 랙이나 전원 계통 정보를 attribute(node.attr.rack_id 등)로 넣고 awareness를 설정하는 방법을 검토하세요. 한 서버에 ES 노드를 여러 개 띄웠다면 호스트 단위 attribute가 먼저입니다.",
+                "[Elastic 공식] Shard allocation awareness")
+        else:
+            add("info", "클러스터", "ES 설정", "shard allocation awareness 미설정",
+                "cluster.routing.allocation.awareness.attributes 없음 · data 노드 {}개".format(len(data_rows)),
+                "물리 호스트(또는 클라우드 가용 영역) 하나에 primary와 replica를 가진 노드가 같이 있으면, 그 호스트가 멈출 때 두 벌을 동시에 잃습니다. ES는 노드가 어느 호스트에 있는지 모릅니다.",
+                "노드에 호스트나 가용 영역 정보를 attribute로 넣고 awareness를 설정하세요. 가상화 쪽 anti-affinity 규칙도 함께 검토합니다.",
+                "[Elastic 공식] Shard allocation awareness")
     return {"rows": rows, "data_rows": data_rows, "io_ok": io_ok, "meta": meta, "settings": settings,
             "health": health, "recovery": rec if isinstance(rec, list) else [], "acts": acts}
 
@@ -668,11 +858,9 @@ class Finding(object):
         self.sev, self.dim, self.owner = sev, dim, owner
         self.title, self.evidence, self.why, self.action, self.source = title, evidence, why, action, source
 
-def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
+def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platform_override=None):
     S = os.path.join(base, "static")
     meta = kv(rd(base, "meta"))
-    storage = storage_override or meta.get("storage", "allflash")
-    th = LAT_TH.get(storage, LAT_TH["allflash"])
     es_pid = meta.get("es_pid", "")
     sysctl = kv(rd(S, "sysctl"))
     virt = kv(rd(S, "virt"))
@@ -725,6 +913,50 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         dev_guess = True
         phys = sorted(d for d in topo.attr if not d.startswith("dm-") and not d.startswith("md"))
 
+    # ── 플랫폼과 판정 기준 ──────────────────────────────────────────────────
+    plat = detect_platform(virt, platform_override or meta.get("platform", "auto"))
+    kind = plat["kind"]
+    sto = parse_storage(rd(S, "storage"))
+    devcls = classify_devices(phys, topo, sto, rd(S, "dmsetup_table"))
+    attaches = sorted(set(c["attach"] for c in devcls.values()))
+    if kind in ("vmware",):
+        attach = "virtual"
+    elif kind == "baremetal":
+        attach = "san" if ("san" in attaches or "nvmeof" in attaches) else ("cloud" if "cloud" in attaches else "local")
+    else:
+        attach = "cloud" if (plat["cloud"] or "cloud" in attaches) else "virtual"
+    req = storage_override or meta.get("storage") or "auto"
+    # 0.9.x 수집기는 -s 를 안 줘도 storage=allflash 를 기록했다. 사용자 선택과 구분할 수 없으므로 auto 로 본다
+    if str(meta.get("tool_version", "")).startswith("0.9") and req == "allflash" and not storage_override:
+        req = "auto"
+    storage_auto = req in ("", "auto")
+    media_note = ""
+    if not storage_auto:
+        storage = req
+    elif kind == "vmware":
+        storage = "allflash"
+    elif kind == "baremetal":
+        order = ["hdd", "ssd", "nvme"]      # 섞여 있으면 가장 느린 매체 기준 (빠른 매체 기준을 느린 디스크에 대면 전부 오탐)
+        media = [c["media"] for c in devcls.values() if c["media"]]
+        storage = next((m for m in order if m in media), "ssd")
+        if len(set(media)) > 1:
+            media_note = "ES data 디스크의 매체가 섞여 있어 가장 느린 {} 기준으로 판정".format(STORAGE_LABEL[storage])
+    else:
+        storage = "vm"
+    th = LAT_TH.get(storage, LAT_TH["allflash"])
+    src_lat = LAT_SRC["vsan"] if storage in ("allflash", "hybrid") else (LAT_SRC["device"] if storage in ("nvme", "ssd", "hdd") else LAT_SRC["vm"])
+    unsure = [d for d, c in devcls.items() if not c["sure"]]
+    is_vmware = kind == "vmware"
+    # "OS 바깥"을 맡는 담당자와 자원 차원 이름
+    if kind == "vmware":
+        OUT, RES_DIM, WHERE_IN, WHERE_OUT = "VMware 관리자", "VMware 자원", "VM 안", "VM 바깥(하이퍼바이저·vSAN)"
+    elif kind == "baremetal" and attach == "san":
+        OUT, RES_DIM, WHERE_IN, WHERE_OUT = "스토리지 관리자", "하드웨어", "서버 안(HBA 큐)", "서버 바깥(스토리지 어레이·SAN 경로)"
+    elif kind == "baremetal" and attach == "local":
+        OUT, RES_DIM, WHERE_IN, WHERE_OUT = "하드웨어 담당자", "하드웨어", "OS 큐", "디스크·컨트롤러"
+    else:
+        OUT, RES_DIM, WHERE_IN, WHERE_OUT = "가상화·클라우드 관리자", "가상화 자원", "VM 안", "VM 바깥(하이퍼바이저·스토리지 백엔드)"
+
     # ── 샘플 ────────────────────────────────────────────────────────────────
     snaps = parse_samples(rd(base, "samples.raw"), es_pid)
     per_dev = {d: disk_intervals(snaps, d) for d in phys}
@@ -769,7 +1001,6 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         fmt(A["r_await_p95"], 2, "ms"), fmt(A["r_await_mean"], 2, "ms"),
         fmt(A["w_await_p95"], 2, "ms"), fmt(A["w_await_mean"], 2, "ms"),
         MIN_IOS_PER_INTERVAL, A["valid_r"], A["valid_w"])
-    src_lat = "[VMware 공식] Broadcom KB 389082. All-Flash 5ms 미만 / Hybrid 20ms 미만을 정상으로 제시. 주의·경고·위험 3단계 구분은 실무 기준이며 Elastic 공식 수치는 없음"
     lat_sev = sev_max(r_sev, w_sev)
     if A["valid_r"] + A["valid_w"] == 0:
         add("info", "지연", "참고", "측정 구간에 디스크 I/O가 거의 없어 응답시간을 평가할 수 없음",
@@ -778,14 +1009,18 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         lat_sev = "na"
     elif lat_sev in ("ok",):
         add("ok", "지연", "참고", "디스크 응답시간 정상 범위", lat_ev,
-            "Guest가 본 응답시간(await)은 vSAN·하이퍼바이저·가상 SCSI를 모두 거친 결과라 ES가 실제로 겪는 지연과 같습니다.",
+            {"vmware": "Guest가 본 응답시간(await)은 vSAN·하이퍼바이저·가상 SCSI를 모두 거친 결과라 ES가 실제로 겪는 지연과 같습니다.",
+             "baremetal": "OS가 본 응답시간(await)은 block layer 대기와 장치 처리 시간을 합친 값이라 ES가 실제로 겪는 지연과 같습니다."}.get(kind,
+             "OS가 본 응답시간(await)은 하이퍼바이저와 스토리지 백엔드를 모두 거친 결과라 ES가 실제로 겪는 지연과 같습니다."),
             "조치 불필요. 피크 시간대 재측정으로 여유를 확인하세요.", src_lat)
     else:
         add(lat_sev, "지연", "원인 분리 필요",
-            "디스크 응답시간이 {} 기준 {} 수준".format("All-Flash" if storage == "allflash" else "Hybrid", SEV_LABEL[lat_sev]),
+            "디스크 응답시간이 {} 기준 {} 수준".format(
+                {"allflash": "All-Flash", "hybrid": "Hybrid"}.get(storage, STORAGE_LABEL.get(storage, storage)), SEV_LABEL[lat_sev]),
             lat_ev,
             "쓰기 지연은 translog fsync와 segment flush를 늦춰 인덱싱 지연으로, 읽기 지연은 page cache에 없는 segment 조회를 늦춰 검색 지연으로 바로 이어집니다.",
-            "아래 '병목 위치' 판정을 먼저 확인하세요. Guest 큐가 원인이면 서버에서, 아니면 VMware 쪽에서 풀어야 합니다.",
+            "아래 '병목 위치' 판정을 먼저 확인하세요. {} 큐가 원인이면 서버에서, 아니면 {} 쪽에서 풀어야 합니다.".format(
+                "Guest" if kind in ("vmware", "vm", "unknown") else "OS", OUT.replace(" 관리자", "").replace(" 담당자", "")),
             src_lat)
 
     # 병목 위치: 큐 사용률과 응답시간의 조합
@@ -803,7 +1038,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     QSRC = ("[VMware 공식] KB 2053145. PVSCSI 기본 큐 64(device)/254(adapter), ring_pages 8→32 및 cmd_per_lun 254 권장. "
             "게스트 내부 지연과 VM/VMDK 레벨 지연의 차이가 큐 깊이 낮은 컨트롤러의 큐 고갈에서 비롯될 수 있다는 서술은 "
             "Broadcom 'Troubleshooting vSAN Performance'. 큐 사용률 구간(40%·80%)은 실무 기준")
-    if SEV_ORDER.get(lat_sev, 0) >= SEV_ORDER["caution"]:
+    if kind == "vmware" and SEV_ORDER.get(lat_sev, 0) >= SEV_ORDER["caution"]:
         if qratio is None:
             add("caution", "지연", "원인 분리 필요", "병목 위치 판정 보류: queue_depth를 읽지 못함",
                 q_ev, "queue_depth를 모르면 지연이 VM 안의 큐에서 생긴 것인지 밖에서 생긴 것인지 가를 수 없습니다.",
@@ -837,14 +1072,111 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                 "resync 진행 여부를 같은 시각으로 확인 요청하세요. 장치 레벨 기대치는 Broadcom KB 424485 기준으로 "
                 "NVMe 0.5ms 미만, SAS/SATA SSD 1ms 내외, HDD 10~20ms 입니다. 이 범위를 넘으면 백엔드 쪽을 먼저 봅니다.", QSRC)
     # 쓰기만 느림 → vSAN 쓰기 경로 힌트
-    if (A["w_await_p95"] and A["r_await_p95"] and A["valid_w"] >= 3 and A["valid_r"] >= 3
-            and A["w_await_p95"] >= th["caution"] and A["w_await_p95"] > 3 * A["r_await_p95"]):
+    write_only = bool(A["w_await_p95"] and A["r_await_p95"] and A["valid_w"] >= 3 and A["valid_r"] >= 3
+                      and A["w_await_p95"] >= th["caution"] and A["w_await_p95"] > 3 * A["r_await_p95"])
+    if kind == "vmware" and write_only:
         add("caution", "지연", "VMware 관리자", "쓰기만 유독 느림. vSAN 쓰기 경로 확인 필요",
             "쓰기 p95 {} vs 읽기 p95 {}".format(fmt(A["w_await_p95"], 2, "ms"), fmt(A["r_await_p95"], 2, "ms")),
             "vSAN은 쓰기를 복제본 전부에서 확인받아야 끝납니다(RAID-1 FTT=1이면 호스트 2대). 그래서 쓰기만 느리면 vSAN 네트워크, "
             "쓰기 버퍼 destage, RAID-5/6 정책의 read-modify-write를 의심할 수 있습니다. Guest에서는 vSAN 네트워크를 직접 볼 수 없어 추정입니다.",
             "VMware 관리자에게 vSAN 네트워크 지연·재전송, 쓰기 버퍼 사용률, 스토리지 정책(RAID/FTT)을 확인 요청하세요.",
             "[VMware 공식] Broadcom vSAN 문서 (쓰기 경로·복제 동작)")
+
+    # ── vSAN 이 아닌 플랫폼의 병목 위치 ─────────────────────────────────────
+    # 같은 원리(대기 I/O ÷ queue_depth)를 쓰되, "바깥"이 무엇인지와 담당자가 다르다.
+    #  bare-metal 로컬 : 큐가 차면 장치가 동시 처리 한계(포화), 큐가 비었는데 느리면 장치 자체 이상
+    #  bare-metal SAN  : 큐가 차면 HBA LUN 큐, 비었는데 느리면 어레이·패브릭
+    #  기타 VM·클라우드 : vSAN 과 같은 구도지만 백엔드를 특정하지 않는다
+    GSRC = ("큐 사용률 구간(40%·80%)은 실무 기준. queue_depth 는 /sys/block/<장치>/device/queue_depth, "
+            "장치 기대 지연은 Broadcom KB 424485 (NVMe 0.5ms 미만, 엔터프라이즈 SSD 1ms 이하, HDD 10~20ms)")
+    no_qd_dev = [d for d in phys if not topo.attr.get(d, {}).get("device/queue_depth")]
+    if kind != "vmware" and SEV_ORDER.get(lat_sev, 0) >= SEV_ORDER["caution"]:
+        hi_sev = "warn" if lat_sev in ("warn", "crit") else "caution"
+        if qratio is None and no_qd_dev and meta.get("is_root") != "0":
+            # NVMe, virtio-blk 은 queue_depth 개념이 SCSI 와 달라 파일이 없다. 권한 문제가 아니다
+            if kind == "baremetal":
+                add(hi_sev, "지연", "원인 분리 필요", "병목 위치: 큐 기준 판정 대신 장치 상태를 함께 확인",
+                    q_ev + " · queue_depth 없는 장치: {}".format(", ".join(no_qd_dev)),
+                    "NVMe는 큐가 수만 개 단위라 대기 I/O ÷ queue_depth 로 포화를 가를 수 없습니다. "
+                    "대기 I/O(aqu-sz)와 %util이 함께 높으면 부하가 장치 능력을 넘은 것이고, 부하는 그대로인데 지연만 높으면 "
+                    "온도 제한(thermal throttling), PCIe 링크 저하, 펌웨어, 여유 공간 부족에 따른 쓰기 성능 저하를 의심합니다.",
+                    "아래 '하드웨어' 항목의 NVMe 온도·링크 판정과 커널 로그를 먼저 보세요. 부하 때문이라면 디스크를 늘려 stripe로 묶거나 "
+                    "샤드를 다른 노드로 분산합니다. 장치 이상이 의심되면 --smart 로 다시 수집해 SMART 상태를 확인하세요.", GSRC)
+            else:
+                add(hi_sev, "지연", "원인 분리 필요", "병목 위치 판정 보류: 이 가상 디스크는 queue_depth를 제공하지 않음",
+                    q_ev + " · 대상 장치: {}".format(", ".join(no_qd_dev)),
+                    "virtio-blk나 가상 NVMe는 SCSI queue_depth 파일이 없어 VM 안의 큐에서 막혔는지 가를 수 없습니다.",
+                    "{}에게 같은 시각의 호스트 쪽 디스크 지연(백엔드)을 확인 요청하세요. VM 안에서는 aqu-sz 가 계속 높고 %util 이 "
+                    "100%에 붙어 있으면 가상 디스크를 늘려 stripe로 묶는 방안을 검토합니다.".format(OUT), src_lat)
+        elif qratio is None:
+            add("caution", "지연", "원인 분리 필요", "병목 위치 판정 보류: queue_depth를 읽지 못함",
+                q_ev, "queue_depth를 모르면 지연이 {}에서 생긴 것인지 {}에서 생긴 것인지 가를 수 없습니다.".format(WHERE_IN, WHERE_OUT),
+                "/sys/block/<장치>/device/queue_depth 를 읽을 수 있는 권한(root)으로 재측정하세요.", GSRC)
+        elif qratio >= 0.8 or (iratio is not None and iratio >= 0.8):
+            if kind == "baremetal" and attach == "san":
+                add("warn", "포화", "서버 담당자", "병목 위치: 서버 쪽 LUN 큐가 가득 참 (큐 사용률 {:.0f}%)".format(qratio * 100), q_ev,
+                    "LUN 하나가 동시에 받을 수 있는 I/O 수(HBA queue depth)가 한계에 닿아 요청이 서버 안에서 줄을 서고 있습니다. "
+                    "어레이가 빨라도 이 구간은 느려집니다.",
+                    "ES data용 LUN을 여러 개로 나눠 LVM stripe로 묶는 방법이 가장 효과적입니다. multipath 경로가 모두 active인지 확인하고, "
+                    "HBA LUN queue depth 상향은 스토리지 벤더 권고 범위 안에서 스토리지 관리자와 함께 검토하세요.", GSRC)
+            elif kind == "baremetal":
+                add("warn", "포화", "서버 담당자", "병목 위치: 디스크가 동시 처리 한계에 도달 (큐 사용률 {:.0f}%)".format(qratio * 100), q_ev,
+                    "장치가 한 번에 받을 수 있는 I/O가 가득 찬 상태로 요청이 계속 들어오고 있습니다. 장치 이상이라기보다 부하가 이 디스크 구성의 능력을 넘은 것입니다.",
+                    "디스크를 늘려 RAID 0 또는 LVM stripe로 묶거나, 더 빠른 매체(HDD라면 SSD, SATA SSD라면 NVMe)를 검토하세요. "
+                    "ES 쪽에서는 이 노드의 샤드 수와 인덱싱 몰림을 함께 확인합니다.",
+                    "[Elastic 공식] Tune for indexing speed (SSD, RAID 0 stripe). 큐 사용률 구간은 실무 기준")
+            else:
+                add("warn", "포화", "서버 담당자", "병목 위치: VM 안의 큐가 가득 참 (큐 사용률 {:.0f}%)".format(qratio * 100), q_ev,
+                    "가상 디스크가 동시에 받을 수 있는 I/O 수가 한계에 닿아 요청이 VM 안에서 줄을 서고 있습니다. 백엔드가 빨라도 이 구간은 느려집니다.",
+                    "가상 디스크를 여러 개로 나눠 LVM stripe로 묶는 방법이 가장 효과적입니다. 가상 컨트롤러의 큐 설정은 하이퍼바이저마다 다르므로 {}와 함께 검토하세요.".format(OUT), GSRC)
+        elif qratio >= 0.4:
+            add(hi_sev, "지연", "원인 분리 필요",
+                "병목 위치: 큐도 깊고 지연도 높음. {}과 {}을 함께 확인 (큐 사용률 {:.0f}%)".format(WHERE_IN, WHERE_OUT, qratio * 100), q_ev,
+                "큐가 절반 이상 차 있으면서 응답시간도 높습니다. 장치 쪽이 느려서 요청이 밀린 것일 수도 있고, 큐가 좁아서 대기가 길어진 것일 수도 있어 한쪽으로 단정할 수 없습니다.",
+                {"san": "스토리지 관리자에게 같은 시각의 어레이 쪽 응답시간(호스트 포트·볼륨 단위)을 요청해 서버에서 본 값과 비교하세요. "
+                        "어레이 값이 낮으면 서버 쪽 큐·경로, 높으면 어레이 쪽입니다.",
+                 "local": "커널 로그와 디스크 상태(SMART, RAID 컨트롤러 이벤트)를 확인하고, 이상이 없으면 부하 분산이나 디스크 증설로 큐를 넓히는 방안을 검토하세요."
+                 }.get(attach, "{}에게 같은 시각의 호스트 쪽 디스크 지연을 요청해 VM 안에서 본 값과 비교하세요.".format(OUT)), GSRC)
+        else:
+            if kind == "baremetal" and attach == "san":
+                ttl, why, act = ("병목 위치: 서버 바깥(스토리지 어레이·SAN 경로) 가능성 높음",
+                    "서버 안에서 기다리는 요청이 적은데도 한 건 한 건이 느리다는 뜻입니다. 어레이 컨트롤러 부하, 같은 어레이를 쓰는 다른 서버, "
+                    "SAN 스위치 포트 혼잡, 경로 하나의 장애가 전형적인 원인입니다. 서버 설정 변경으로는 개선되지 않습니다.",
+                    "측정 시각과 이 리포트를 스토리지 관리자에게 전달하고, 같은 시각의 어레이 볼륨·호스트 포트 응답시간과 SAN 스위치 포트 오류를 확인 요청하세요.")
+            elif kind == "baremetal":
+                ttl, why, act = ("병목 위치: 디스크·컨트롤러 자체가 느림 (큐 여유 있음)",
+                    "기다리는 요청이 적은데도 한 건 한 건이 느립니다. 부하가 아니라 장치 쪽 상태 문제일 가능성이 큽니다. "
+                    "불량 섹터가 생긴 디스크, RAID 재구성·일관성 검사·patrol read, 배터리 학습 주기나 배터리 이상으로 컨트롤러 쓰기 캐시가 꺼진 경우가 전형적입니다.",
+                    "커널 로그의 디스크·컨트롤러 오류를 먼저 확인하고, 하드웨어 담당자에게 RAID 컨트롤러 이벤트 로그와 캐시·배터리 상태, 디스크 SMART 상태를 "
+                    "같은 시각 기준으로 확인 요청하세요. 장치 기대 지연은 NVMe 0.5ms 미만, 엔터프라이즈 SSD 1ms 이하, HDD 10~20ms 입니다.")
+            else:
+                ttl, why, act = ("병목 위치: VM 바깥(하이퍼바이저·스토리지 백엔드) 가능성 높음",
+                    "VM 안에서 기다리는 요청이 적은데도 한 건 한 건이 느리다는 뜻입니다. 같은 호스트·스토리지를 쓰는 다른 VM과의 경합, "
+                    "스토리지 백엔드 지연, 볼륨의 IOPS·처리량 한도가 전형적인 원인입니다. VM 설정 변경으로는 개선되지 않습니다.",
+                    "측정 시각과 이 리포트를 {}에게 전달하고 같은 시각의 호스트·볼륨 단위 지연과 한도 도달 여부를 확인 요청하세요.".format(OUT))
+            add(hi_sev, "지연", OUT, ttl, q_ev + " → 큐 사용률 {:.0f}%".format(qratio * 100), why, act, GSRC)
+    if kind != "vmware" and write_only:
+        if kind == "baremetal" and attach == "local" and (storage == "hdd" or any(c["raid"] for c in devcls.values())):
+            add("caution", "지연", OUT, "쓰기만 유독 느림. RAID 컨트롤러 쓰기 캐시 확인 필요",
+                "쓰기 p95 {} vs 읽기 p95 {}".format(fmt(A["w_await_p95"], 2, "ms"), fmt(A["r_await_p95"], 2, "ms")),
+                "RAID 컨트롤러는 배터리(또는 flash) 보호 캐시로 쓰기를 먼저 받고 나중에 디스크에 씁니다. 배터리 학습 주기, 배터리 이상, "
+                "정책 변경으로 캐시가 write-through로 바뀌면 fsync마다 디스크까지 가야 해서 쓰기만 크게 느려집니다. "
+                "RAID 5/6은 쓰기마다 읽기-수정-쓰기가 생기는 것도 원인입니다.",
+                "하드웨어 담당자에게 컨트롤러 캐시 정책(현재 write-back인지), 배터리·캐시 모듈 상태, 논리 디스크 RAID 레벨을 확인 요청하세요.",
+                "RAID 컨트롤러 캐시 동작 (벤더 공통). OS에서는 컨트롤러 캐시 상태를 읽을 수 없어 추정")
+        elif kind == "baremetal" and attach == "local":
+            add("caution", "지연", OUT, "쓰기만 유독 느림. SSD 쓰기 성능 저하 가능성",
+                "쓰기 p95 {} vs 읽기 p95 {}".format(fmt(A["w_await_p95"], 2, "ms"), fmt(A["r_await_p95"], 2, "ms")),
+                "SSD는 여유 블록이 부족해지면 쓰기 전에 지우는 작업(garbage collection)이 겹쳐 쓰기 지연이 급격히 늘어납니다. "
+                "Broadcom은 SSD 지연이 2~3ms를 계속 넘으면 이 'write cliff'에 가까워진 신호로 설명합니다.",
+                "디스크 사용률과 TRIM(fstrim.timer) 동작 여부를 확인하고, 하드웨어 담당자에게 SSD 수명·여유 공간(SMART)을 확인 요청하세요.",
+                "[VMware 공식] Broadcom KB 424485 (SSD write cliff)")
+        else:
+            add("caution", "지연", OUT, "쓰기만 유독 느림. 스토리지 쓰기 경로 확인 필요",
+                "쓰기 p95 {} vs 읽기 p95 {}".format(fmt(A["w_await_p95"], 2, "ms"), fmt(A["r_await_p95"], 2, "ms")),
+                "읽기는 캐시가 받아 주지만 쓰기는 끝까지 기록돼야 끝납니다. 스토리지 쪽 복제, 쓰기 캐시 포화, 볼륨 처리량 한도가 쓰기에 먼저 나타납니다.",
+                "{}에게 같은 시각의 쓰기 지연, 쓰기 캐시 상태, 볼륨 한도 도달 여부를 확인 요청하세요.".format(OUT),
+                "스토리지 쓰기 경로 일반 동작")
 
     # ═════════════ 2. 포화 ═════════════
     psi_full = [r.get("psi_io_full") for r in sysr if r.get("psi_io_full") is not None]
@@ -899,32 +1231,46 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
 
     # ═════════════ 3. 오류 (커널 로그) ═════════════
     klog = rd(S, "klog_io").splitlines()
-    STO = r'(scsi|sd [0-9]|pvscsi|mptscsih|mptbase|nvme|ata[0-9])'
+    STO = r'(scsi|sd [0-9]|pvscsi|mptscsih|mptbase|nvme|ata[0-9]|megaraid|mpt[23]sas|hpsa|smartpqi|aacraid|qla2xxx|lpfc)'
     cats = {
-        "I/O 오류": r'I/O error|blk_update_request|Buffer I/O error|critical medium|rejecting I/O',
+        "I/O 오류": r'I/O error|blk_update_request|Buffer I/O error|critical medium|Medium Error|rejecting I/O',
         "SCSI abort/reset": STO + r'.*\b(abort\w*|reset)\b',
         "hung task (120초 이상 멈춤)": r'hung_task|blocked for more than',
         "파일시스템 오류·읽기전용 전환": r'XFS .*(error|shutdown|corruption)|EXT4-fs error|remount.*read-only',
         "타임아웃": STO + r'.*(timed out|timing out|timeout)',
+        "컨트롤러·PCIe 오류": r'controller is down|AER:.*error|(megaraid|mpt[23]sas|hpsa|smartpqi|aacraid).*(FATAL|fault|firmware)|Controller cache pinned',
+        "RAID·경로 장애": r'md/raid.*(Disk failure|not operational)|multipath.*(Failing path|remaining active paths: 0)',
     }
     cnt = {k: sum(1 for l in klog if re.search(v, l, re.I)) for k, v in cats.items()}
     err_sev = "ok"
     if cnt["I/O 오류"] or cnt["파일시스템 오류·읽기전용 전환"]:
         err_sev = "crit"
-    elif cnt["hung task (120초 이상 멈춤)"] or cnt["SCSI abort/reset"]:
+    elif cnt["hung task (120초 이상 멈춤)"] or cnt["SCSI abort/reset"] or cnt["컨트롤러·PCIe 오류"] or cnt["RAID·경로 장애"]:
         err_sev = "warn"
     elif cnt["타임아웃"]:
         err_sev = "caution"
     if err_sev != "ok":
-        add(err_sev, "오류", "VMware 관리자", "커널 로그에 디스크 관련 오류 기록",
+        ERR_WHY = {
+            "vmware": "vSAN 경로가 잠시 멈추면(호스트 장애, resync 폭주, 네트워크 단절) Guest에서는 SCSI abort/reset, hung task, 심하면 파일시스템 읽기전용 전환으로 나타납니다. ",
+            "local": "디스크 불량 섹터, 컨트롤러 펌웨어 문제, RAID 재구성 중 지연이 SCSI abort/reset, Medium Error, hung task로 나타납니다. "
+                     "Medium Error·I/O error는 디스크 교체 신호일 수 있습니다. ",
+            "san": "어레이 컨트롤러 전환, SAN 경로 끊김, 스위치 포트 오류가 경로 소실(multipath), SCSI abort/reset, hung task로 나타납니다. ",
+        }
+        where = "vmware" if kind == "vmware" else ("san" if (kind == "baremetal" and attach == "san") else ("local" if kind == "baremetal" else ""))
+        add(err_sev, "오류", OUT, "커널 로그에 디스크 관련 오류 기록",
             " · ".join("{} {}건".format(k, v) for k, v in cnt.items() if v),
-            "vSAN 경로가 잠시 멈추면(호스트 장애, resync 폭주, 네트워크 단절) Guest에서는 SCSI abort/reset, hung task, 심하면 파일시스템 읽기전용 전환으로 나타납니다. "
-            "짧은 측정 창에서 안 보인 과거 사고의 흔적입니다.",
-            "리포트 부록의 로그 원문 시각을 VMware 관리자에게 전달해 같은 시각의 vSAN 이벤트를 확인하세요. I/O 오류·읽기전용 전환은 ES 데이터 무결성 점검이 필요합니다.",
+            ERR_WHY.get(where, "스토리지 백엔드가 잠시 멈추면 OS에서는 SCSI abort/reset, hung task, 심하면 파일시스템 읽기전용 전환으로 나타납니다. ")
+            + "짧은 측정 구간에서 안 보인 과거 사고의 흔적입니다.",
+            {"vmware": "리포트 부록의 로그 원문 시각을 VMware 관리자에게 전달해 같은 시각의 vSAN 이벤트를 확인하세요. ",
+             "local": "리포트 부록의 로그 원문 시각을 하드웨어 담당자에게 전달해 같은 시각의 RAID 컨트롤러 이벤트 로그, 디스크 SMART, BMC(iDRAC·iLO·XCC) 로그를 확인하세요. ",
+             "san": "리포트 부록의 로그 원문 시각을 스토리지 관리자에게 전달해 같은 시각의 어레이 이벤트와 SAN 스위치 포트 로그를 확인하세요. "
+             }.get(where, "리포트 부록의 로그 원문 시각을 {}에게 전달해 같은 시각의 호스트·스토리지 이벤트를 확인하세요. ".format(OUT))
+            + "I/O 오류·읽기전용 전환은 ES 데이터 무결성 점검이 필요합니다.",
             "커널 로그 (journalctl -k / dmesg), 최근 7일")
     else:
-        add("ok", "오류", "참고", "최근 커널 로그에 디스크 오류 없음", "검사 패턴: I/O error, SCSI abort/reset, hung task, FS error, timeout",
-            "vSAN 순간 정지의 흔적이 없다는 뜻입니다.", "조치 불필요.", "journalctl -k / dmesg")
+        add("ok", "오류", "참고", "최근 커널 로그에 디스크 오류 없음", "검사 패턴: I/O error, SCSI abort/reset, hung task, FS error, timeout, 컨트롤러·PCIe 오류, RAID·경로 장애",
+            "vSAN 순간 정지의 흔적이 없다는 뜻입니다." if kind == "vmware" else "스토리지 경로가 멈췄거나 장치 오류가 난 흔적이 없다는 뜻입니다.",
+            "조치 불필요.", "journalctl -k / dmesg")
 
     # ═════════════ 4. ES 영향 ═════════════
     es_sev = "na"
@@ -999,14 +1345,14 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         mem_sevs.append("warn")
         add("warn", "메모리·캐시", "서버 담당자", "측정 중 swap 입출력 발생", "swap in+out 최대 {} pages/s".format(fmt(swp_max, 0)),
             "ES heap이나 page cache가 swap으로 밀려나면 GC가 수 초씩 멈추고 그동안 디스크 읽기가 폭증합니다. Elastic은 swap을 꺼 두거나 막아 두라고 권고합니다.",
-            "swapoff -a 후 /etc/fstab의 swap 항목 주석 처리(가장 확실), 또는 bootstrap.memory_lock: true 설정. VMware balloon 여부도 함께 확인하세요.",
+            "swapoff -a 후 /etc/fstab의 swap 항목 주석 처리(가장 확실), 또는 bootstrap.memory_lock: true 설정." + (" VMware balloon 여부도 함께 확인하세요." if is_vmware else ""),
             "[Elastic 공식] Disable swapping")
     if swap_on and mlock is not True:
         s = "caution" if (swappiness is not None and swappiness <= 1) else "warn"
         mem_sevs.append(s)
         add(s, "메모리·캐시", "서버 담당자", "swap이 켜져 있고 memory_lock도 꺼져 있음",
             "swap 장치 {}개 · vm.swappiness {} · mlockall {}".format(len(swaps), sysctl.get("vm.swappiness"), "미확인" if mlock is None else mlock),
-            "지금 swap이 쓰이지 않아도 메모리 압박(balloon 포함) 순간에 ES가 swap으로 밀릴 수 있는 상태입니다.",
+            "지금 swap이 쓰이지 않아도 메모리 압박{} 순간에 ES가 swap으로 밀릴 수 있는 상태입니다.".format("(balloon 포함)" if kind in ("vmware", "vm") else ""),
             "Elastic 권고 순서: ① swap 비활성화 ② 불가하면 bootstrap.memory_lock: true (memlock unlimited 필요) ③ 최소한 vm.swappiness=1.",
             "[Elastic 공식] Disable swapping")
     heap = dig(node_i, "jvm", "mem", "heap_max_in_bytes") or dig(n1 or {}, "jvm", "mem", "heap_max_in_bytes")
@@ -1078,19 +1424,39 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             + tuned_hint,
             "[Elastic 공식] Tune for search speed. LVM, software RAID, dm-crypt에서 readahead가 수 MiB로 커질 수 있으며 128KiB 권장 (blockdev --setra 256)")
     # scheduler
-    sch_bad = []
+    # Red Hat 권고: 가상 게스트 mq-deadline/none, 고성능 SSD·NVMe none/kyber, 기존 HDD mq-deadline/bfq
+    def sched_rec(d):
+        if kind != "baremetal":
+            return ("mq-deadline", "none"), "가상 디스크"
+        c = devcls.get(d, {})
+        if c.get("attach") == "san":
+            return ("mq-deadline", "none"), "SAN LUN"
+        if c.get("media") == "hdd":
+            return ("mq-deadline", "bfq"), "HDD"
+        return ("none", "kyber", "mq-deadline"), "NVMe" if c.get("media") == "nvme" else "SSD"
+    sch_bad, sch_kind = [], set()
     for d in phys:
         sch = topo.attr.get(d, {}).get("queue/scheduler", "")
         m = re.search(r'\[(\S+)\]', sch)
         cur = m.group(1) if m else sch.strip()
-        if cur in ("cfq", "bfq"):
-            sch_bad.append("{}={}".format(d, cur))
+        ok_set, what = sched_rec(d)
+        # 판정은 확실히 불리한 경우만: 가상 디스크·SAN·SSD·NVMe 에 cfq/bfq. HDD 의 bfq 는 Red Hat 권고 범위
+        if cur in ("cfq", "bfq") and what != "HDD":
+            sch_bad.append("{}={}".format(d, cur)); sch_kind.add(what)
     if sch_bad:
         cfg_sevs.append("caution")
-        add("caution", "설정", "서버 담당자", "I/O 스케줄러가 가상 디스크에 불리함", ", ".join(sch_bad),
-            "cfq/bfq는 프로세스 간 공평 분배에 시간을 씁니다. 스케줄링은 vSAN이 이미 하므로 VM에서는 가볍게 두는 편이 낫습니다. none과 mq-deadline의 차이는 작습니다.",
-            "mq-deadline 또는 none으로 변경 (echo mq-deadline > /sys/block/<장치>/queue/scheduler, udev 규칙으로 영구화).",
-            "Red Hat 'Monitoring and managing system status and performance' > Setting the disk scheduler")
+        if kind == "baremetal":
+            add("caution", "설정", "서버 담당자", "I/O 스케줄러가 장치 종류에 맞지 않음", ", ".join(sch_bad) + " · 장치 종류 " + ", ".join(sorted(sch_kind)),
+                "cfq/bfq는 프로세스 간 공평 분배에 CPU와 시간을 씁니다. 빠른 SSD·NVMe에서는 그 비용이 장치 지연보다 커질 수 있습니다. "
+                "Red Hat은 고성능 SSD·NVMe에 none 또는 kyber, 기존 HDD에 mq-deadline 또는 bfq를 권고합니다.",
+                "SSD·NVMe는 none (echo none > /sys/block/<장치>/queue/scheduler), HDD는 mq-deadline 으로 변경하고 udev 규칙으로 영구화하세요.",
+                "[Red Hat 공식] Setting the disk scheduler > Disk schedulers for different use cases")
+        else:
+            add("caution", "설정", "서버 담당자", "I/O 스케줄러가 가상 디스크에 불리함", ", ".join(sch_bad),
+                "cfq/bfq는 프로세스 간 공평 분배에 시간을 씁니다. 스케줄링은 {}가 이미 하므로 VM에서는 가볍게 두는 편이 낫습니다. none과 mq-deadline의 차이는 작습니다.".format(
+                    "vSAN" if is_vmware else "하이퍼바이저·스토리지 백엔드"),
+                "mq-deadline 또는 none으로 변경 (echo mq-deadline > /sys/block/<장치>/queue/scheduler, udev 규칙으로 영구화).",
+                "Red Hat 'Monitoring and managing system status and performance' > Setting the disk scheduler")
     # max_map_count
     mmc = num(sysctl.get("vm.max_map_count"))
     if mmc is not None and mmc < 262144:
@@ -1131,8 +1497,9 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         if "discard" in opts:
             cfg_sevs.append("caution")
             add("caution", "설정", "서버 담당자", "online discard 마운트 옵션 사용", m["opts"],
-                "삭제 때마다 TRIM을 보내 쓰기 지연을 늘릴 수 있습니다. vSAN에서 Guest TRIM은 클러스터 설정이 켜져 있어야 공간 회수로 이어집니다.",
-                "discard를 빼고 fstrim.timer(주 1회)로 대체하세요. vSAN Guest TRIM/UNMAP 사용 여부는 VMware 관리자에게 확인.", "mount(8), vSAN Guest TRIM/UNMAP 문서")
+                "삭제 때마다 TRIM을 보내 쓰기 지연을 늘릴 수 있습니다." + (" vSAN에서 Guest TRIM은 클러스터 설정이 켜져 있어야 공간 회수로 이어집니다." if is_vmware else ""),
+                "discard를 빼고 fstrim.timer(주 1회)로 대체하세요." + (" vSAN Guest TRIM/UNMAP 사용 여부는 VMware 관리자에게 확인." if is_vmware else ""),
+                "mount(8)" + (", vSAN Guest TRIM/UNMAP 문서" if is_vmware else ""))
     # 파티션 정렬
     for d in phys:
         for part, (parent, start) in topo.parts.items():
@@ -1142,8 +1509,10 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
                     "정렬이 어긋나면 I/O 한 번이 하부 블록 두 개에 걸쳐 불필요한 추가 I/O가 생깁니다.",
                     "신규 구성 시 1MiB(2048 섹터) 정렬로 파티션을 만드세요. 운영 중 변경은 데이터 이전이 필요합니다.", "parted/fdisk 정렬 가이드")
     # SCSI timeout: vSAN failover 대비
+    # 180초 권고는 VMware(open-vm-tools) 기준. bare-metal 로컬 디스크는 커널 기본 30초가 정상이고,
+    # SAN 은 multipath 벤더 권고를 따르므로 여기서 판정하지 않는다
     to_bad = ["{}={}s".format(d, topo.attr[d]["device/timeout"]) for d in phys
-              if num(topo.attr.get(d, {}).get("device/timeout"), 999) < 60]
+              if is_vmware and num(topo.attr.get(d, {}).get("device/timeout"), 999) < 60]
     if to_bad:
         cfg_sevs.append("warn")
         add("warn", "설정", "서버 담당자", "SCSI 명령 타임아웃이 짧음. vSAN이 잠깐 멈추면 I/O 오류 위험", ", ".join(to_bad),
@@ -1199,9 +1568,16 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     share_dev = sorted(set(root_phys) & set(phys))
     if share_dev and not dev_guess:
         cfg_sevs.append("info")
-        add("info", "설정", "VMware 관리자", "OS와 ES data가 같은 가상 디스크를 사용", ", ".join(share_dev),
-            "로그 쓰기, 패키지 작업 등 OS I/O가 ES I/O와 같은 큐를 나눠 씁니다.", "ES data 전용 VMDK 분리를 권장합니다.", "VMware DB-on-vSAN 구성 권고")
-    else:
+        if is_vmware:
+            add("info", "설정", "VMware 관리자", "OS와 ES data가 같은 가상 디스크를 사용", ", ".join(share_dev),
+                "로그 쓰기, 패키지 작업 등 OS I/O가 ES I/O와 같은 큐를 나눠 씁니다.", "ES data 전용 VMDK 분리를 권장합니다.", "VMware DB-on-vSAN 구성 권고")
+        else:
+            add("info", "설정", "서버 담당자" if kind == "baremetal" else OUT,
+                "OS와 ES data가 같은 {}를 사용".format("디스크" if kind == "baremetal" else "가상 디스크"), ", ".join(share_dev),
+                "로그 쓰기, 패키지 작업 등 OS I/O가 ES I/O와 같은 장치를 나눠 씁니다.",
+                "ES data 전용 {}를 분리하는 것을 권장합니다.".format("디스크(또는 RAID 논리 디스크)" if kind == "baremetal" else "가상 디스크"),
+                "[실무 기준] OS I/O 와 ES I/O 분리")
+    elif is_vmware:
         hosts = sorted(set(topo.scsihost.get(d) for d in phys if topo.scsihost.get(d)))
         rhosts = sorted(set(topo.scsihost.get(d) for d in root_phys if topo.scsihost.get(d)))
         if hosts and set(hosts) <= set(rhosts):
@@ -1245,7 +1621,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             out = {}
             for line in t.splitlines()[1:]:
                 p_ = line.split()
-                if len(p_) > 2 and re.match(r'^\d+:$', p_[0]) and re.search(r'(pvscsi|virtio\d+-req|nvme|ahci|mpt)', line, re.I):
+                if len(p_) > 2 and re.match(r'^\d+:$', p_[0]) and re.search(r'(pvscsi|virtio\d+-req|nvme|ahci|mpt|megasas|megaraid|hpsa|smartpqi|aacraid|qla2xxx|lpfc)', line, re.I):
                     vals = []
                     for x in p_[1:]:
                         if x.isdigit():
@@ -1264,10 +1640,13 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             share = 100.0 * max(tot) / sum(tot)
             if share > 70:
                 cfg_sevs.append("caution")
-                add("caution", "설정", "서버 담당자", "스토리지 인터럽트가 vCPU 한 개에 몰림",
-                    "상위 vCPU가 전체 스토리지 인터럽트의 {:.0f}% 처리 (vCPU {}개 중)".format(share, len(tot)),
+                cpu_w = "CPU" if kind == "baremetal" else "vCPU"
+                add("caution", "설정", "서버 담당자", "스토리지 인터럽트가 {} 한 개에 몰림".format(cpu_w),
+                    "상위 {}가 전체 스토리지 인터럽트의 {:.0f}% 처리 ({} {}개 중)".format(cpu_w, share, cpu_w, len(tot)),
                     "I/O 완료 처리가 한 코어에 집중되면 그 코어가 한계일 때 전체 IOPS가 거기서 막힙니다. 디스크는 여유가 있는데 더 안 나오는 상황이 됩니다.",
-                    "irqbalance 동작 여부를 확인하세요. PVSCSI·vmxnet3는 다중 큐를 지원하므로 큐 수와 인터럽트 분산 설정을 VMware 관리자와 함께 점검합니다.",
+                    "irqbalance 동작 여부를 확인하세요. " + ("PVSCSI·vmxnet3는 다중 큐를 지원하므로 큐 수와 인터럽트 분산 설정을 VMware 관리자와 함께 점검합니다." if is_vmware else
+                    "NVMe와 최신 RAID·HBA 드라이버는 다중 큐(MSI-X)를 지원하므로 큐 수가 CPU 수만큼 잡혔는지 /proc/interrupts 에서 확인합니다." if kind == "baremetal" else
+                    "가상 컨트롤러의 다중 큐 설정을 {}와 함께 점검합니다.".format(OUT)),
                     "/proc/interrupts")
     # mmap 여유 (ES는 segment를 mmap으로 연다)
     mapc = num(rd(S, "es_mapcount").strip())
@@ -1328,28 +1707,38 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             "[Elastic 공식] Translog settings")
 
     # merge scheduler: Elastic은 spinning platter 에 max_thread_count=1 을 권고
-    # 주의. VMware 가상 디스크는 백엔드가 all-flash 여도 rotational=1 로 보고하는 경우가 많다.
-    # 그래서 rotational 값만으로 판정하지 않고, 사용자가 -s hybrid 로 선언한 경우에만 본다.
+    # VMware 가상 디스크는 백엔드가 all-flash 여도 rotational=1 로 보고하는 경우가 많아 vSAN 에서는
+    # rotational 값만으로 판정하지 않고 -s hybrid 선언을 기준으로 삼는다.
+    # bare-metal 로컬 디스크는 rotational 을 믿을 수 있으므로 매체 판정(hdd)을 그대로 쓴다.
+    # RAID 논리 디스크는 컨트롤러가 rotational 을 제대로 넘기지 않는 경우가 있어 추정으로 표시한다.
     mtc = idx_vals("index.merge.scheduler.max_thread_count")
     rot = [d for d in phys if topo.attr.get(d, {}).get("queue/rotational") == "1"]
-    if storage == "hybrid":
+    spinning = storage in ("hybrid", "hdd")
+    if spinning:
         not_one = [k for k, v in mtc.items() if str(v) != "1"]
         if not mtc or not_one:
             cfg_sevs.append("caution")
-            add("caution", "ES 설정", "ES 설정", "Hybrid vSAN인데 merge 스레드 수가 Elastic 권고(1)가 아님",
-                "max_thread_count를 1로 설정한 인덱스 {}개{} · Guest가 rotational로 보고한 장치: {}".format(
+            if storage == "hybrid":
+                ttl = "Hybrid vSAN인데 merge 스레드 수가 Elastic 권고(1)가 아님"
+                tail = "All-Flash인데 -s hybrid로 실행했다면 -s allflash로 다시 측정하세요."
+            else:
+                ttl = "HDD인데 merge 스레드 수가 Elastic 권고(1)가 아님"
+                tail = ("HDD 판정은 {}. 실제로는 SSD라면 -s ssd 로 다시 분석하세요.".format(
+                    "RAID 논리 디스크의 rotational 값으로 추정한 것입니다" if unsure else "커널이 보고한 rotational=1 기준입니다"))
+            add("caution", "ES 설정", "ES 설정", ttl,
+                "max_thread_count를 1로 설정한 인덱스 {}개{} · {}가 rotational로 보고한 장치: {}".format(
                     len([k for k, v in mtc.items() if str(v) == "1"]),
                     " (1이 아닌 인덱스: " + ", ".join(sorted(not_one)[:4]) + ")" if not_one else "",
-                    ", ".join(rot) or "없음"),
+                    "Guest" if kind in ("vmware", "vm") else "커널", ", ".join(rot) or "없음"),
                 "기본값은 프로세서 수의 절반입니다. SSD에는 맞지만 회전 디스크에서는 동시 merge가 헤드를 흩어 놓아 "
                 "오히려 느려집니다. Elastic은 이 경우 1로 낮추라고 명시합니다.",
-                "Hybrid 구성이 맞다면 index.merge.scheduler.max_thread_count를 1로 낮추는 것을 검토하세요. "
-                "인덱스 단위 동적 설정이라 재시작은 필요 없습니다. All-Flash인데 -s hybrid로 실행했다면 -s allflash로 다시 측정하세요.",
+                "index.merge.scheduler.max_thread_count를 1로 낮추는 것을 검토하세요. "
+                "인덱스 단위 동적 설정이라 재시작은 필요 없습니다. " + tail,
                 "[Elastic 공식] Merge settings (기본값은 프로세서 수의 절반, 회전 디스크면 1로 낮출 것)")
     elif mtc:
         add("info", "ES 설정", "참고", "merge 스레드 수를 기본값과 다르게 설정한 인덱스 있음",
             ", ".join("{}={}".format(k, v) for k, v in sorted(mtc.items())[:6]),
-            "기본값은 프로세서 수의 절반입니다. All-Flash에서는 기본값이 적절합니다.",
+            "기본값은 프로세서 수의 절반입니다. SSD·NVMe·All-Flash에서는 기본값이 적절합니다.",
             "의도한 설정인지 확인하세요.", "[Elastic 공식] Merge settings")
 
     # store type / preload
@@ -1364,9 +1753,8 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
 
     cfg_sev = sev_max(*cfg_sevs) if cfg_sevs else "ok"
 
-    # ═════════════ 7. VMware 자원 ═════════════
+    # ═════════════ 7. 플랫폼 자원 (VMware 자원 / 가상화 자원 / 하드웨어) ═════════════
     vm_sevs = []
-    is_vmware = "vmware" in (virt.get("detect_virt", "") + virt.get("sys_vendor", "")).lower()
     drivers = sorted(set(topo.hostdrv.get(topo.scsihost.get(d), "?") for d in phys if topo.scsihost.get(d)))
     if any(dr.startswith("nvme") for dr in phys):
         drivers.append("nvme")
@@ -1418,10 +1806,12 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     if st95 is not None and st95 >= 5:
         s = "warn" if st95 >= 10 else "caution"
         vm_sevs.append(s)
-        add(s, "VMware 자원", "VMware 관리자", "CPU steal 발생. 호스트 CPU 경합", "p95 {} · 최대 {}".format(fmt(st95, 1, "%"), fmt(vmax(steal), 1, "%")),
-            "VM이 실행하려 할 때 호스트가 CPU를 내주지 못한 시간입니다. vSAN은 호스트 CPU로 동작하므로 경합이 크면 I/O 처리도 늦어집니다.",
-            "호스트 과할당 여부, VM CPU ready 값을 VMware 관리자에게 확인 요청하세요.", "Linux /proc/stat steal")
-    vm_sev = sev_max(*vm_sevs) if vm_sevs else ("ok" if is_vmware else "na")
+        add(s, RES_DIM, OUT, "CPU steal 발생. 호스트 CPU 경합", "p95 {} · 최대 {}".format(fmt(st95, 1, "%"), fmt(vmax(steal), 1, "%")),
+            "VM이 실행하려 할 때 호스트가 CPU를 내주지 못한 시간입니다. " + (
+                "vSAN은 호스트 CPU로 동작하므로 경합이 크면 I/O 처리도 늦어집니다." if is_vmware else
+                "I/O 완료 처리도 CPU가 있어야 진행되므로 경합이 크면 디스크 응답도 늦어집니다."),
+            "호스트 과할당 여부, VM CPU ready 값을 {}에게 확인 요청하세요.".format(OUT), "Linux /proc/stat steal")
+    vm_sev = sev_max(*vm_sevs) if vm_sevs else ("ok" if (is_vmware or kind == "baremetal") else "na")
 
     # ═════════════ 8. 네트워크 (보조) ═════════════
     net_sev = "ok"
@@ -1438,16 +1828,18 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         add("caution", "네트워크", "서버 담당자", "측정 중 NIC 패킷 드롭/오류 발생",
             ", ".join("{} drop {} err {}".format(k, v["rx_drop"] + v["tx_drop"], v["rx_err"] + v["tx_err"]) for k, v in drops.items()),
             "ES 복제·복구 트래픽이 재전송으로 늦어지면 복제본 쓰기가 끝나지 않아 인덱싱 응답이 늦어집니다(디스크 문제처럼 보일 수 있음).",
-            "ethtool -g로 RX ring 최대값 확인 후 상향 검토, 호스트 쪽 vmxnet3 큐 상태는 VMware 관리자에게 확인.", "ethtool(8)")
+            "ethtool -g로 RX ring 최대값 확인 후 상향 검토." + (" 호스트 쪽 vmxnet3 큐 상태는 VMware 관리자에게 확인." if is_vmware else
+            " 스위치 포트 오류 카운터도 함께 확인." if kind == "baremetal" else " 호스트 쪽 가상 NIC 큐 상태는 {}에게 확인.".format(OUT)), "ethtool(8)")
     rt = [r.get("retrans_pct") for r in sysr if r.get("retrans_pct") is not None]
     if rt and pctl(rt, .95) >= 1.0:
         net_sev = sev_max(net_sev, "caution")
         add("caution", "네트워크", "원인 분리 필요", "TCP 재전송률이 높음", "p95 {}".format(fmt(pctl(rt, .95), 2, "%")),
             "ES 노드 간 통신 품질이 떨어져 복제본 응답이 늦어질 수 있습니다.", "네트워크 경로·NIC 설정 점검.", "/proc/net/snmp")
-    add("info", "네트워크", "참고", "vSAN 네트워크는 Guest에서 보이지 않음",
-        "Guest NIC에는 ES 트래픽만 흐름. vSAN 복제 트래픽은 ESXi vmkernel 포트로 흐름",
-        "vSAN 네트워크 지연은 Guest에서 '쓰기 응답시간 증가'로만 간접 관측됩니다. 그래서 네트워크는 보조 지표로만 씁니다.",
-        "쓰기 지연이 높으면 VMware 관리자에게 vSAN 네트워크(전용 대역, 25GbE 이상 권장, 재전송·지연)를 확인 요청하세요.", "[VMware 공식] Troubleshooting vSAN Performance. 2% 패킷 손실로 스토리지 성능 32% 저하, vSwitch 드롭 0.0001% 이하 권고")
+    if is_vmware:
+        add("info", "네트워크", "참고", "vSAN 네트워크는 Guest에서 보이지 않음",
+            "Guest NIC에는 ES 트래픽만 흐름. vSAN 복제 트래픽은 ESXi vmkernel 포트로 흐름",
+            "vSAN 네트워크 지연은 Guest에서 '쓰기 응답시간 증가'로만 간접 관측됩니다. 그래서 네트워크는 보조 지표로만 씁니다.",
+            "쓰기 지연이 높으면 VMware 관리자에게 vSAN 네트워크(전용 대역, 25GbE 이상 권장, 재전송·지연)를 확인 요청하세요.", "[VMware 공식] Troubleshooting vSAN Performance. 2% 패킷 손실로 스토리지 성능 32% 저하, vSwitch 드롭 0.0001% 이하 권고")
 
     # ═════════════ 9. 과거 이력 (sar) ═════════════
     want = set(phys) | set(logical) | set(topo.attr.get(d, {}).get("dm/name", "") for d in logical)
@@ -1463,7 +1855,8 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
             add("caution", "지연", "원인 분리 필요", "과거 이력에 응답시간 급등 구간 존재 (sar)",
                 "{} {} 에 {} (10분 평균)".format(worst[0], worst[3], fmt(worst[2], 1, "ms")),
                 "이번 측정 창 밖에서 일어난 피크입니다. sar는 10분 평균이라 실제 순간값은 더 높았을 수 있습니다.",
-                "해당 시각의 배치·스냅샷·백업·vSAN 작업 이력을 대조하고, 같은 시간대에 이 도구로 재측정하세요.", "sysstat sar 이력")
+                "해당 시각의 배치·스냅샷·백업{} 작업 이력을 대조하고, 같은 시간대에 이 도구로 재측정하세요.".format(
+                    "·vSAN" if is_vmware else ("·RAID 점검(patrol read, consistency check)" if kind == "baremetal" else "")), "sysstat sar 이력")
 
     # ═════════════ 10. 벤치(선택) → 여유율 ═════════════
     bench = load_bench(bench_dir)
@@ -1502,7 +1895,11 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         m_ = re.search(r'\[(\S+)\]', topo.attr.get(d, {}).get("queue/scheduler", ""))
         if m_:
             schs.append((d, m_.group(1)))
-    if schs:
+    if schs and kind == "baremetal":
+        recs = sorted(set("{} {}".format(sched_rec(d)[1], "/".join(sched_rec(d)[0][:2])) for d, _ in schs))
+        bp("OS·블록 장치", "I/O 스케줄러", " · ".join(recs), ", ".join("{} {}".format(d, v) for d, v in schs),
+           "caution" if sch_bad else "ok", "[Red Hat 공식] Setting the disk scheduler")
+    elif schs:
         bp("OS·블록 장치", "I/O 스케줄러", "mq-deadline 또는 none", ", ".join("{} {}".format(d, v) for d, v in schs),
            "caution" if any(v in ("cfq", "bfq") for _, v in schs) else "ok", "[Red Hat 공식] Setting the disk scheduler")
     ios = [topo.attr.get(d, {}).get("queue/iostats") for d in phys]
@@ -1510,11 +1907,17 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         bp("OS·블록 장치", "I/O 통계 수집(iostats)", "1 (켜짐)", ", ".join(x or "-" for x in ios), "warn" if "0" in ios else "ok", "커널 block layer")
     tos = [num(topo.attr.get(d, {}).get("device/timeout")) for d in phys]
     tos = [t for t in tos if t is not None]
-    bp("OS·블록 장치", "SCSI 명령 타임아웃", "60초 이상 (open-vm-tools 180초)", ", ".join("{}s".format(int(t)) for t in tos) or "해당 없음",
-       ("warn" if min(tos) < 60 else "ok") if tos else "na", "open-vm-tools udev 규칙")
+    if is_vmware:
+        bp("OS·블록 장치", "SCSI 명령 타임아웃", "60초 이상 (open-vm-tools 180초)", ", ".join("{}s".format(int(t)) for t in tos) or "해당 없음",
+           ("warn" if min(tos) < 60 else "ok") if tos else "na", "open-vm-tools udev 규칙")
     qds = [topo.attr.get(d, {}).get("device/queue_depth") for d in phys if topo.attr.get(d, {}).get("device/queue_depth")]
-    bp("OS·블록 장치", "가상 디스크 queue_depth", "기본값 유지, 큐 포화가 확인될 때만 상향(254)", ", ".join(qds) or "-",
-       ("warn" if (qratio or 0) >= 0.8 else "ok") if qds else "na", "VMware KB 2053145")
+    if is_vmware:
+        bp("OS·블록 장치", "가상 디스크 queue_depth", "기본값 유지, 큐 포화가 확인될 때만 상향(254)", ", ".join(qds) or "-",
+           ("warn" if (qratio or 0) >= 0.8 else "ok") if qds else "na", "VMware KB 2053145")
+    elif qds:
+        bp("OS·블록 장치", "LUN queue_depth" if attach == "san" else "장치 queue_depth", "큐 사용률 80% 미만",
+           "{} · 큐 사용률 p95 {}".format(", ".join(qds), fmt((qratio or 0) * 100, 0, "%") if qratio is not None else "-"),
+           "warn" if (qratio or 0) >= 0.8 else "ok", "[실무 기준] 큐 사용률 구간")
     mis = [(pt, st) for pt, (par, st) in topo.parts.items() if par in phys and st % 2048]
     bp("OS·블록 장치", "파티션 정렬", "1MiB(2048 섹터) 단위", "어긋남: " + ", ".join(p_ for p_, _ in mis) if mis else "정렬됨 / 파티션 없음",
        "caution" if mis else "ok", "parted 정렬 가이드")
@@ -1530,7 +1933,9 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         bp("파일시스템", "online discard ({})".format(m_["mnt"]), "끔 (fstrim.timer로 대체)", "켜짐" if "discard" in o else "꺼짐",
            "caution" if "discard" in o else "ok", "mount(8)")
     fst = rd(S, "fstrim").split()
-    bp("파일시스템", "fstrim.timer", "주기 실행 권장 (vSAN Guest TRIM 사용 시 의미)", fst[0] if fst else "미확인", "info", "systemd fstrim.timer")
+    bp("파일시스템", "fstrim.timer", "주기 실행 권장 (vSAN Guest TRIM 사용 시 의미)" if is_vmware else
+       ("주기 실행 권장 (SSD·NVMe 쓰기 성능 유지)" if kind == "baremetal" else "주기 실행 권장 (가상 디스크 공간 회수)"),
+       fst[0] if fst else "미확인", "info", "systemd fstrim.timer")
     bp("커널", "vm.max_map_count", "최소 262144, 권장 1048576", sysctl.get("vm.max_map_count", "-"),
        "crit" if (mmc or 0) < 262144 else ("ok" if (mmc or 0) >= 1048576 else "info"), "Elastic 공식")
     if mapc and mmc:
@@ -1549,10 +1954,18 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     bp("커널", "dirty page 기준", "기본값 유지, 쓰기 지연 급등 시 바이트 단위 검토",
        "ratio {}/{} · bytes {}/{}".format(sysctl.get("vm.dirty_background_ratio", "-"), sysctl.get("vm.dirty_ratio", "-"),
                                          sysctl.get("vm.dirty_background_bytes", "-"), sysctl.get("vm.dirty_bytes", "-")), "info", "커널 문서")
-    bp("OS·블록 장치", "tuned profile", "virtual-guest (VM 권고). readahead·dirty_ratio를 바꿀 수 있어 함께 확인",
-       tuned_prof or "미확인",
-       "ok" if tuned_prof.lower().endswith("virtual-guest") else ("na" if not tuned_prof else "info"),
-       "[Red Hat 공식] TuneD profiles (virtual-guest는 throughput-performance 기반, swappiness를 낮추고 dirty_ratio를 올림)")
+    if kind == "baremetal":
+        bp("OS·블록 장치", "tuned profile", "throughput-performance (물리 서버 권고). readahead·dirty_ratio를 바꿀 수 있어 함께 확인",
+           tuned_prof or "미확인",
+           "ok" if tuned_prof.lower() in ("throughput-performance", "latency-performance", "network-throughput", "network-latency")
+           else ("na" if not tuned_prof else "info"),
+           "[Red Hat 공식] TuneD profiles (설치 시 컴퓨트 노드는 throughput-performance, VM은 virtual-guest 선택. "
+           "throughput-performance는 절전 기능을 끔)")
+    else:
+        bp("OS·블록 장치", "tuned profile", "virtual-guest (VM 권고). readahead·dirty_ratio를 바꿀 수 있어 함께 확인",
+           tuned_prof or "미확인",
+           "ok" if tuned_prof.lower().endswith("virtual-guest") else ("na" if not tuned_prof else "info"),
+           "[Red Hat 공식] TuneD profiles (virtual-guest는 throughput-performance 기반, swappiness를 낮추고 dirty_ratio를 올림)")
     bp("커널", "PSI(I/O 압박 지표)", "사용 가능 (RHEL 8은 psi=1)", sysctl.get("psi", "-"), "ok" if sysctl.get("psi") == "available" else "info", "커널 문서")
     bp("ES 프로세스", "파일 핸들 한도", "65535 이상", nofile or "-", ("ok" if (nofile == "unlimited" or num(nofile, 0) >= 65535) else "crit") if nofile else "na", "Elastic 공식")
     if heap_mb and mem_total_mb:
@@ -1561,11 +1974,12 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
            "caution" if (heap_mb / mem_total_mb > 0.5 or heap_mb > 31 * 1024) else "ok", "Elastic 공식")
     bp("ES 프로세스", "cgroup I/O 제한", "없음", "있음" if (cg and re.search(r'(rbps|wbps|riops|wiops)=\d', cg)) else "없음",
        "warn" if (cg and re.search(r'(rbps|wbps|riops|wiops)=\d', cg)) else "ok", "cgroup v2")
-    bp("구성", "OS와 ES data 디스크 분리", "별도 가상 디스크", "같은 디스크: " + ", ".join(share_dev) if share_dev else "분리됨",
-       "info" if share_dev else "ok", "[VMware 공식] Performance Best Practices. 워크로드별 컨트롤러 분리")
+    bp("구성", "OS와 ES data 디스크 분리", "별도 디스크" if kind == "baremetal" else "별도 가상 디스크",
+       "같은 디스크: " + ", ".join(share_dev) if share_dev else "분리됨",
+       "info" if share_dev else "ok", "[VMware 공식] Performance Best Practices. 워크로드별 컨트롤러 분리" if is_vmware else "[실무 기준] OS I/O 와 ES I/O 분리")
     dh = sorted(set(topo.scsihost.get(d) for d in phys if topo.scsihost.get(d)))
     rh = sorted(set(topo.scsihost.get(d) for d in root_phys if topo.scsihost.get(d)))
-    if dh and rh:
+    if dh and rh and is_vmware:
         shared = sorted(set(dh) & set(rh))
         bp("구성", "ES data 전용 가상 컨트롤러", "OS와 다른 PVSCSI 컨트롤러", "OS와 공유: " + ", ".join(shared) if shared else "분리됨 (" + ", ".join(dh) + ")",
            "info" if shared else "ok", "[VMware 공식] Performance Best Practices for vSphere")
@@ -1615,7 +2029,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         auto = os.path.join(S, "cluster")
         if os.path.isdir(auto):
             cluster_dir = auto
-    CL = analyze_cluster(cluster_dir, add, th)
+    CL = analyze_cluster(cluster_dir, add, th, kind)
     IDX = analyze_local_indices(S, cluster_dir)
     me_name = dig(node_i, "name")
     if CL and CL["data_rows"]:
@@ -1642,14 +2056,30 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
         if len(busy) >= 3:
             high = [n_ for n_, v in busy if v >= 70]
             if len(high) >= max(2, len(busy) // 2) and SEV_ORDER.get(lat_sev, 0) >= SEV_ORDER["caution"]:
-                add("warn", "클러스터", "VMware 관리자", "여러 노드가 동시에 디스크를 많이 쓰고 있음. 공용 스토리지 의심",
-                    "디스크 busy 70% 이상 {}개 노드 ({}) / 전체 {}개 · 이 노드 지연 {}".format(
-                        len(high), ", ".join(high[:6]), len(busy), SEV_LABEL.get(lat_sev, lat_sev)),
-                    "노드 하나가 아니라 여러 노드가 같은 시간에 느려졌다면, 각 VM의 문제가 아니라 그 VM들이 공유하는 vSAN 데이터스토어나 호스트 쪽 원인일 가능성이 큽니다. "
-                    "ES 노드가 같은 vSAN 클러스터에 있다면 서로의 I/O가 같은 자원을 두고 경쟁합니다.",
-                    "VMware 관리자에게 해당 시각의 vSAN 클러스터 단위 지표(디스크 그룹 지연, 캐시 사용률, resync, 네트워크)를 요청하세요. "
-                    "ES 노드 VM들이 같은 호스트·데이터스토어에 몰려 있는지도 함께 확인합니다.",
-                    "노드 간 동시성 비교 (_nodes/stats fs.io_stats)")
+                ev_ = "디스크 busy 70% 이상 {}개 노드 ({}) / 전체 {}개 · 이 노드 지연 {}".format(
+                        len(high), ", ".join(high[:6]), len(busy), SEV_LABEL.get(lat_sev, lat_sev))
+                if kind == "vmware":
+                    add("warn", "클러스터", "VMware 관리자", "여러 노드가 동시에 디스크를 많이 쓰고 있음. 공용 스토리지 의심", ev_,
+                        "노드 하나가 아니라 여러 노드가 같은 시간에 느려졌다면, 각 VM의 문제가 아니라 그 VM들이 공유하는 vSAN 데이터스토어나 호스트 쪽 원인일 가능성이 큽니다. "
+                        "ES 노드가 같은 vSAN 클러스터에 있다면 서로의 I/O가 같은 자원을 두고 경쟁합니다.",
+                        "VMware 관리자에게 해당 시각의 vSAN 클러스터 단위 지표(디스크 그룹 지연, 캐시 사용률, resync, 네트워크)를 요청하세요. "
+                        "ES 노드 VM들이 같은 호스트·데이터스토어에 몰려 있는지도 함께 확인합니다.",
+                        "노드 간 동시성 비교 (_nodes/stats fs.io_stats)")
+                elif kind == "baremetal" and attach == "san":
+                    add("warn", "클러스터", "스토리지 관리자", "여러 노드가 동시에 디스크를 많이 쓰고 있음. 공용 스토리지 어레이 의심", ev_,
+                        "노드마다 디스크가 따로라면 동시에 느려질 이유가 적습니다. ES 노드들이 같은 어레이를 쓰고 있다면 어레이 컨트롤러나 공용 SAN 경로가 원인일 가능성이 큽니다.",
+                        "스토리지 관리자에게 같은 시각의 어레이 컨트롤러 부하, 볼륨별 응답시간, 스위치 포트 사용률을 요청하세요.",
+                        "노드 간 동시성 비교 (_nodes/stats fs.io_stats)")
+                elif kind == "baremetal":
+                    add("warn", "클러스터", "원인 분리 필요", "여러 노드가 동시에 디스크를 많이 쓰고 있음. 인입량 급증 의심", ev_,
+                        "로컬 디스크는 노드끼리 공유하지 않으므로, 여러 노드가 같은 시간에 바쁘다면 스토리지보다 인입량이나 클러스터 작업(복구, 대량 merge, 스냅샷)이 원인일 가능성이 큽니다.",
+                        "같은 시각의 인입량, 샤드 복구·이동, force merge·스냅샷 작업을 확인하세요. 평소 부하라면 노드나 디스크 증설이 필요한 시점입니다.",
+                        "노드 간 동시성 비교 (_nodes/stats fs.io_stats)")
+                else:
+                    add("warn", "클러스터", OUT, "여러 노드가 동시에 디스크를 많이 쓰고 있음. 공용 스토리지 의심", ev_,
+                        "노드 하나가 아니라 여러 노드가 같은 시간에 느려졌다면 그 노드들이 공유하는 스토리지 백엔드나 호스트 쪽 원인일 가능성이 큽니다.",
+                        "{}에게 같은 시각의 스토리지 백엔드 지표와 노드 VM 배치를 확인 요청하세요.".format(OUT),
+                        "노드 간 동시성 비교 (_nodes/stats fs.io_stats)")
     # (교차 3) 쓰기가 특정 인덱스에 집중
     if IDX:
         tot = sum(r["docs"] for r in IDX) or 1
@@ -1674,7 +2104,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
 
     dims = [
         ("지연", lat_sev), ("포화", sat_sev), ("오류", err_sev), ("ES 영향", es_sev),
-        ("메모리·캐시", mem_sev), ("설정", cfg_sev), ("VMware 자원", vm_sev), ("네트워크(보조)", net_sev), ("클러스터", cl_sev),
+        ("메모리·캐시", mem_sev), ("설정", cfg_sev), (RES_DIM, vm_sev), ("네트워크(보조)", net_sev), ("클러스터", cl_sev),
     ]
     disk_rt = sev_max(lat_sev, sat_sev, err_sev)          # 디스크 자체의 측정 결과
     runtime = sev_max(disk_rt, es_sev)
@@ -1733,7 +2163,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
     top = [f for f in F if f.title.startswith("병목 위치") and SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["caution"]][:1]
     # 클러스터 교차 판정은 "누가 움직여야 하는가"를 바꾸므로 개별 설정 항목보다 앞에 둔다
     top += [f for f in F if f.dim == "클러스터" and SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["warn"] and f not in top][:2 - len(top)]
-    act_owner = ("VMware 관리자", "서버 담당자", "ES 설정")
+    act_owner = (OUT, "서버 담당자", "ES 설정")
     top += sorted([f for f in F if f.owner in act_owner and SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["caution"] and f not in top],
                   key=lambda f: -SEV_ORDER.get(f.sev, 0))[:3 - len(top)]
 
@@ -1761,6 +2191,8 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None):
 
     return {
         "meta": meta, "storage": storage, "th": th, "es_version": es_version, "is_vmware": is_vmware,
+        "platform": kind, "plat": plat, "attach": attach, "devcls": devcls, "storage_auto": storage_auto,
+        "media_note": media_note, "unsure": unsure, "out_owner": OUT, "res_dim": RES_DIM, "sto": sto, "src_lat": src_lat,
         "os": kv(rd(S, "os-release")).get("PRETTY_NAME", "").strip('"'), "kernel": (rd(S, "uname").split() + ["", "", ""])[2],
         "ncpu": ncpu, "mem_gb": mem_total_mb / 1024.0, "path_map": path_map, "phys": phys, "logical": logical,
         "dev_guess": dev_guess, "A": A, "dev_stats": dev_stats, "log_stats": log_stats, "topo": topo,
@@ -1851,18 +2283,79 @@ function chart(id, series, ths, unit){
 }
 """
 
-OWNER_ORDER = ["원인 분리 필요", "서버 담당자", "VMware 관리자", "ES 설정", "참고"]
+OWNER_ORDER = ["원인 분리 필요", "서버 담당자", "VMware 관리자", "가상화·클라우드 관리자", "하드웨어 담당자", "스토리지 관리자", "ES 설정", "참고"]
 OWNER_DESC = {
-    "원인 분리 필요": "측정값 자체가 나쁜 항목입니다. 원인이 VM 안인지 밖인지 판정 근거를 함께 적었습니다.",
-    "서버 담당자": "Guest OS에서 바꿀 수 있는 항목입니다. 모두 운영 변경이므로 담당자 검토 후 적용하세요. 이 도구는 아무것도 바꾸지 않았습니다.",
+    "원인 분리 필요": "측정값 자체가 나쁜 항목입니다. 원인이 어디에 있는지 판정 근거를 함께 적었습니다.",
+    "서버 담당자": "OS에서 바꿀 수 있는 항목입니다. 모두 운영 변경이므로 담당자 검토 후 적용하세요. 이 도구는 아무것도 바꾸지 않았습니다.",
     "VMware 관리자": "VM 바깥 설정이라 Guest에서는 바꿀 수 없습니다. 근거와 함께 요청하세요.",
+    "가상화·클라우드 관리자": "VM 바깥(하이퍼바이저, 스토리지 백엔드, 클라우드 볼륨) 설정이라 OS에서는 바꿀 수 없습니다. 근거와 함께 요청하세요.",
+    "하드웨어 담당자": "디스크, RAID 컨트롤러, BIOS·펌웨어 쪽 항목입니다. OS에서는 상태를 일부만 볼 수 있어 하드웨어 관리 도구(BMC, 컨트롤러 유틸리티)로 확인이 필요합니다.",
+    "스토리지 관리자": "외부 스토리지 어레이와 SAN 경로 쪽 항목이라 서버에서는 바꿀 수 없습니다. 측정 시각과 근거를 함께 전달하세요.",
     "ES 설정": "Elasticsearch 설정·운영으로 풀어야 하는 항목입니다.",
     "참고": "정상 확인 또는 해석에 필요한 참고 정보입니다.",
 }
 COLOR = {"ok": "#1d7a4b", "info": "#2d5f9e", "caution": "#946300", "warn": "#bf4a10", "crit": "#b3261e", "na": "#8b93a1"}
 
+BLIND_VMWARE = [
+    ("vSAN 스토리지 정책 (RAID·FTT·stripe·IOPS 제한)", "OSA에서 RAID-5/6은 쓰기마다 읽기-수정-쓰기가 생겨 RAID-1보다 쓰기 지연이 큽니다. 정책의 IOPS 제한은 그 이상을 막습니다.", "VM 스토리지 정책 확인"),
+    ("ES 복제본 × vSAN 복제의 쓰기 증폭", "ES 복제본 1 + vSAN FTT=1(RAID-1)이면 문서 하나가 물리적으로 4벌 기록됩니다. 가용성은 ES에서도 보장되므로 용량·쓰기 부하 설계 때 함께 고려해야 합니다.", "스토리지 정책 + ES 인덱스 replicas 비교"),
+    ("VM 스냅샷 존재", "스냅샷이 남아 있으면 쓰기가 delta 파일로 가서 성능이 떨어집니다.", "vCenter 스냅샷 관리자"),
+    ("같은 호스트의 ES 노드 배치", "ES primary와 replica가 같은 ESXi 호스트에 있으면 호스트 장애 한 번에 둘 다 잃습니다.", "DRS anti-affinity 규칙 + ES shard allocation awareness"),
+    ("vSAN 네트워크·resync·캐시 사용률", "Guest에서는 쓰기 지연으로만 간접 관측됩니다.", "vSAN 성능 서비스, esxtop DAVG/KAVG"),
+    ("실제 물리 디스크 상태·지연", "Guest의 SMART 조회는 가상 디스크라 의미가 없습니다.", "vSAN Skyline Health"),
+    ("vNUMA 경계, CPU hot-add", "CPU hot-add를 켜면 vNUMA가 꺼져 메모리 접근이 느려질 수 있습니다.", "VM 고급 설정"),
+]
+BLIND_BAREMETAL = [
+    ("RAID 컨트롤러 캐시 정책·배터리", "write-back 캐시가 배터리 이상이나 학습 주기로 write-through로 바뀌면 fsync마다 디스크까지 가야 해서 쓰기 지연이 크게 늘어납니다. OS에는 보이지 않습니다.", "컨트롤러 유틸리티(storcli·perccli·ssacli), BMC(iDRAC·iLO·XCC)"),
+    ("RAID 레벨과 재구성·점검 작업", "RAID 5/6은 쓰기마다 읽기-수정-쓰기가 생깁니다. 재구성, 일관성 검사, patrol read 중에는 성능이 떨어집니다.", "컨트롤러 이벤트 로그와 작업 일정"),
+    ("RAID 뒤 개별 디스크 상태", "RAID 논리 디스크 하나로만 보여 구성원 디스크의 SMART와 지연은 OS에서 볼 수 없습니다.", "컨트롤러 유틸리티의 물리 디스크 상태, predictive failure"),
+    ("BIOS 전원 정책", "BIOS가 전원 절약 모드면 OS의 governor 설정과 별개로 CPU와 PCIe가 절전 상태로 들어갑니다.", "BIOS System Profile (Performance 권장 여부는 벤더 가이드 확인)"),
+    ("ES 복제본과 RAID 이중화", "ES replica가 이미 이중화를 하므로 RAID 1/10과 겹치면 같은 문서를 여러 벌 씁니다. Elastic은 성능을 위해 RAID 0 stripe를 예로 듭니다.", "인덱스 replicas 설정과 RAID 레벨 비교"),
+]
+BLIND_SAN = [
+    ("어레이 쪽 응답시간과 컨트롤러 부하", "서버에서 본 지연에는 SAN 경로와 어레이 처리 시간이 모두 들어 있어 어느 쪽인지 서버에서 가를 수 없습니다.", "어레이 관리 화면의 볼륨·호스트 포트별 응답시간"),
+    ("같은 어레이를 쓰는 다른 서버", "다른 업무 서버의 배치 작업이 어레이를 차지하면 ES 쪽 지연이 이유 없이 오릅니다.", "어레이의 호스트별 IOPS·처리량"),
+    ("볼륨 QoS 한도", "볼륨에 IOPS·처리량 한도가 걸려 있으면 서버에서는 수치가 평평하게 막히는 것으로만 보입니다.", "어레이 QoS 정책"),
+    ("SAN 스위치 포트 오류·혼잡", "CRC 오류, 버퍼 부족은 서버에서 재시도와 지연으로만 나타납니다.", "스위치 포트 오류 카운터"),
+    ("어레이 복제·스냅샷 일정", "동기 복제는 쓰기 지연을 늘리고, 스냅샷 작업 시간대에는 성능이 떨어집니다.", "어레이 복제·스냅샷 정책"),
+]
+BLIND_VM = [
+    ("호스트 스토리지 백엔드와 캐시", "가상 디스크 뒤의 실제 스토리지 종류와 캐시 설정은 VM에서 보이지 않습니다.", "하이퍼바이저 관리 화면의 디스크 지연·캐시 모드"),
+    ("볼륨 IOPS·처리량 한도", "클라우드 볼륨과 일부 하이퍼바이저는 디스크별·VM별 한도를 둡니다. 한도에 닿으면 수치가 평평하게 막힙니다.", "클라우드 콘솔의 볼륨 성능 지표(한도 도달 여부)"),
+    ("같은 호스트의 다른 VM", "다른 VM의 I/O와 CPU 경합은 steal과 지연으로만 간접 관측됩니다.", "호스트 단위 성능 지표"),
+    ("ES 노드 배치", "ES primary와 replica가 같은 물리 호스트(또는 같은 가용 영역)에 있으면 한 번의 장애로 둘 다 잃습니다.", "anti-affinity 규칙 + ES shard allocation awareness"),
+]
+
+def platform_label(R):
+    p = R.get("plat") or {}
+    kind = R.get("platform")
+    if kind == "vmware":
+        base = "VMware Guest"
+    elif kind == "baremetal":
+        base = "bare-metal" + {"san": " · SAN", "cloud": " · 클라우드 볼륨"}.get(R.get("attach"), "")
+    elif kind == "vm":
+        base = "{} Guest".format(HV_LABEL.get(p.get("hv"), p.get("hv") or "가상 머신"))
+    else:
+        base = "플랫폼 미확정"
+    if p.get("cloud"):
+        base += " · " + p["cloud"]
+    if p.get("container"):
+        base += " · 컨테이너 안에서 실행({})".format(p["container"])
+    return base
+
+def storage_basis(R):
+    st = R["storage"]
+    lab = {"allflash": "All-Flash vSAN", "hybrid": "Hybrid vSAN"}.get(st, STORAGE_LABEL.get(st, st))
+    how = "자동 판정" if R.get("storage_auto") else "-s 지정"
+    if R.get("platform") == "baremetal" and R.get("attach") == "san" and R.get("storage_auto"):
+        how = "자동 판정, SAN 은 매체를 알 수 없어 SSD 기준. 어레이가 HDD면 -s hdd"
+    elif R.get("unsure") and R.get("storage_auto"):
+        how = "자동 판정, RAID 논리 디스크라 추정. 다르면 -s 로 지정"
+    return "{} ({})".format(lab, how)
+
 def render(R, out_path):
     A, th = R["A"], R["th"]
+    kind = R.get("platform")
     t0 = R["agg"][0]["t"] if R["agg"] else 0
     sys_by_t = {round(r["t"], 1): r for r in R["sysr"]}
     data = {"t": [], "ra": [], "wa": [], "rs": [], "ws": [], "rmb": [], "wmb": [], "aqu": [],
@@ -1885,9 +2378,9 @@ def render(R, out_path):
     h.append('<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">')
     h.append('<title>ES Disk I/O 진단 · {}</title><style>{}</style></head><body><div class="wrap">'.format(E(meta.get("host")), CSS))
     h.append('<h1>Elasticsearch 디스크 I/O 진단 리포트</h1>')
-    h.append('<div class="meta">{} · {} · kernel {} · vCPU {} · RAM {:.0f}GB · ES {} · {} · 측정 {} ~ {} ({:.0f}초, {}초 간격)</div>'.format(
-        E(meta.get("host")), E(R["os"]), E(R["kernel"]), R["ncpu"], R["mem_gb"], E(R["es_version"]),
-        "VMware Guest" if R["is_vmware"] else E(R["virt"].get("detect_virt", "")),
+    h.append('<div class="meta">{} · {} · kernel {} · {} {} · RAM {:.0f}GB · ES {} · {} · 측정 {} ~ {} ({:.0f}초, {}초 간격)</div>'.format(
+        E(meta.get("host")), E(R["os"]), E(R["kernel"]), "CPU" if kind == "baremetal" else "vCPU", R["ncpu"], R["mem_gb"], E(R["es_version"]),
+        E(platform_label(R)),
         E(meta.get("start_wall", "")), E(meta.get("end_wall", "")[11:19]), R["dur"], E(meta.get("interval"))))
 
     h.append('<div class="verdict {}"><b>{}</b><span>{}</span></div>'.format(v[0], E(v[1]), E(v[2])))
@@ -1895,9 +2388,10 @@ def render(R, out_path):
     for name, s in R["dims"]:
         h.append('<div class="dim"><div class="n">{}</div><div class="s s-{}">{}</div><div class="bar b-{}"></div></div>'.format(E(name), s, SEV_LABEL.get(s, s), s))
     h.append('</div>')
-    h.append('<p class="note">판정 기준: {} vSAN · 조치가 필요한 항목 {}건 · 측정 대상 디스크 {}{}</p>'.format(
-        "All-Flash" if R["storage"] == "allflash" else "Hybrid", R["n_act"], E(", ".join(R["phys"]) or "-"),
-        " (ES data 경로를 특정하지 못해 전체 디스크 기준)" if R["dev_guess"] else ""))
+    h.append('<p class="note">판정 기준: {} · 응답시간 주의 {:g}ms / 경고 {:g}ms / 위험 {:g}ms · 조치가 필요한 항목 {}건 · 측정 대상 디스크 {}{}{}</p>'.format(
+        E(storage_basis(R)), th["caution"], th["warn"], th["crit"], R["n_act"], E(", ".join(R["phys"]) or "-"),
+        " (ES data 경로를 특정하지 못해 전체 디스크 기준)" if R["dev_guess"] else "",
+        " · " + E(R["media_note"]) if R.get("media_note") else ""))
 
     # 우선 조치
     if R.get("top"):
@@ -1921,7 +2415,8 @@ def render(R, out_path):
     h.append('</div>')
 
     # 차트
-    h.append('<h2>시간대별 흐름</h2><p class="lead">응답시간이 튄 순간에 IOPS·대기 I/O·PSI가 함께 올랐는지 보면 원인을 가를 수 있습니다. 함께 오르면 부하 때문이고, 부하는 그대로인데 응답시간만 오르면 VM 바깥 문제일 가능성이 큽니다. 차트 위에 마우스를 올리면 값이 보입니다.</p>')
+    h.append('<h2>시간대별 흐름</h2><p class="lead">응답시간이 튄 순간에 IOPS·대기 I/O·PSI가 함께 올랐는지 보면 원인을 가를 수 있습니다. 함께 오르면 부하 때문이고, 부하는 그대로인데 응답시간만 오르면 {} 문제일 가능성이 큽니다. 차트 위에 마우스를 올리면 값이 보입니다.</p>'.format(
+        {"vmware": "VM 바깥", "baremetal": "스토리지 어레이·SAN 경로" if R.get("attach") == "san" else "디스크·컨트롤러 상태"}.get(kind, "VM 바깥")))
     charts = [
         ("c1", "디스크 응답시간 (ms)", [{"k": "ra", "n": "읽기", "c": "#2d5f9e"}, {"k": "wa", "n": "쓰기", "c": "#bf4a10"}],
          [{"v": th["caution"], "l": "주의 {}ms".format(th["caution"]), "c": "#946300"}, {"v": th["crit"], "l": "위험 {}ms".format(th["crit"]), "c": "#b3261e"}], "ms"),
@@ -1976,7 +2471,9 @@ def render(R, out_path):
 
     # 여유율
     if R["headroom"]:
-        h.append('<h2>최대 능력 대비 사용률</h2><p class="lead">es_disk_bench.sh로 잰 최대 능력과 이번 측정의 p95를 비교했습니다. vSAN 캐시 계층에 벤치 파일이 들어가면 최대 능력이 실제보다 높게 나오므로 사용률은 낙관적인 값입니다.</p>')
+        h.append('<h2>최대 능력 대비 사용률</h2><p class="lead">es_disk_bench.sh로 잰 최대 능력과 이번 측정의 p95를 비교했습니다. {}</p>'.format(
+            "vSAN 캐시 계층에 벤치 파일이 들어가면 최대 능력이 실제보다 높게 나오므로 사용률은 낙관적인 값입니다." if kind == "vmware" else
+            "RAID 컨트롤러·스토리지 캐시에 벤치 파일이 들어가면 최대 능력이 실제보다 높게 나오므로 사용률은 낙관적인 값입니다."))
         h.append('<table><tr><th>항목</th><th>관측 p95</th><th>측정 최대</th><th>사용률</th></tr>')
         for l, o, c, p, u in R["headroom"]:
             s = "warn" if p >= 80 else "caution" if p >= 60 else "ok"
@@ -1987,13 +2484,15 @@ def render(R, out_path):
             h.append('<p class="note">동기 쓰기(fdatasync) p99 {}. translog를 요청마다 fsync하는 기본 설정(durability: request)에서 인덱싱 요청 한 번이 최소로 기다리는 시간입니다.</p>'.format(
                 fmt(sync.get("sync_p99") or sync.get("w_p99"), 2, " ms")))
     else:
-        h.append('<h2>한계 추정</h2><p class="lead">부하 테스트 없이 계산할 수 있는 것은 "가상 디스크 큐 기준 상한"까지입니다. 동시에 처리할 수 있는 요청 수(queue_depth 합계)를 1건 평균 처리 시간으로 나눈 값입니다. '
-                 '실제로는 부하가 늘면 처리 시간도 늘고 vSAN 쪽이 먼저 막히므로, 이 값은 <b>넘을 수 없는 천장</b>이지 도달 가능한 값이 아닙니다.</p>')
+        h.append('<h2>한계 추정</h2><p class="lead">부하 테스트 없이 계산할 수 있는 것은 "{} 큐 기준 상한"까지입니다. 동시에 처리할 수 있는 요청 수(queue_depth 합계)를 1건 평균 처리 시간으로 나눈 값입니다. '
+                 '실제로는 부하가 늘면 처리 시간도 늘고 {}이 먼저 막히므로, 이 값은 <b>넘을 수 없는 상한</b>이지 도달 가능한 값이 아닙니다.</p>'.format(
+                     "장치" if kind == "baremetal" else "가상 디스크",
+                     {"vmware": "vSAN 쪽", "baremetal": "디스크 자체"}.get(kind, "스토리지 백엔드")))
         if R.get("q_ceiling"):
             use = 100.0 * (A["iops_p95"] or 0) / R["q_ceiling"]
-            h.append('<table><tr><th>항목</th><th>값</th></tr><tr><td>Guest 큐 기준 이론 상한</td><td class="n">{}</td></tr>'
-                     '<tr><td>이번 측정 p95</td><td class="n">{}</td></tr><tr><td>천장 대비 사용</td><td class="n"><b>{:.0f}%</b></td></tr></table>'.format(
-                         fmt(R["q_ceiling"], 0, " IOPS"), fmt(A["iops_p95"], 0, " IOPS"), use))
+            h.append('<table><tr><th>항목</th><th>값</th></tr><tr><td>{} 큐 기준 이론 상한</td><td class="n">{}</td></tr>'
+                     '<tr><td>이번 측정 p95</td><td class="n">{}</td></tr><tr><td>상한 대비 사용</td><td class="n"><b>{:.0f}%</b></td></tr></table>'.format(
+                         "OS" if kind == "baremetal" else "Guest", fmt(R["q_ceiling"], 0, " IOPS"), fmt(A["iops_p95"], 0, " IOPS"), use))
         else:
             h.append('<p class="note">측정 구간의 I/O가 적거나 queue_depth를 읽지 못해 계산하지 않았습니다.</p>')
         h.append('<p class="note">실제 한계는 서비스 투입 전이나 점검 시간에 <code>es_disk_bench.sh</code>로 재고 <code>--bench</code> 옵션으로 넣으면 "최대 능력 대비 사용률"이 이 자리에 표시됩니다.</p>')
@@ -2063,7 +2562,7 @@ def render(R, out_path):
                      E(a.get("queue/logical_block_size", "-")), E(a.get("queue/physical_block_size", "-")),
                      fmt(st.get("r_await_p95"), 2, "ms"), fmt(st.get("w_await_p95"), 2, "ms"), fmt(st.get("iops_p95"), 0),
                      fmt(st.get("aqu_p95"), 2), fmt(st.get("inflight_p95"), 1), fmt(st.get("util_p95"), 0, "%")))
-    h.append('</table></div><p class="note">%util은 참고용입니다. vSAN·SSD처럼 요청을 병렬로 처리하는 장치는 %util이 100%여도 여유가 있을 수 있어 판정에 쓰지 않았습니다. '
+    h.append('</table></div><p class="note">%util은 참고용입니다. vSAN·SSD·NVMe·RAID 처럼 요청을 병렬로 처리하는 장치는 %util이 100%여도 여유가 있을 수 있어 판정에 쓰지 않았습니다. '
              'aqu p95는 블록 계층에서 대기 중인 요청까지 포함한 시간 평균이라 queue_depth를 넘을 수 있고, inflight p95는 장치에 넘겨져 처리 중인 I/O 수라 queue_depth와 직접 비교됩니다. '
              '병목 위치 판정은 두 값을 함께 봅니다.</p>')
 
@@ -2115,14 +2614,30 @@ def render(R, out_path):
     h.append('<table><tr><th>지표</th><th>출처</th><th>알 수 있는 것</th><th>판정에 쓰는 방식</th></tr>')
     rows = [
         ("응답시간 r_await / w_await", "/proc/diskstats (iostat과 같은 원본, 직접 계산)", "ES가 실제로 겪는 I/O 1건당 지연", "p95로 판정. I/O 적은 구간 제외"),
-        ("대기 I/O aqu-sz ÷ queue_depth", "/proc/diskstats, /sys/block/*/device/queue_depth", "지연이 VM 안(큐)에서 생기는지 밖에서 생기는지", "병목 위치 분리"),
+        ("대기 I/O aqu-sz ÷ queue_depth", "/proc/diskstats, /sys/block/*/device/queue_depth",
+         {"vmware": "지연이 VM 안(큐)에서 생기는지 밖에서 생기는지",
+          "baremetal": "지연이 부하 포화 때문인지 장치 자체가 느린 것인지" if R.get("attach") != "san" else "지연이 서버 쪽 LUN 큐에서 생기는지 어레이 쪽에서 생기는지"
+          }.get(kind, "지연이 VM 안(큐)에서 생기는지 밖에서 생기는지"), "병목 위치 분리"),
         ("PSI io some/full", "/proc/pressure/io (커널 4.20+, RHEL8은 psi=1 필요)", "작업이 I/O 때문에 멈춘 시간 비율", "포화 판정"),
         ("ES 스레드 D 상태", "/proc/<pid>/task/*/stat", "ES 스레드가 디스크 때문에 멈춘 순간", "포화 판정"),
         ("iowait · procs_blocked", "/proc/stat", "추세 참고 (CPU가 바쁘면 낮게 나와 단독 판정 불가)", "참고만"),
         ("ES major fault · 물리 읽기/쓰기", "/proc/<pid>/stat, /proc/<pid>/io", "page cache에 없어 디스크를 읽은 양", "캐시 부족형 병목 판정"),
         ("swap · dirty page", "/proc/vmstat, /proc/meminfo", "메모리 압박이 디스크로 번지는지", "메모리 판정"),
-        ("CPU steal · balloon · 메모리 예약/한도", "/proc/stat, vmware-toolbox-cmd stat", "호스트 자원 경합과 VM 자원 설정", "VMware 자원 판정"),
-        ("커널 로그", "journalctl -k / dmesg (최근 7일)", "vSAN 순간 정지 흔적 (abort/reset, hung task)", "오류 판정"),
+    ]
+    if kind == "vmware":
+        rows += [("CPU steal · balloon · 메모리 예약/한도", "/proc/stat, vmware-toolbox-cmd stat", "호스트 자원 경합과 VM 자원 설정", "VMware 자원 판정"),
+                 ("커널 로그", "journalctl -k / dmesg (최근 7일)", "vSAN 순간 정지 흔적 (abort/reset, hung task)", "오류 판정")]
+    elif kind == "baremetal":
+        rows += [("장치 종류·연결 방식", "/sys/block/*/queue/rotational, SCSI host 드라이버, dm-multipath, /sys/class/nvme", "NVMe·SSD·HDD, RAID 논리 디스크, SAN 여부", "판정 기준 선택"),
+                 ("NVMe 온도·PCIe 링크", "/sys/class/nvme/*/hwmon, */device/current_link_*", "온도 제한, 링크 속도·폭 저하", "하드웨어 판정"),
+                 ("소프트웨어 RAID", "/proc/mdstat", "resync·recovery 진행, degraded", "하드웨어 판정"),
+                 ("CPU governor", "/sys/devices/system/cpu/cpu0/cpufreq", "절전 정책이 I/O 처리를 늦추는지", "하드웨어 판정"),
+                 ("SMART (--smart 때만)", "smartctl -H -A", "디스크 자체 건강 상태", "하드웨어 판정"),
+                 ("커널 로그", "journalctl -k / dmesg (최근 7일)", "Medium Error, 컨트롤러·PCIe 오류, 경로 소실, abort/reset", "오류 판정")]
+    else:
+        rows += [("CPU steal", "/proc/stat", "호스트 CPU 경합", "가상화 자원 판정"),
+                 ("커널 로그", "journalctl -k / dmesg (최근 7일)", "스토리지 백엔드 정지 흔적 (abort/reset, hung task)", "오류 판정")]
+    rows += [
         ("ES node stats 변화량", "_nodes/_local/stats (조회 API 2회)", "인덱싱 스로틀, 거절, flush·검색 지연", "ES 영향 판정"),
         ("설정값", "/sys/block, sysctl, mount, udev, ES 설정", "readahead·스케줄러·타임아웃·limits 등", "설정 판정"),
         ("과거 이력", "sysstat sar 파일 (이미 기록된 것)", "측정 창 밖의 피크", "주의 알림"),
@@ -2141,13 +2656,20 @@ def render(R, out_path):
     h.append('<table><tr><th>항목</th><th>상시 수집 지표</th><th>이 도구</th><th>왜 필요한가</th></tr>')
     gaps = [
         ("응답시간 백분위", "10~30초 평균값만 저장", "p95 + I/O 적은 구간 제외", "평균은 짧은 지연 급등을 지워 버립니다"),
-        ("병목 위치 판정", "없음", "대기 I/O ÷ queue_depth 로 VM 안/밖 구분", "VMware 관리자에게 넘길지 서버에서 풀지가 갈립니다"),
+        ("병목 위치 판정", "없음", "대기 I/O ÷ queue_depth 로 " + {"vmware": "VM 안/밖 구분", "baremetal": "포화/장치 이상 구분"}.get(kind, "VM 안/밖 구분"),
+         "{}에게 넘길지 서버에서 풀지가 갈립니다".format(R.get("out_owner", "VMware 관리자"))),
         ("PSI (I/O 압박)", "Linux integration에 pressure 지표 일부", "io some/full 을 측정 구간 전체로 계산", "iowait보다 정확한 포화 지표"),
         ("ES 스레드 D 상태", "없음", "ES 스레드만 골라 카운트", "ES가 실제로 디스크에 멈춰 있었는지"),
         ("블록 장치 설정 전수", "없음", "readahead·scheduler·timeout·iostats·wbt 등", "설정 문제는 지표로 안 보이고 설정을 봐야 압니다"),
         ("LVM·파티션 토폴로지", "없음", "dm → 물리 디스크 역추적, 정렬 확인", "ES 경로가 실제로 어느 디스크인지"),
-        ("커널 로그 상관", "없음 (로그는 별도 수집)", "SCSI abort/reset·hung task 분류", "vSAN 순간 정지의 흔적"),
-        ("VMware 자원", "없음", "balloon·host swap·예약·limit", "메모리 회수는 디스크 문제로 위장해 나타납니다"),
+        ("커널 로그 상관", "없음 (로그는 별도 수집)", "SCSI abort/reset·hung task·컨트롤러 오류 분류",
+         "vSAN 순간 정지의 흔적" if kind == "vmware" else "장치·경로 장애의 흔적"),
+    ]
+    if kind == "vmware":
+        gaps.append(("VMware 자원", "없음", "balloon·host swap·예약·limit", "메모리 회수는 디스크 문제로 위장해 나타납니다"))
+    elif kind == "baremetal":
+        gaps.append(("스트라이프 구성원별 비교", "디스크별 지표는 있으나 비교 판정 없음", "같은 묶음 안에서 한 디스크만 느린지", "불량 디스크 하나가 전체 묶음을 늦춥니다"))
+    gaps += [
         ("스토리지 IRQ 편중", "없음", "측정 구간 IRQ 분포", "vCPU 한 개에 몰리면 IOPS가 거기서 막힙니다"),
         ("mmap 여유", "없음", "현재 매핑 수 / max_map_count", "한도에 닿으면 인덱싱이 실패합니다"),
         ("인덱스별 쓰기 분포", "인덱스 지표는 있으나 노드 로컬 관점 아님", "이 노드 샤드의 인덱스별 delta + ILM phase", "디스크를 쓰는 주체를 인덱스까지 좁힘"),
@@ -2158,17 +2680,21 @@ def render(R, out_path):
     h.append('</table>')
     h.append('<p class="note">반대로 상시 수집 지표가 더 나은 영역도 분명합니다. 장기 추세, 여러 노드 동시 시계열, 경보 자동화는 Elastic 쪽이 맞습니다. '
              '이 도구는 그 경보가 울린 순간에 한 번 깊게 파는 용도입니다. 상시 경보 기준은 GUARDLINE.md 4장에 정리했습니다.</p>')
-    h.append('<p><b>Guest OS에서 원리상 볼 수 없는 것</b><br>아래 항목은 판정에 넣지 않았고, 필요하면 VMware 관리자에게 확인해야 합니다.</p>')
+    if kind == "vmware":
+        h.append('<p><b>Guest OS에서 원리상 볼 수 없는 것</b><br>아래 항목은 판정에 넣지 않았고, 필요하면 VMware 관리자에게 확인해야 합니다.</p>')
+    elif kind == "baremetal":
+        h.append('<p><b>OS에서 원리상 볼 수 없는 것</b><br>아래 항목은 판정에 넣지 않았고, 필요하면 {}에게 확인해야 합니다.</p>'.format(E(R.get("out_owner"))))
+    else:
+        h.append('<p><b>Guest OS에서 원리상 볼 수 없는 것</b><br>아래 항목은 판정에 넣지 않았고, 필요하면 {}에게 확인해야 합니다.</p>'.format(E(R.get("out_owner"))))
     h.append('<table><tr><th>항목</th><th>왜 중요한가</th><th>관리자 확인 방법</th></tr>')
-    blind = [
-        ("vSAN 스토리지 정책 (RAID·FTT·stripe·IOPS 제한)", "OSA에서 RAID-5/6은 쓰기마다 읽기-수정-쓰기가 생겨 RAID-1보다 쓰기 지연이 큽니다. 정책의 IOPS 제한은 그 이상을 막습니다.", "VM 스토리지 정책 확인"),
-        ("ES 복제본 × vSAN 복제의 쓰기 증폭", "ES 복제본 1 + vSAN FTT=1(RAID-1)이면 문서 하나가 물리적으로 4벌 기록됩니다. 가용성은 ES에서도 보장되므로 용량·쓰기 부하 설계 때 함께 고려해야 합니다.", "스토리지 정책 + ES 인덱스 replicas 비교"),
-        ("VM 스냅샷 존재", "스냅샷이 남아 있으면 쓰기가 delta 파일로 가서 성능이 떨어집니다.", "vCenter 스냅샷 관리자"),
-        ("같은 호스트의 ES 노드 배치", "ES primary와 replica가 같은 ESXi 호스트에 있으면 호스트 장애 한 번에 둘 다 잃습니다.", "DRS anti-affinity 규칙 + ES shard allocation awareness"),
-        ("vSAN 네트워크·resync·캐시 사용률", "Guest에서는 쓰기 지연으로만 간접 관측됩니다.", "vSAN 성능 서비스, esxtop DAVG/KAVG"),
-        ("실제 물리 디스크 상태·지연", "Guest의 SMART 조회는 가상 디스크라 의미가 없습니다.", "vSAN Skyline Health"),
-        ("vNUMA 경계, CPU hot-add", "CPU hot-add를 켜면 vNUMA가 꺼져 메모리 접근이 느려질 수 있습니다.", "VM 고급 설정"),
-    ]
+    if kind == "vmware":
+        blind = BLIND_VMWARE
+    elif kind == "baremetal" and R.get("attach") == "san":
+        blind = BLIND_SAN
+    elif kind == "baremetal":
+        blind = BLIND_BAREMETAL
+    else:
+        blind = BLIND_VM
     for r in blind:
         h.append('<tr>' + "".join('<td>{}</td>'.format(E(c)) for c in r) + '</tr>')
     h.append('</table>')
@@ -2241,7 +2767,8 @@ def main():
     ap.add_argument("bundle", nargs="?")
     ap.add_argument("--cluster-only")
     ap.add_argument("-o", "--out")
-    ap.add_argument("--storage", choices=["allflash", "hybrid"])
+    ap.add_argument("--storage", choices=["auto", "allflash", "hybrid", "nvme", "ssd", "hdd"])
+    ap.add_argument("--platform", choices=["auto", "vmware", "baremetal", "vm"])
     ap.add_argument("--bench")
     ap.add_argument("--cluster")
     a = ap.parse_args()
@@ -2254,7 +2781,7 @@ def main():
     if not a.bundle:
         ap.error("노드 번들 경로 또는 --cluster-only <클러스터 번들> 이 필요합니다")
     base = open_bundle(a.bundle)
-    R = analyze(base, a.storage, a.bench, a.cluster)
+    R = analyze(base, None if a.storage == "auto" else a.storage, a.bench, a.cluster, a.platform)
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.bundle)), "es_disk_report_{}.html".format(R["meta"].get("host", "node")))
     render(R, out)
     print(out)
