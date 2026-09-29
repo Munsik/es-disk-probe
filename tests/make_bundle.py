@@ -203,7 +203,7 @@ def build(name, out):
         for c, a in sc["nvme"].items():
             for k, v in a.items():
                 out_l.append("NVME|{}|{}|{}".format(c, k, v))
-        w(S("nvme"), "\n".join(out_l) + "\n")
+        w(S("storage"), "\n".join(out_l) + "\nISCSI|sessions|0\n")
 
     # 샘플: 5초 간격 25개
     n_s, dt = 25, 5.0
