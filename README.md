@@ -476,6 +476,8 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 샘플 리포트: `docs/sample_node_report.html`(VMware Guest), `docs/sample_baremetal_report.html`(bare-metal, HDD RAID5 에서 CacheVault 이상으로 쓰기 캐시가 write-through 로 떨어진 사례),
 `docs/sample_cluster_report.html`(클러스터 원격 조회). 모두 합성 데이터입니다.
 
+기준값을 최신 문서와 대조한 기록과 남은 업데이트 항목은 `docs/UPDATE_NOTES.md` 에 있습니다.
+
 ---
 
 ## 판정 읽는 법

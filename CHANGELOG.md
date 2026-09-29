@@ -113,6 +113,7 @@ VMware 판정은 그대로다 (합성 번들 3종에서 0.9.5 와 판정 목록 
 - systemd-detect-virt 새 값(vm-other, container-other, apple, sre 등) 반영
 - 문구 정정: TuneD virtual-guest(swappiness 30·dirty_ratio 30), PSI 는 RHEL 8·9·10 모두 psi=1 필요, NVMe temp1_max 는 "현재 과열 임계값(기본 WCTEMP)"
 - 셸 요약의 thin pool 파싱을 컬럼 위치 고정 대신 thin-pool 다음 칸 기준으로
+- 남은 업데이트 항목과 버전별 재확인 기준을 `docs/UPDATE_NOTES.md` 로 정리
 
 ### SMART
 - bare-metal 에서는 기본으로 조회 (`--no-hw` 로 끔). VM 에서는 가상 장치라 건너뜀. RAID 컨트롤러 뒤 디스크는 컨트롤러 도구가 대신 봄
