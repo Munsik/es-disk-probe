@@ -21,7 +21,7 @@ TOOL_VERSION = "0.10.0"
 # 기준값 (출처를 함께 표기. 리포트에도 그대로 노출)
 # ─────────────────────────────────────────────────────────────────────────────
 # OS에서 관측한 디스크 응답시간(ms). Elastic이 공식 수치를 제시하지는 않는다.
-# - vSAN(allflash/hybrid): Broadcom KB 389082 의 VM 관점 정상 범위(All-Flash <5ms, Hybrid <20ms)를 기준
+# - vSAN(allflash/hybrid): Broadcom KB 389082 의 vSAN 성능 화면 정상 범위(flash <5ms, hybrid <20ms)를 기준. ESA 도 flash 기준
 # - bare-metal·SAN(nvme/ssd/hdd): Broadcom KB 424485 의 장치 관점 경보 기준
 #   (NVMe >1ms, 엔터프라이즈 SSD >3ms, HDD >25ms, HDD 30ms 초과는 critical)을 '주의' 선으로 둔다.
 #   bare-metal 에는 hypervisor·가상 SCSI 계층이 없어 장치 관점 수치가 곧 OS 관점 기대치다.
@@ -44,17 +44,17 @@ STORAGE_LABEL = {"allflash": "vSAN All-Flash", "hybrid": "vSAN Hybrid", "nvme": 
                  "hdd": "HDD", "vm": "가상 디스크 공통", "vmware": "VMware 공유 스토리지",
                  "vmfs": "VMware SAN·NFS 데이터스토어", "cloud": "클라우드 블록 볼륨", "network": "네트워크 블록 스토리지"}
 LAT_SRC = {
-    "vsan": "[VMware 공식] Broadcom KB 389082. All-Flash 5ms 미만 / Hybrid 20ms 미만을 정상으로 제시. "
+    "vsan": "[VMware 공식] Broadcom KB 389082 (vSAN 7·8). vSAN 성능 화면의 읽기·쓰기 지연이 flash 5ms 미만 / hybrid 20ms 미만이면 정상으로 제시. "
             "주의·경고·위험 3단계 구분은 실무 기준이며 Elastic 공식 수치는 없음",
     "device": "[VMware 공식] Broadcom KB 424485 의 장치 관점 경보 기준(NVMe 1ms, 엔터프라이즈 SSD 3ms, HDD 25ms 초과, "
-              "HDD 30ms 초과 critical)을 주의 선으로 사용. vSAN 문서지만 수치는 장치 자체의 기대치. "
+              "30ms 초과는 critical 신호)을 주의 선으로 사용. vSAN 문서지만 수치는 장치 자체의 기대치. "
               "경고·위험 단계는 실무 기준이며 Elastic 공식 수치는 없음",
-    "vm": "[실무 기준] 하이퍼바이저·스토리지 백엔드를 알 수 없어 Broadcom KB 389082 의 VM 관점 수치(5ms)를 공통 기준으로 차용. "
+    "vm": "[실무 기준] 하이퍼바이저·스토리지 백엔드를 알 수 없어 Broadcom KB 389082 의 flash 수치(5ms)를 공통 기준으로 차용. "
           "Elastic 공식 수치는 없음",
     "vmware": "[실무 기준] Guest 에서는 데이터스토어가 vSAN 인지 SAN·NFS 인지 알 수 없어 Broadcom KB 389082 의 "
-              "All-Flash VM 관점 수치(5ms)를 공통 기준으로 사용. Elastic 공식 수치는 없음",
+              "flash 수치(5ms)를 공통 기준으로 사용. Elastic 공식 수치는 없음",
     "cloud": "[실무 기준] 클라우드 블록 볼륨은 네트워크를 거치는 원격 스토리지라 로컬 SSD 기준을 쓸 수 없어 "
-             "Broadcom KB 389082 의 VM 관점 수치(5ms)를 공통 기준으로 차용. 볼륨 종류별 기대치는 각 클라우드 문서를 따름",
+             "Broadcom KB 389082 의 flash 수치(5ms)를 공통 기준으로 차용. 볼륨 종류별 기대치는 각 클라우드 문서를 따름",
 }
 MIN_IOS_PER_INTERVAL = 20      # 이보다 I/O가 적은 구간은 응답시간 통계에서 제외 (소수 I/O 노이즈 방지)
 LOW_LOAD_IOPS = 50             # p95 IOPS 가 이보다 낮고
@@ -236,20 +236,23 @@ class Topo(object):
 #   attach : virtual | local | san | nvmeof | cloud
 # 수집기는 근거만 모으고 여기서 판정한다. 확실한 근거가 없으면 bare-metal 로 단정하지 않는다.
 # ─────────────────────────────────────────────────────────────────────────────
-CONTAINER_IDS = ("docker", "podman", "lxc", "lxc-libvirt", "systemd-nspawn", "openvz", "rkt", "wsl", "proot", "pouch")
+CONTAINER_IDS = ("docker", "podman", "lxc", "lxc-libvirt", "systemd-nspawn", "openvz", "rkt", "wsl", "proot", "pouch", "container-other")
 HV_LABEL = {"vmware": "VMware", "kvm": "KVM", "qemu": "QEMU", "microsoft": "Hyper-V", "xen": "Xen",
             "amazon": "AWS Nitro", "google": "Google Compute Engine", "oracle": "VirtualBox", "powervm": "IBM PowerVM",
-            "zvm": "IBM z/VM", "parallels": "Parallels", "bhyve": "bhyve", "unknown-vm": "알 수 없는 hypervisor"}
+            "zvm": "IBM z/VM", "parallels": "Parallels", "bhyve": "bhyve", "qnx": "QNX", "acrn": "ACRN", "apple": "Apple Virtualization",
+            "sre": "SRE", "bochs": "Bochs", "uml": "UML", "vm-other": "알 수 없는 hypervisor", "unknown-vm": "알 수 없는 hypervisor"}
 FC_DRV = ("qla2xxx", "lpfc", "bfa", "qedf", "bnx2fc", "fnic", "zfcp", "csiostor")
 ISCSI_DRV = ("iscsi_tcp", "be2iscsi", "bnx2i", "qedi", "cxgb3i", "cxgb4i", "ib_iser")
-RAID_DRV = ("megaraid_sas", "hpsa", "smartpqi", "aacraid", "arcmsr", "3w-9xxx", "3w-sas", "mpt2sas", "mpt3sas", "mptsas")
+RAID_DRV = ("megaraid_sas", "mpi3mr", "hpsa", "smartpqi", "aacraid", "arcmsr", "3w-9xxx", "3w-sas", "mpt2sas", "mpt3sas", "mptsas")
 # mpt*sas 는 IT(HBA) 모드면 디스크를 그대로 넘기므로 모델명으로 RAID 논리 디스크인지 한 번 더 본다
 RAID_MODEL = re.compile(r'PERC|LOGICAL VOLUME|MR9\d|MegaRAID|ServeRAID|RAID|Virtual Disk|AVAGO|SmartArray|ThinkSystem R', re.I)
 SAN_VENDOR = re.compile(r'^(PURE|NETAPP|3PARdata|HITACHI|HP HSV|EMC|DGC|IBM\s+2145|IBM\s+2107|HUAWEI|Nimble|NEXSAN|FUJITSU|DataCore|COMPELNT|Dell EMC|XtremIO|INFINIDAT|LIO-ORG|TrueNAS)', re.I)
 VM_DISK_VENDOR = re.compile(r'^(VMware|QEMU|Msft|Virtual|Google|Amazon|0x1af4|RHEV|Xen|NUTANIX)', re.I)
 # 클라우드 볼륨(네트워크 블록)과 인스턴스 로컬 디스크를 모델명으로 구분한다
-CLOUD_BLOCK_MODEL = re.compile(r'Amazon Elastic Block Store|PersistentDisk|nvme_card-pd', re.I)
-CLOUD_LOCAL_MODEL = re.compile(r'Amazon EC2 NVMe Instance Storage|Microsoft NVMe Direct Disk|nvme_card$|EphemeralDisk|Google EphemeralDisk', re.I)
+# AWS: EBS·instance store 는 NVMe 모델명. Azure: 원격 디스크 "MSFT NVMe Accelerator v1", 로컬 "Microsoft NVMe Direct Disk v1/v2",
+# SCSI 는 Msft Virtual Disk. GCP: NVMe PD·Hyperdisk "nvme_card-pd", Local SSD "nvme_card" (다중 컨트롤러면 nvme_card0 ...)
+CLOUD_BLOCK_MODEL = re.compile(r'Amazon Elastic Block Store|MSFT NVMe Accelerator|PersistentDisk|nvme_card-pd', re.I)
+CLOUD_LOCAL_MODEL = re.compile(r'Amazon EC2 NVMe Instance Storage|Microsoft NVMe Direct Disk|nvme_card\d*$|EphemeralDisk', re.I)
 
 def parse_storage(text):
     nv, fc, iscsi = {}, [], 0
@@ -580,25 +583,121 @@ def load_hwraid(S, topo):
         t = rd(S, fname)
         if not t:
             continue
-        if t.startswith("#TOOL_ABSENT"):
-            absent.append(t.split(None, 1)[1].strip()); continue
+        if "#CMD" not in t:
+            for l in t.splitlines():
+                if l.startswith("#TOOL_ABSENT"):
+                    absent.append(l.split(None, 1)[1].strip())
+            continue
         try:
             r = fn(t)
         except Exception:
+            r = None
+        if r is None or (not r.get("vds") and not r.get("ctrl") and fname == "raid_storcli"):
+            # storcli2·perccli2 JSON 은 키 이름이 공개 문서로 확정되지 않았다. 해석을 못 하면 원문만 번들에 남긴다
+            absent.append("#UNPARSED " + ("storcli2" if "#TOOL storcli2" in t else fname.replace("raid_", "")))
             continue
-        # OS 장치 이름이 없으면 SCSI 주소로 잇는다. megaraid 는 논리 디스크를 channel 2, target = VD 번호로,
-        # aacraid 는 channel 0, target = LD 번호로 내보낸다
-        drv_chan = {"storcli": ("megaraid_sas", "2"), "arcconf": ("aacraid", "0")}.get(r["tool"])
+        # OS 장치 이름이 없으면 SCSI 주소로 잇는다.
+        # megaraid_sas: channel 0·1 은 물리 디스크, 2 이상이 논리 디스크. VD 번호 = (channel-2)*128 + target
+        # aacraid: channel 0, target = LD 번호. mpi3mr 는 channel 이 고정되지 않아 OS Drive Name 으로만 잇는다
         for v in r["vds"]:
             if v.get("dev"):
                 v["dev"] = v["dev"].replace("/dev/", "")
-            elif drv_chan:
-                for d, h in topo.hctl.items():
-                    H, C, T, L = h.split(":")
-                    if topo.hostdrv.get("host" + H) == drv_chan[0] and C == drv_chan[1] and T == str(v.get("id")):
-                        v["dev"] = d
+                continue
+            for d, h in topo.hctl.items():
+                try:
+                    H, C, T, L = (int(x) for x in h.split(":"))
+                except ValueError:
+                    continue
+                drv = topo.hostdrv.get("host%d" % H)
+                if r["tool"] == "storcli" and drv == "megaraid_sas" and C >= 2 and (C - 2) * 128 + T == int(v.get("id") or -1):
+                    v["dev"] = d
+                elif r["tool"] == "arcconf" and drv == "aacraid" and C == 0 and T == int(v.get("id") or -1):
+                    v["dev"] = d
         res.append(r)
     return res, absent
+
+def wm_high(groups, total_bytes):
+    """실제로 적용되는 high watermark 사용률(%)과 표시 문구.
+    ES 8.5+ 는 비율을 직접 지정하지 않았으면 max_headroom(high 기본 150GB)도 함께 적용해, 큰 디스크에서는
+    여유 공간이 150GB 로 줄어드는 시점이 기준이 된다 (둘 중 늦게 오는 쪽)"""
+    groups = groups or {}
+    merged, explicit = {}, set()
+    for grp in ("defaults", "persistent", "transient"):
+        for k, v in (groups.get(grp) or {}).items():
+            merged[k] = v
+            if grp != "defaults":
+                explicit.add(k)
+    key = "cluster.routing.allocation.disk.watermark.high"
+    hi = str(merged.get(key, "90%"))
+    if not hi.endswith("%"):
+        return None, hi
+    pct = num(hi.rstrip("%"))
+    hr = merged.get(key + ".max_headroom")
+    if pct is None or key in explicit or not hr or not total_bytes:
+        return pct, hi
+    hb = parse_bytes(hr)
+    if not hb or hb <= 0:
+        return pct, hi
+    eff = max(pct, 100.0 * (total_bytes - hb) / total_bytes)
+    if eff > pct + 0.5:
+        return eff, "{} 또는 여유 {} 중 늦은 쪽 = {:.0f}%".format(hi, hr, eff)
+    return pct, hi
+
+
+def parse_bytes(v):
+    m = re.match(r'^\s*([\d.]+)\s*([kmgtp]?b?)\s*$', str(v or ""), re.I)
+    if not m:
+        return None
+    mul = {"": 1, "b": 1, "k": 1024, "kb": 1024, "m": 1024 ** 2, "mb": 1024 ** 2, "g": 1024 ** 3, "gb": 1024 ** 3,
+           "t": 1024 ** 4, "tb": 1024 ** 4, "p": 1024 ** 5, "pb": 1024 ** 5}[m.group(2).lower()]
+    return float(m.group(1)) * mul
+
+
+def parse_ebs_stats(text):
+    """nvme amzn stats / ebsnvme stats 결과. 장치별 한도 초과 누적 시간(us).
+    JSON(키 이름)과 사람이 읽는 형식(섹션 제목 + IOPS/Throughput 줄) 둘 다 읽는다"""
+    out, dev, sect = {}, None, None
+    keys = (("vol_iops", r'volume.*exceeded.*iops'), ("vol_tp", r'volume.*exceeded.*(tp|throughput)'),
+            ("inst_iops", r'instance.*exceeded.*iops'), ("inst_tp", r'instance.*exceeded.*(tp|throughput)'))
+    def put(k, v):
+        try:
+            out.setdefault(dev, {})[k] = int(float(v))
+        except (TypeError, ValueError):
+            pass
+    def walk(o, pre=""):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                walk(v, pre + "_" + str(k).lower())
+        elif isinstance(o, (int, float)):
+            for name, pat in keys:
+                if re.search(pat, pre):
+                    put(name, o); break
+    for l in (text or "").splitlines():
+        if l.startswith("#DEV "):
+            dev, sect = l.split()[1], None; continue
+        if dev is None:
+            continue
+        st = l.strip()
+        if st.startswith("{"):
+            try:
+                walk(json.loads(st))
+            except ValueError:
+                pass
+            continue
+        low = st.lower()
+        if "performance exceeded" in low:
+            sect = "inst" if "instance" in low else "vol"; continue
+        m = re.match(r'^"?([a-z0-9_]+)"?\s*[:=]\s*(\d+)', low)
+        if m and "exceeded" in m.group(1):
+            for name, pat in keys:
+                if re.search(pat, m.group(1)):
+                    put(name, m.group(2)); break
+            continue
+        m = re.match(r'^(iops|throughput)\s*:\s*(\d+)', low)
+        if m and sect:
+            put(sect + ("_iops" if m.group(1) == "iops" else "_tp"), m.group(2))
+    return out
+
 
 def classify_devices(phys, topo, sto, dmtable, hwraid=None, cloud=""):
     """ES data 물리 디스크별 매체·연결 방식. bare-metal·SAN 기준값 선택에 쓴다."""
@@ -1008,7 +1107,7 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
             "name": b.get("name", nid[:8]), "roles": ",".join(r for r in (b.get("roles") or []) if r in
                      ("data", "data_hot", "data_warm", "data_cold", "data_frozen", "data_content", "master", "ingest", "ml")),
             "busy": busy, "rops": rops, "wops": wops, "rmb": rmb, "wmb": wmb,
-            "used_pct": (100.0 * (tot - avail) / tot) if (tot and avail is not None) else None,
+            "used_pct": (100.0 * (tot - avail) / tot) if (tot and avail is not None) else None, "tot_b": tot,
             "store_gb": (dig(b, "indices", "store", "size_in_bytes") or 0) / 1024.0 ** 3,
             "idx_rate": (idx_n / dt) if idx_n is not None else None,
             "idx_ms": (idx_t / float(idx_n)) if (idx_t is not None and idx_n) else None,
@@ -1060,13 +1159,15 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
     cs = j("cluster_settings.json") or {}
     for grp in ("defaults", "persistent", "transient"):
         settings.update(cs.get(grp) or {})
-    hi = str(settings.get("cluster.routing.allocation.disk.watermark.high", "90%"))
-    hi_pct = num(hi.rstrip("%")) if hi.endswith("%") else None
-    over = [r for r in data_rows if r["used_pct"] is not None and hi_pct and r["used_pct"] >= hi_pct - 5]
+    over = []
+    for r in data_rows:
+        lim, lab = wm_high(cs, r.get("tot_b"))
+        if r["used_pct"] is not None and lim and r["used_pct"] >= lim - 5:
+            over.append((r, lim, lab))
     if over:
-        sev = "crit" if any(r["used_pct"] >= (hi_pct or 90) for r in over) else "caution"
+        sev = "crit" if any(r["used_pct"] >= lim for r, lim, _ in over) else "caution"
         add(sev, "클러스터", "ES 설정", "디스크 사용률이 watermark에 도달했거나 근접한 노드 있음",
-            ", ".join("{} {:.0f}%".format(r["name"], r["used_pct"]) for r in over[:6]) + " (high {})".format(hi),
+            ", ".join("{} {:.0f}% (high {})".format(r["name"], r["used_pct"], lab) for r, lim, lab in over[:6]),
             "high watermark를 넘으면 ES가 샤드를 다른 노드로 옮깁니다. 이 복사 작업 자체가 큰 디스크 부하라, 느려서 넘쳤는데 더 느려지는 악순환이 생깁니다.",
             "ILM 정책 점검으로 오래된 인덱스를 정리하거나 용량을 늘리세요. 임시로 watermark를 올리는 것은 원인을 미루는 것뿐입니다.",
             "[Elastic 공식] Disk-based shard allocation")
@@ -1399,6 +1500,31 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
                 OUT, fmt(mx, 0 if not unit else 1, unit)),
             "[실무 기준] 상한 근처 구간 30~90%, 대기 I/O 2배 이상일 때 판정")
 
+    # ── AWS EBS: 볼륨·인스턴스 한도를 넘긴 시간 (Nitro NVMe 로그 페이지, 누적 us) ─────────
+    ebs0, ebs1 = parse_ebs_stats(rd(S, "ebs_stats_start")), parse_ebs_stats(rd(S, "ebs_stats_end"))
+    win = (snaps[-1]["t"] - snaps[0]["t"]) if len(snaps) >= 2 else 0
+    EBS, ebs_sevs = {}, []
+    for d_ in phys:
+        a_, b_ = ebs0.get(d_), ebs1.get(d_)
+        if not a_ or not b_ or win <= 0:
+            continue
+        EBS[d_] = {k: max(b_[k] - a_.get(k, 0), 0) / 1e6 for k in b_ if k in a_}
+    if EBS:
+        for scope, lab, fix in (("vol", "EBS 볼륨", "볼륨의 IOPS·처리량 설정 상향(gp3 프로비저닝 값, io2) 또는 볼륨 여러 개로 분산(LVM stripe)"),
+                                ("inst", "EC2 인스턴스의 EBS", "EBS 대역폭이 더 큰 인스턴스 유형으로 변경 (볼륨을 올려도 효과 없음)")):
+            hit = [(d_, v.get(scope + "_iops", 0), v.get(scope + "_tp", 0)) for d_, v in EBS.items()
+                   if max(v.get(scope + "_iops", 0), v.get(scope + "_tp", 0)) >= 0.01 * win]
+            if hit:
+                worst = max(max(h[1], h[2]) for h in hit) / win
+                ebs_sevs.append("warn" if worst >= 0.1 else "caution")
+                add(ebs_sevs[-1], "포화", "가상화·클라우드 관리자",
+                    "{} 성능 한도를 넘긴 시간이 있음 (AWS 가 직접 보고)".format(lab),
+                    ", ".join("{}: IOPS 한도 초과 {:.1f}초 · 처리량 한도 초과 {:.1f}초".format(h[0], h[1], h[2]) for h in hit)
+                    + " (측정 {:.0f}초 중)".format(win),
+                    "Nitro 가 요청량이 {} 한도를 넘은 시간을 누적해 알려 줍니다. 이 시간 동안 I/O 는 한도에 맞춰 늦춰졌습니다. "
+                    "추정이 아니라 AWS 가 기록한 값입니다.".format(lab),
+                    fix + ".", "[AWS 공식] EBS detailed performance statistics (nvme amzn stats)")
+
     # ═════════════ 1. 지연 ═════════════
     r_sev, w_sev = grade(A["r_await_p95"], th), grade(A["w_await_p95"], th)
     lat_ev = "읽기 p95 {} / 평균 {} · 쓰기 p95 {} / 평균 {} (I/O {}건 이상 구간만 집계: 읽기 {}구간, 쓰기 {}구간)".format(
@@ -1439,7 +1565,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         fmt(A["aqu_p95"], 1),
         " · 장치 처리 중(inflight) p95 {}".format(fmt(A["inflight_p95"], 1)) if A["inflight_p95"] is not None else "",
         int(qd_total) if qd_total else "미확인")
-    QSRC = ("[VMware 공식] KB 2053145. PVSCSI 기본 큐 64(device)/254(adapter), ring_pages 8→32 및 cmd_per_lun 254 권장. "
+    QSRC = ("[VMware 공식] KB 343323 (구 2053145). PVSCSI 기본 큐 64(device)/254(adapter), ring_pages 8→32 및 cmd_per_lun 254 권장. "
             "게스트 내부 지연과 VM/VMDK 레벨 지연의 차이가 큐 깊이 낮은 컨트롤러의 큐 고갈에서 비롯될 수 있다는 서술은 "
             "Broadcom 'Troubleshooting vSAN Performance'. 큐 사용률 구간(40%·80%)은 실무 기준")
     if kind == "vmware" and SEV_ORDER.get(lat_sev, 0) >= SEV_ORDER["caution"]:
@@ -1454,7 +1580,8 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
                 q_ev,
                 "가상 디스크가 동시에 받을 수 있는 I/O 수가 한계에 닿아, 요청이 VM 안에서 줄을 서고 있습니다. 백엔드가 빨라도 이 구간은 느려집니다.",
                 "ES data용 VMDK를 여러 개로 나눠 별도 PVSCSI 컨트롤러에 붙이고 LVM stripe로 묶는 방법이 가장 효과적입니다. "
-                "그다음 PVSCSI queue depth 상향(cmd_per_lun=254, ring_pages=32, 재부팅 필요)을 검토하세요.", QSRC)
+                "그다음 PVSCSI queue depth 상향(cmd_per_lun=254, ring_pages=32, 재부팅 필요)을 검토하세요. "
+                "vSAN ESA 라면 가상 NVMe 컨트롤러로 바꾸는 것도 방법입니다.", QSRC)
         elif qratio >= 0.4:
             # 큐도 깊고 지연도 높다 → 한쪽으로 단정할 수 없는 구간
             add("warn" if lat_sev in ("warn", "crit") else "caution", "지연", "원인 분리 필요",
@@ -1463,8 +1590,8 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
                 "큐가 절반 이상 차 있으면서 응답시간도 높습니다. 백엔드가 느려서 요청이 밀려 큐가 쌓인 것일 수도 있고, "
                 "큐가 좁아서 대기가 길어진 것일 수도 있어 한쪽으로 단정할 수 없습니다. 두 원인은 함께 나타나는 경우가 많습니다.",
                 "VMware 관리자에게 같은 시각의 esxtop DAVG(백엔드)와 KAVG(커널·큐 대기) 분리 확인을 요청하세요. "
-                "DAVG가 크면 VM 바깥, KAVG가 크면 큐 쪽입니다. 장치 레벨 기대치는 Broadcom KB 424485 기준으로 "
-                "NVMe 0.5ms 미만, SAS/SATA SSD 1ms 내외, HDD 10~20ms 입니다. "
+                "DAVG가 크면 VM 바깥, KAVG가 크면 큐 쪽입니다(Broadcom KB 344099: 셋 다 10ms 넘는 상태가 이어지면 문제). 장치 레벨 기대치는 Broadcom KB 424485 기준으로 "
+                "NVMe 0.5ms 미만, SSD 1ms 이하, HDD 10~20ms 입니다. "
                 "동시에 Guest에서는 VMDK 분할 + 별도 PVSCSI 컨트롤러로 큐를 넓히는 방안을 검토합니다.", QSRC)
         else:
             add("warn" if lat_sev in ("warn", "crit") else "caution", "지연", "VMware 관리자",
@@ -1482,7 +1609,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
                     "데이터스토어와 스토리지 어레이 볼륨의 응답시간, 경로 상태를",
                     "이 VM의 데이터스토어 종류(vSAN 또는 SAN·NFS)와 그에 맞는 지연 지표(vSAN 성능 서비스 또는 어레이 볼륨 응답시간)를")
                 + " 같은 시각으로 확인 요청하세요. 장치 레벨 기대치는 Broadcom KB 424485 기준으로 "
-                "NVMe 0.5ms 미만, SAS/SATA SSD 1ms 내외, HDD 10~20ms 입니다. 이 범위를 넘으면 백엔드 쪽을 먼저 봅니다.", QSRC)
+                "NVMe 0.5ms 미만, SSD 1ms 이하, HDD 10~20ms 입니다. 이 범위를 넘으면 백엔드 쪽을 먼저 봅니다.", QSRC)
     # 쓰기만 느림 → vSAN 쓰기 경로 힌트
     write_only = bool(A["w_await_p95"] and A["r_await_p95"] and A["valid_w"] >= 3 and A["valid_r"] >= 3
                       and A["w_await_p95"] >= th["caution"] and A["w_await_p95"] > 3 * A["r_await_p95"])
@@ -1692,7 +1819,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
     iow = [r.get("iowait") for r in sysr if r.get("iowait") is not None]
     dst = [r.get("es_dstate") for r in sysr if r.get("es_dstate") is not None]
     blk = [r.get("blocked") for r in sysr if r.get("blocked") is not None]
-    sat_sevs = []
+    sat_sevs = list(ebs_sevs)       # AWS 가 직접 보고한 한도 초과는 실측 포화로 본다
     if psi_full:
         pf95 = pctl(psi_full, 0.95)
         s = "warn" if pf95 >= 20 else "caution" if pf95 >= 5 else "ok"
@@ -1717,7 +1844,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
     else:
         add("info", "포화", "참고", "PSI(Pressure Stall Information) 미지원 또는 비활성",
             "/proc/pressure/io 없음",
-            "RHEL 8은 커널에 포함돼 있지만 기본 비활성입니다. 켜면 I/O 포화를 가장 정확하게 볼 수 있습니다.",
+            "RHEL 8·9·10은 커널에 포함돼 있지만 기본 비활성입니다. 켜면 I/O 포화를 가장 정확하게 볼 수 있습니다.",
             "필요 시 커널 부트 파라미터 psi=1 추가 후 재부팅 (운영 변경이므로 정기 점검 때 검토). 이번 판정은 D-state·큐·지연으로 대신합니다.",
             "RHEL 8 커널 문서")
     if dst:
@@ -1879,16 +2006,22 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         if m:
             heap = int(m.group(1)) * (1024 ** 3 if m.group(2) in "gG" else 1024 ** 2)
     heap_mb = heap / 1048576.0 if heap else None
+    # compressed oops 사용 여부는 ES 가 직접 알려 준다(true/false). 값이 없으면 30GB 를 경계로 본다
+    # (Elastic: 대부분 26GB 까지 안전, 일부 시스템은 30GB 까지)
+    coops = str(dig(node_i, "jvm", "using_compressed_ordinary_object_pointers") or "").lower()
+    heap_big = (coops == "false") if coops in ("true", "false") else bool(heap_mb and heap_mb > 30 * 1024)
     store_b = dig(n1 or {}, "indices", "store", "size_in_bytes")
     if heap_mb and mem_total_mb:
         cache_mb = mem_total_mb - heap_mb
         hr = heap_mb / mem_total_mb
-        if hr > 0.5 or heap_mb > 31 * 1024:
+        if hr > 0.5 or heap_big:
             mem_sevs.append("caution")
             add("caution", "메모리·캐시", "ES 설정", "heap 비중이 커서 page cache 몫이 줄어듦",
                 "heap {} / RAM {} ({:.0f}%)".format(fmt(heap_mb / 1024, 1, "GB"), fmt(mem_total_mb / 1024, 1, "GB"), hr * 100),
-                "ES는 segment 읽기를 page cache에 기댑니다. heap이 RAM의 50%를 넘거나 compressed oops 경계(약 31GB)를 넘으면 캐시가 줄어 디스크 읽기가 늘어납니다.",
-                "heap을 RAM의 50% 이하, 31GB 이하로 맞추는 것이 Elastic 권고입니다.", "[Elastic 공식] Set the JVM heap size")
+                "ES는 segment 읽기를 page cache에 기댑니다. heap이 RAM의 50%를 넘거나 compressed oops 한도를 넘으면 캐시가 줄어 디스크 읽기가 늘어납니다."
+                + (" 이 노드는 compressed oops 를 쓰지 못하고 있습니다." if coops == "false" else ""),
+                "Elastic 권고는 heap 자동 설정(기본값)을 쓰는 것입니다. 직접 정한다면 RAM의 50% 이하, compressed oops 한도 이하(대부분 26GB 까지 안전, 일부 30GB)로 맞추세요.",
+                "[Elastic 공식] JVM settings > Set the JVM heap size")
         ratio_txt = ""
         if store_b:
             ratio = cache_mb * 1048576.0 / store_b
@@ -2007,7 +2140,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
             cfg_sevs.append(s)
             add(s, "설정", "서버 담당자", "ES data 경로 파일시스템이 {}".format(m["fs"]), "{} on {}".format(m["mnt"], m["src"]),
                 "ES는 로컬 블록 장치 위의 xfs/ext4를 전제로 합니다. 네트워크 파일시스템은 잠금·fsync 동작이 달라 위험합니다.",
-                "xfs 또는 ext4 로컬 볼륨으로 이전하세요.", "[Elastic 공식] Hardware. 로컬 스토리지 권장, 원격 파일시스템 회피")
+                "xfs 또는 ext4 로컬 볼륨으로 이전하세요.", "[Elastic 공식] Tune for indexing speed > Local vs. remote storage (직결 로컬 스토리지가 일반적으로 더 빠름). 네트워크 파일시스템 금지는 [실무 기준]")
         if "strictatime" in opts:
             cfg_sevs.append("caution")
             add("caution", "설정", "서버 담당자", "strictatime 마운트. 읽을 때마다 메타데이터 쓰기", m["opts"],
@@ -2065,17 +2198,12 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         add("warn", "설정", "서버 담당자", "열린 파일 핸들이 한도의 80% 초과", "{} / {}".format(int(fdc), nofile),
             "샤드·segment 수가 많아 한도에 근접했습니다.", "한도 상향과 함께 샤드 수 정리를 검토하세요.", "/proc/<pid>/fd")
     # 디스크 용량 · watermark
-    wm = {}
-    for grp in ("defaults", "persistent", "transient"):
-        for k, v in ((csettings or {}).get(grp) or {}).items():
-            wm[k] = v
-    hi = wm.get("cluster.routing.allocation.disk.watermark.high", "90%")
-    hi_pct = num(str(hi).rstrip("%")) if str(hi).endswith("%") else None
     for line in rd(S, "df").splitlines()[1:]:
         p = line.split()
         if len(p) >= 6 and any(pm["mount"] and p[5] in (pm["mount"]["mnt"], pm["mount"].get("host_mnt")) for pm in path_map):
             use = num(p[4].rstrip("%"), 0)
-            lim_pct = hi_pct or 90
+            lim_pct, hi = wm_high(csettings, (num(p[1], 0) or 0) * 1024)
+            lim_pct = lim_pct or 90
             if use >= lim_pct:
                 cfg_sevs.append("crit")
                 add("crit", "설정", "ES 설정", "data 디스크 사용률이 high watermark 이상", "{} {}% (high {})".format(p[5], int(use), hi),
@@ -2258,7 +2386,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
                 "오히려 느려집니다. Elastic은 이 경우 1로 낮추라고 명시합니다.",
                 "index.merge.scheduler.max_thread_count를 1로 낮추는 것을 검토하세요. "
                 "인덱스 단위 동적 설정이라 재시작은 필요 없습니다. " + tail,
-                "[Elastic 공식] Merge settings (기본값은 프로세서 수의 절반, 회전 디스크면 1로 낮출 것)")
+                "[Elastic 공식] Merge settings (기본값은 프로세서 수의 절반, 9.3 이하·8.x 는 최대 4. 회전 디스크면 1로 낮출 것)")
     elif mtc:
         add("info", "ES 설정", "참고", "merge 스레드 수를 기본값과 다르게 설정한 인덱스 있음",
             ", ".join("{}={}".format(k, v) for k, v in sorted(mtc.items())[:6]),
@@ -2541,8 +2669,9 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
             vm_sevs.append("caution")
             add("caution", "VMware 자원", "VMware 관리자", "ES data 디스크가 LSI Logic/SATA 가상 컨트롤러에 연결", ", ".join(drivers),
                 "VMware는 I/O가 많은 워크로드에 PVSCSI를 권장합니다. 같은 I/O를 더 적은 CPU로 처리하고 큐도 깊게 쓸 수 있습니다.",
-                "VM 정지 후 ES data VMDK를 PVSCSI 컨트롤러로 옮기는 작업을 VMware 관리자에게 요청하세요 (Guest 드라이버 vmw_pvscsi 필요).",
-                "[VMware 공식] KB 1010398, Performance Best Practices for vSphere")
+                "VM 정지 후 ES data VMDK를 PVSCSI 컨트롤러로 옮기는 작업을 VMware 관리자에게 요청하세요 (Guest 드라이버 vmw_pvscsi 필요). "
+                "vSAN ESA 라면 가상 NVMe 컨트롤러도 선택지입니다. 디스크가 여럿이면 컨트롤러 최대 4개로 나눕니다.",
+                "[VMware 공식] Broadcom KB 313507 (PVSCSI 구성), KB 392848 (컨트롤러 분산), Troubleshooting vSAN Performance (ESA 는 가상 NVMe 권장)")
         tools = virt.get("tools_version", "absent")
         if tools == "absent":
             vm_sevs.append("caution")
@@ -2582,7 +2711,8 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
     # ── 하드웨어 (bare-metal): 장치 자체의 상태 ─────────────────────────────
     HW = {"nvme": [], "md": [], "smart": [], "fc": [], "governor": None, "raid": []}
     if kind == "baremetal":
-        # NVMe 온도: hwmon temp1_max 는 컨트롤러의 경고 온도(WCTEMP), temp1_crit 는 위험 온도(CCTEMP).
+        # NVMe 온도: hwmon temp1_max 는 컨트롤러에 현재 설정된 과열 임계값(기본값은 경고 온도 WCTEMP),
+        # temp1_crit 는 위험 온도(CCTEMP).
         # 경고 온도를 넘으면 컨트롤러가 스스로 성능을 낮추는(thermal throttling) 구간에 들어간다
         data_ctrls = sorted(set(nvme_ctrl(d) for d in phys if nvme_ctrl(d)))
         for c in data_ctrls:
@@ -2601,13 +2731,13 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
                                                                  " · 온도 경고 비트 켜짐" if row["alarm"] == "1" else ""),
                     "NVMe는 경고 온도를 넘으면 장치를 보호하려고 스스로 성능을 낮춥니다. 이때는 부하가 그대로여도 지연이 오르고 처리량이 떨어집니다.",
                     "서버 팬 정책, 드라이브 베이 공기 흐름, 빈 슬롯 블랭크 장착 여부를 하드웨어 담당자와 확인하세요. BMC의 온도 이력도 함께 봅니다.",
-                    "Linux nvme hwmon (temp1_max = WCTEMP, temp1_crit = CCTEMP), NVMe 규격 Composite Temperature")
+                    "Linux nvme hwmon (temp1_max = 현재 과열 임계값, 기본 WCTEMP · temp1_crit = CCTEMP), NVMe 규격 Composite Temperature")
             elif row["temp"] and row["tmax"] and row["temp"] >= row["tmax"] - 5:
                 vm_sevs.append("caution")
                 add("caution", RES_DIM, OUT, "NVMe 온도가 경고 온도에 근접 ({})".format(c),
                     "현재 {:.0f}°C · 경고 온도 {:.0f}°C".format(row["temp"], row["tmax"]),
                     "경고 온도까지 5°C 이내입니다. 부하가 더 오르면 성능 제한 구간에 들어갈 수 있습니다.",
-                    "냉각 상태를 미리 점검하세요.", "Linux nvme hwmon (temp1_max = WCTEMP)")
+                    "냉각 상태를 미리 점검하세요.", "Linux nvme hwmon (temp1_max = 현재 과열 임계값, 기본 WCTEMP)")
             def gts(x):
                 m_ = re.search(r'([\d.]+)\s*GT/s', x or "")
                 return float(m_.group(1)) if m_ else None
@@ -2774,11 +2904,18 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
                     "megaraid_sas 드라이버가 컨트롤러 펌웨어 크래시를 보고했습니다. 그 순간 I/O가 멈췄을 수 있습니다.",
                     "컨트롤러 이벤트 로그와 펌웨어 버전을 하드웨어 담당자와 확인하세요.", "megaraid_sas sysfs")
         raid_data = any(devcls.get(d, {}).get("raid") for d in phys)
+        unparsed = [a.split(None, 1)[1] for a in raid_absent if a.startswith("#UNPARSED")]
+        raid_absent = [a for a in raid_absent if not a.startswith("#UNPARSED")]
+        if raid_data and not hwraid and unparsed:
+            add("info", RES_DIM, "참고", "RAID 컨트롤러 도구는 실행했지만 결과 형식을 해석하지 못함",
+                "도구: {}".format(", ".join(unparsed)),
+                "도구 출력 원문은 번들(static/raid_storcli)에 있습니다. 새 세대 컨트롤러(Broadcom MegaRAID 96xx, Dell PERC 12 이후)의 storcli2·perccli2 는 JSON 형식이 달라질 수 있습니다.",
+                "하드웨어 담당자에게 원문을 전달해 논리 디스크 상태, 쓰기 캐시 정책, 배터리 상태를 확인하세요.", "Broadcom StorCLI2 User Guide")
         if raid_data and not hwraid and raid_absent:
             add("info", RES_DIM, "참고", "RAID 컨트롤러 도구가 없어 캐시·배터리·구성 디스크 상태는 판정하지 못함",
                 "필요한 도구: {}".format(", ".join(raid_absent)),
                 "ES data 가 RAID 논리 디스크 위에 있습니다. 컨트롤러 도구가 있으면 쓰기 캐시 정책, 배터리, 구성 디스크 상태, 재구성 진행까지 자동으로 봅니다.",
-                "서버 벤더의 RAID 관리 도구(Broadcom·Dell: storcli 또는 perccli, HPE: ssacli, Microchip: arcconf)를 설치한 뒤 다시 수집하세요. "
+                "서버 벤더의 RAID 관리 도구(Broadcom·Dell: storcli 또는 perccli, MegaRAID 96xx·PERC 12 이후: storcli2 또는 perccli2, HPE: ssacli, Microchip: arcconf)를 설치한 뒤 다시 수집하세요. "
                 "조회만 하고 설정은 바꾸지 않습니다.", "RAID 컨트롤러 드라이버 " + ", ".join(sorted(set(c["drv"] for c in devcls.values() if c["raid"]))))
         if unsure and storage_auto and attach == "local":
             add("info", RES_DIM, "참고", "RAID 논리 디스크라 매체 종류를 추정으로 판정",
@@ -2854,7 +2991,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
             net_sev = sev_max(net_sev, "caution")
             add("caution", "네트워크", "VMware 관리자", "ES NIC가 e1000 에뮬레이션 사용", "{} {}".format(p[1], p[2]),
                 "ES 복제본 쓰기·샤드 복구는 ES 노드 간 네트워크로 오갑니다. 에뮬레이션 NIC는 CPU를 더 쓰고 처리량이 낮습니다.",
-                "VMXNET3로 변경을 요청하세요.", "[VMware 공식] KB 1001805 (VMXNET3)")
+                "VMXNET3로 변경을 요청하세요.", "[VMware 공식] Broadcom KB 321259 (구 1001805, VMXNET3)")
     drops = {k: v for k, v in nets.items() if (v["rx_drop"] + v["tx_drop"] + v["rx_err"] + v["tx_err"]) > 0}
     if drops:
         net_sev = sev_max(net_sev, "caution")
@@ -2872,7 +3009,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         add("info", "네트워크", "참고", "vSAN 네트워크는 Guest에서 보이지 않음" + ("" if VMBK == "vsan" else " (vSAN 데이터스토어인 경우)"),
             "Guest NIC에는 ES 트래픽만 흐름. vSAN 복제 트래픽은 ESXi vmkernel 포트로 흐름",
             "vSAN 네트워크 지연은 Guest에서 '쓰기 응답시간 증가'로만 간접 관측됩니다. 그래서 네트워크는 보조 지표로만 씁니다.",
-            "쓰기 지연이 높으면 VMware 관리자에게 vSAN 네트워크(전용 대역, 25GbE 이상 권장, 재전송·지연)를 확인 요청하세요.", "[VMware 공식] Troubleshooting vSAN Performance. 2% 패킷 손실로 스토리지 성능 32% 저하, vSwitch 드롭 0.0001% 이하 권고")
+            "쓰기 지연이 높으면 VMware 관리자에게 vSAN 네트워크(전용 대역, 패킷 손실·재전송·지연)를 확인 요청하세요.", "[VMware 공식] Troubleshooting vSAN Performance (VCF 9.1). 패킷 손실 2%만으로 스토리지 성능이 32% 떨어질 수 있음")
 
     # ═════════════ 9. 과거 이력 (sar) ═════════════
     want = set(phys) | set(logical) | set(topo.attr.get(d, {}).get("dm/name", "") for d in logical)
@@ -2953,12 +3090,12 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
     tos = [num(topo.attr.get(d, {}).get("device/timeout")) for d in phys]
     tos = [t for t in tos if t is not None]
     if is_vmware:
-        bp("OS·블록 장치", "SCSI 명령 타임아웃", "60초 이상 (open-vm-tools 180초)", ", ".join("{}s".format(int(t)) for t in tos) or "해당 없음",
-           ("warn" if min(tos) < 60 else "ok") if tos else "na", "open-vm-tools udev 규칙")
+        bp("OS·블록 장치", "SCSI 명령 타임아웃", "180초 (open-vm-tools 기본값). 60초 미만은 경고", ", ".join("{}s".format(int(t)) for t in tos) or "해당 없음",
+           ("warn" if min(tos) < 60 else "ok") if tos else "na", "open-vm-tools udev 규칙 (180초). 60초 경계는 [실무 기준]")
     qds = [topo.attr.get(d, {}).get("device/queue_depth") for d in phys if topo.attr.get(d, {}).get("device/queue_depth")]
     if is_vmware:
         bp("OS·블록 장치", "가상 디스크 queue_depth", "기본값 유지, 큐 포화가 확인될 때만 상향(254)", ", ".join(qds) or "-",
-           ("warn" if (qratio or 0) >= 0.8 else "ok") if qds else "na", "VMware KB 2053145")
+           ("warn" if (qratio or 0) >= 0.8 else "ok") if qds else "na", "VMware KB 343323 (구 2053145)")
     elif qds:
         bp("OS·블록 장치", "LUN queue_depth" if attach == "san" else "장치 queue_depth", "큐 사용률 80% 미만",
            "{} · 큐 사용률 p95 {}".format(", ".join(qds), fmt((qratio or 0) * 100, 0, "%") if qratio is not None else "-"),
@@ -3016,13 +3153,13 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         bp("OS·블록 장치", "tuned profile", "virtual-guest (VM 권고). readahead·dirty_ratio를 바꿀 수 있어 함께 확인",
            tuned_prof or "미확인",
            "ok" if tuned_prof.lower().endswith("virtual-guest") else ("na" if not tuned_prof else "info"),
-           "[Red Hat 공식] TuneD profiles (virtual-guest는 throughput-performance 기반, swappiness를 낮추고 dirty_ratio를 올림)")
-    bp("커널", "PSI(I/O 압박 지표)", "사용 가능 (RHEL 8은 psi=1)", sysctl.get("psi", "-"), "ok" if sysctl.get("psi") == "available" else "info", "커널 문서")
+           "[Red Hat 공식] TuneD profiles (virtual-guest는 throughput-performance 기반. swappiness 30·dirty_ratio 30, throughput-performance 는 10·40)")
+    bp("커널", "PSI(I/O 압박 지표)", "사용 가능 (RHEL 8·9·10은 psi=1 필요)", sysctl.get("psi", "-"), "ok" if sysctl.get("psi") == "available" else "info", "커널 문서")
     bp("ES 프로세스", "파일 핸들 한도", "65535 이상", nofile or "-", ("ok" if (nofile == "unlimited" or num(nofile, 0) >= 65535) else "crit") if nofile else "na", "Elastic 공식")
     if heap_mb and mem_total_mb:
-        bp("ES 프로세스", "JVM heap", "RAM의 50% 이하, 약 31GB 이하",
+        bp("ES 프로세스", "JVM heap", "RAM의 50% 이하, compressed oops 사용 (자동 설정 권장)",
            "{:.1f}GB / RAM {:.1f}GB ({:.0f}%)".format(heap_mb / 1024, mem_total_mb / 1024, 100 * heap_mb / mem_total_mb),
-           "caution" if (heap_mb / mem_total_mb > 0.5 or heap_mb > 31 * 1024) else "ok", "Elastic 공식")
+           "caution" if (heap_mb / mem_total_mb > 0.5 or heap_big) else "ok", "Elastic 공식")
     bp("ES 프로세스", "cgroup I/O 제한", "없음", "있음" if (cg and re.search(r'(rbps|wbps|riops|wiops)=\d', cg)) else "없음",
        "warn" if (cg and re.search(r'(rbps|wbps|riops|wiops)=\d', cg)) else "ok", "cgroup v2")
     bp("구성", "OS와 ES data 디스크 분리", "별도 디스크" if kind == "baremetal" else "별도 가상 디스크",
@@ -3061,7 +3198,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
             bp("VMware", "하이퍼바이저 swap", "0", "{} MB".format(hsw), "ok" if not hsw else "crit", "VMware")
         nics = [p_[2].replace("driver=", "") for p_ in netinfo]
         if nics:
-            bp("VMware", "NIC", "VMXNET3", ", ".join(sorted(set(nics))), "caution" if any("e1000" in n for n in nics) else "ok", "[VMware 공식] KB 1001805 (VMXNET3)")
+            bp("VMware", "NIC", "VMXNET3", ", ".join(sorted(set(nics))), "caution" if any("e1000" in n for n in nics) else "ok", "[VMware 공식] Broadcom KB 321259 (구 1001805, VMXNET3)")
     if kind == "baremetal":
         cls_txt = ", ".join("{} {}{}".format(d, STORAGE_LABEL.get(c["media"], c["media"] or "-"),
                                              "" if c["sure"] else "(추정)") for d, c in sorted(devcls.items()))
@@ -3114,8 +3251,10 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
     for line in rd(S, "df").splitlines()[1:]:
         p_ = line.split()
         if len(p_) >= 6 and any(pm["mount"] and p_[5] in (pm["mount"]["mnt"], pm["mount"].get("host_mnt")) for pm in path_map):
-            use = num(p_[4].rstrip("%"), 0); lp = hi_pct or 90
-            bp("ES 용량", "data 디스크 사용률 ({})".format(p_[5]), "high watermark({})보다 10%p 이상 여유".format(hi), "{}%".format(int(use)),
+            use = num(p_[4].rstrip("%"), 0)
+            lp, hl = wm_high(csettings, (num(p_[1], 0) or 0) * 1024)
+            lp = lp or 90
+            bp("ES 용량", "data 디스크 사용률 ({})".format(p_[5]), "high watermark({})보다 10%p 이상 여유".format(hl), "{}%".format(int(use)),
                "crit" if use >= lp else ("caution" if use >= lp - 10 else "ok"), "Elastic 공식")
 
 
@@ -3203,7 +3342,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         aw_ = CL["settings"].get("cluster.routing.allocation.awareness.attributes")
         bp("ES 클러스터", "shard allocation awareness", "ESXi 호스트 단위로 설정", aw_ or "미설정", "ok" if aw_ else "info", "Elastic 공식")
         rmax_ = CL["settings"].get("indices.recovery.max_bytes_per_sec", "40mb")
-        bp("ES 클러스터", "indices.recovery.max_bytes_per_sec", "기본 40mb, 복구가 서비스를 방해하면 조정", rmax_, "info", "Elastic 공식")
+        bp("ES 클러스터", "indices.recovery.max_bytes_per_sec", "기본 40mb (전용 cold·frozen 노드는 메모리에 따라 최대 250mb), 복구가 서비스를 방해하면 조정", rmax_, "info", "Elastic 공식")
         cl_sev = sev_max(*[f.sev for f in F if f.dim == "클러스터"]) if any(f.dim == "클러스터" for f in F) else "ok"
 
     dims = [
@@ -3296,7 +3435,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
     return {
         "meta": meta, "storage": storage, "th": th, "es_version": es_version, "is_vmware": is_vmware,
         "platform": kind, "plat": plat, "attach": attach, "devcls": devcls, "storage_auto": storage_auto,
-        "media_note": media_note, "unsure": unsure, "HW": HW, "vmbk": VMBK, "raid_absent": raid_absent,
+        "media_note": media_note, "unsure": unsure, "EBS": EBS, "HW": HW, "vmbk": VMBK, "raid_absent": raid_absent,
         "PROC": PROC, "DM": DM, "DEVERR": DEVERR, "out_owner": OUT, "res_dim": RES_DIM, "sto": sto, "src_lat": src_lat,
         "os": kv(rd(S, "os-release")).get("PRETTY_NAME", "").strip('"'), "kernel": (rd(S, "uname").split() + ["", "", ""])[2],
         "ncpu": ncpu, "mem_gb": mem_total_mb / 1024.0, "path_map": path_map, "phys": phys, "logical": logical,
@@ -3434,7 +3573,7 @@ BLIND_SAN = [
 ]
 BLIND_VM = [
     ("호스트 스토리지 백엔드와 캐시", "가상 디스크 뒤의 실제 스토리지 종류와 캐시 설정은 VM에서 보이지 않습니다.", "하이퍼바이저 관리 화면의 디스크 지연·캐시 모드"),
-    ("볼륨 IOPS·처리량 한도", "클라우드 볼륨과 일부 하이퍼바이저는 디스크별·VM별 한도를 둡니다. 한도에 닿으면 수치가 평평하게 막힙니다.", "클라우드 콘솔의 볼륨 성능 지표(한도 도달 여부)"),
+    ("볼륨 IOPS·처리량 한도", "클라우드 볼륨과 일부 하이퍼바이저는 디스크별·VM별 한도를 둡니다. 한도에 닿으면 수치가 평평하게 막힙니다. AWS EBS 는 nvme-cli(amzn 플러그인)가 있으면 한도 초과 시간을 직접 읽습니다.", "클라우드 콘솔의 볼륨 성능 지표(한도 도달 여부), AWS 는 nvme amzn stats"),
     ("같은 호스트의 다른 VM", "다른 VM의 I/O와 CPU 경합은 steal과 지연으로만 간접 관측됩니다.", "호스트 단위 성능 지표"),
     ("ES 노드 배치", "ES primary와 replica가 같은 물리 호스트(또는 같은 가용 영역)에 있으면 한 번의 장애로 둘 다 잃습니다.", "anti-affinity 규칙 + ES shard allocation awareness"),
 ]
@@ -3788,7 +3927,7 @@ def render(R, out_path):
          {"vmware": "지연이 VM 안(큐)에서 생기는지 밖에서 생기는지",
           "baremetal": "지연이 부하 포화 때문인지 장치 자체가 느린 것인지" if R.get("attach") != "san" else "지연이 서버 쪽 LUN 큐에서 생기는지 어레이 쪽에서 생기는지"
           }.get(kind, "지연이 VM 안(큐)에서 생기는지 밖에서 생기는지"), "병목 위치 분리"),
-        ("PSI io some/full", "/proc/pressure/io (커널 4.20+, RHEL8은 psi=1 필요)", "작업이 I/O 때문에 멈춘 시간 비율", "포화 판정"),
+        ("PSI io some/full", "/proc/pressure/io (커널 4.20+, RHEL 8·9·10은 psi=1 필요)", "작업이 I/O 때문에 멈춘 시간 비율", "포화 판정"),
         ("ES 스레드 D 상태", "/proc/<pid>/task/*/stat", "ES 스레드가 디스크 때문에 멈춘 순간", "포화 판정"),
         ("iowait · procs_blocked", "/proc/stat", "추세 참고 (CPU가 바쁘면 낮게 나와 단독 판정 불가)", "참고만"),
         ("ES major fault · 물리 읽기/쓰기", "/proc/<pid>/stat, /proc/<pid>/io", "page cache에 없어 디스크를 읽은 양", "캐시 부족형 병목 판정"),

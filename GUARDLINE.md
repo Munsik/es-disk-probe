@@ -22,7 +22,7 @@ Guest OS에서는 바꿀 수 없고, 나중에 바꾸려면 VM 정지나 데이�
 |---|---|---|---|
 | 메모리 예약 | VM 메모리 100% 예약 | 예약 안 된 만큼은 호스트가 부족할 때 balloon·swap으로 회수됩니다. 가장 먼저 page cache가 줄어 검색이 디스크를 더 읽게 됩니다 | [VMware] |
 | 메모리·CPU limit | 설정하지 않음 | limit을 넘는 메모리는 항상 balloon·swap 대상입니다 | [VMware] |
-| 가상 SCSI 컨트롤러 | PVSCSI | 같은 I/O를 더 적은 CPU로 처리하고 큐를 깊게 씁니다 | [VMware] |
+| 가상 디스크 컨트롤러 | PVSCSI. vSAN ESA면 가상 NVMe(vNVMe)도 권장 | 같은 I/O를 더 적은 CPU로 처리하고 큐를 깊게 씁니다. 디스크가 여럿이면 컨트롤러 최대 4개로 나눕니다 | [VMware] KB 392848, Troubleshooting vSAN Performance |
 | 디스크 분리 | OS 디스크와 ES data 디스크를 별도 VMDK로. data VMDK는 별도 PVSCSI 컨트롤러에 | 컨트롤러 하나의 큐를 OS 로그와 ES가 나눠 쓰지 않게 합니다 | [VMware] |
 | NIC | VMXNET3 | 복제본 쓰기·샤드 복구가 ES 노드 간 네트워크로 오갑니다 | [VMware] |
 | 스토리지 정책 | 쓰기가 많은 hot 노드는 RAID-1(미러) 우선 검토. vSAN ESA는 VMware가 RAID-5/6도 RAID-1 수준 성능이라고 설명 | OSA의 RAID-5/6은 쓰기마다 읽기-수정-쓰기가 생겨 쓰기 지연이 늘어납니다 | [VMware] |
@@ -50,8 +50,8 @@ Storage I/O Control·디스크 IOPS 한도, ESXi 경로 정책(Round Robin 등)�
 | 여러 디스크 묶기 | RAID 0 또는 LVM stripe | ES replica가 이중화를 맡습니다. RAID 1/10과 겹치면 같은 문서를 여러 벌 씁니다 | [Elastic] |
 | RAID 5/6 | hot 노드에는 피함 | 쓰기마다 읽기-수정-쓰기가 생깁니다 | [실무] |
 | 컨트롤러 캐시 | 배터리(또는 flash) 보호 write-back. 배터리 상태 정기 점검 | 캐시가 write-through로 바뀌면 fsync마다 디스크까지 가서 쓰기 지연이 크게 늘어납니다 | [실무] |
-| RAID 관리 도구 | 벤더 도구(storcli·perccli, ssacli, arcconf)를 OS에 설치해 둠 | 진단 도구가 캐시·배터리·구성 디스크 상태를 자동으로 봅니다. 장애 때 확인 시간도 줄어듭니다 | [실무] |
-| NVMe 냉각 | 드라이브 베이 공기 흐름 확보, 빈 슬롯 블랭크 장착 | 경고 온도(WCTEMP)를 넘으면 장치가 스스로 성능을 낮춥니다 | [OS] NVMe 규격 |
+| RAID 관리 도구 | 벤더 도구(storcli·perccli, MegaRAID 96xx·PERC 12 이후는 storcli2·perccli2, ssacli, arcconf)를 OS에 설치해 둠 | 진단 도구가 캐시·배터리·구성 디스크 상태를 자동으로 봅니다. 장애 때 확인 시간도 줄어듭니다 | [실무] |
+| NVMe 냉각 | 드라이브 베이 공기 흐름 확보, 빈 슬롯 블랭크 장착 | 과열 임계값(기본 경고 온도 WCTEMP)을 넘으면 장치가 스스로 성능을 낮춥니다 | [OS] NVMe 규격 |
 | NVMe 슬롯 | 장치가 지원하는 PCIe 세대·레인 수로 연결되는 슬롯 | 링크가 낮게 잡히면 최대 처리량이 그만큼 줄어듭니다 | [OS] |
 | BIOS 전원 정책 | 성능 우선 프로파일 검토 (벤더 가이드 확인) | 절전 상태에서 깨어나는 시간이 I/O 완료 처리에 더해집니다 | [실무] |
 | 랙·전원 분산 | ES 노드를 여러 랙·전원 계통에 나누고 awareness 설정 | 한 랙 장애로 primary와 replica를 동시에 잃지 않게 합니다 | [Elastic] |
@@ -66,7 +66,7 @@ Storage I/O Control·디스크 IOPS 한도, ESXi 경로 정책(Round Robin 등)�
 | I/O 스케줄러 | VM: mq-deadline 또는 none (cfq/bfq 피함). bare-metal: NVMe·SSD none 또는 kyber, HDD mq-deadline 또는 bfq | `cat /sys/block/sdX/queue/scheduler` | [OS] Red Hat |
 | tuned profile | VM: virtual-guest. bare-metal: throughput-performance | `tuned-adm active` | [OS] Red Hat |
 | CPU governor | bare-metal: performance (throughput-performance가 설정) | `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor` | [OS] Red Hat |
-| SCSI 타임아웃 | VMware: 60초 이상. open-vm-tools 설치 시 180초로 자동 설정. bare-metal 로컬 디스크는 커널 기본 30초, SAN은 multipath 벤더 권고 | `cat /sys/block/sdX/device/timeout` | [VMware] |
+| SCSI 타임아웃 | VMware: open-vm-tools 설치 시 180초로 자동 설정(60초 미만은 경고, [실무]). bare-metal 로컬 디스크는 커널 기본 30초, SAN은 multipath 벤더 권고 | `cat /sys/block/sdX/device/timeout` | [VMware] |
 | I/O 통계 | `queue/iostats` = 1 | `cat /sys/block/sdX/queue/iostats` | [OS] |
 | 파일시스템 | xfs 또는 ext4, 로컬 블록 장치. NFS 금지 | `findmnt -T <path.data>` | [Elastic] |
 | 마운트 옵션 | noatime 또는 relatime. `discard` 대신 `fstrim.timer` | `findmnt -o OPTIONS` | [OS] |
@@ -77,14 +77,14 @@ Storage I/O Control·디스크 IOPS 한도, ESXi 경로 정책(Round Robin 등)�
 | 파일 핸들 | 65535 이상 | `cat /proc/<pid>/limits` | [Elastic] |
 | open-vm-tools | VMware만. 설치 | `vmware-toolbox-cmd -v` | [VMware] |
 | 소프트웨어 RAID 점검 일정 | bare-metal md: 정기 check를 서비스 피크 밖으로 | `cat /proc/mdstat`, `/etc/cron.d/raid-check` | [OS] |
-| PSI | RHEL 8은 부트 파라미터 `psi=1`로 켜 두면 포화 진단이 정확해짐 | `cat /proc/pressure/io` | [OS] |
+| PSI | RHEL 8·9·10은 기본 비활성. 부트 파라미터 `psi=1`로 켜 두면 포화 진단이 정확해짐 | `cat /proc/pressure/io` | [OS] |
 | write barrier | `nobarrier`, `barrier=0` 금지. 전원이 끊기면 파일시스템이 깨질 수 있음 (xfs 는 커널 4.19부터 옵션 자체가 없어짐) | `findmnt -o OPTIONS -T <path.data>` | [OS] |
 | LVM thin pool | ES data 는 thick LV 권장. thin 이면 데이터·메타 사용률 80% 전에 확장, 100%면 쓰기가 멈춤 | `lvs -o lv_name,data_percent,metadata_percent` | [OS] Red Hat |
 | LVM snapshot | ES data LV 에 snapshot 을 오래 두지 않음. 원본에 쓸 때마다 복사가 일어나 쓰기가 느려짐 | `lvs -o lv_name,origin` | [OS] Red Hat |
 | 같은 디스크 공유 | swap, path.repo(스냅샷 저장소), path.logs 는 ES data 와 다른 디스크 | `swapon --show`, `findmnt -T <경로>` | [Elastic] |
 | 장치 오류 카운터 | `iotmo_cnt`·`ioerr_cnt` 가 늘면 경로·장치 점검 | `cat /sys/block/sdX/device/iotmo_cnt` | [OS] |
 
-**PVSCSI queue depth 상향(cmd_per_lun=254, ring_pages=32)은 VMware에서도 기본 적용 대상이 아닙니다.** 진단 리포트에서 "Guest 큐 포화"가 확인됐을 때만 적용합니다. 재부팅이 필요합니다. [VMware KB 2053145]
+**PVSCSI queue depth 상향(cmd_per_lun=254, ring_pages=32)은 VMware에서도 기본 적용 대상이 아닙니다.** 진단 리포트에서 "Guest 큐 포화"가 확인됐을 때만 적용합니다. 재부팅이 필요합니다. [Broadcom KB 343323 (구 2053145)]
 
 ---
 
@@ -92,44 +92,43 @@ Storage I/O Control·디스크 IOPS 한도, ESXi 경로 정책(Round Robin 등)�
 
 | 항목 | 기준 | 이유 | 출처 |
 |---|---|---|---|
-| JVM heap | RAM의 50% 이하, 약 31GB 이하 | 나머지 RAM이 page cache가 되어 segment 읽기를 받아 줍니다 | [Elastic] |
+| JVM heap | 자동 설정(기본값) 권장. 직접 정하면 RAM의 50% 이하, compressed oops 한도 이하(대부분 26GB 까지 안전, 일부 30GB) | 나머지 RAM이 page cache가 되어 segment 읽기를 받아 줍니다 | [Elastic] |
 | path.data | 경로 하나 (여러 디스크는 OS에서 LVM stripe로 묶음) | 다중 data path는 7.13부터 deprecated | [Elastic] |
-| disk watermark | 기본값(85/90/95%) 유지, 사용률은 high보다 10%p 이상 여유 | high를 넘으면 샤드 이동 자체가 큰 디스크 부하가 됩니다 | [Elastic] |
+| disk watermark | 기본값(85/90/95%) 유지, 사용률은 high보다 10%p 이상 여유. 8.5부터 비율을 직접 지정하지 않으면 여유 공간 기준(max_headroom 200/150/100GB)도 함께 적용돼 큰 디스크는 더 늦게 걸림 | high를 넘으면 샤드 이동 자체가 큰 디스크 부하가 됩니다 | [Elastic] |
 | shard allocation awareness | VMware: ESXi 호스트 단위. bare-metal: 랙·전원 계통 단위. 클라우드: 가용 영역 단위 | ES는 노드가 어느 호스트·랙에 있는지 모릅니다 | [Elastic] |
-| 복구 속도 | `indices.recovery.max_bytes_per_sec` 기본 40mb 유지. 복구가 서비스를 방해할 때만 조정 | 올리면 복구는 빨라지지만 그동안 디스크를 더 씁니다 | [Elastic] |
+| 복구 속도 | `indices.recovery.max_bytes_per_sec` 기본 40mb(전용 cold·frozen 노드는 메모리에 따라 최대 250mb) 유지. 복구가 서비스를 방해할 때만 조정 | 올리면 복구는 빨라지지만 그동안 디스크를 더 씁니다 | [Elastic] |
 | 인덱싱 위주 인덱스 | `refresh_interval` 연장 검토 (예: 30s) | refresh마다 작은 segment가 생기고 merge 부하가 늘어납니다 | [Elastic] |
 | translog | `durability: request`(기본) 유지 | `async`는 fsync를 줄이지만 장애 시 최근 데이터를 잃을 수 있습니다. 디스크 문제를 이 설정으로 덮지 않습니다 | [Elastic] |
-| merge 스레드 | HDD(bare-metal) 또는 Hybrid vSAN이면 `index.merge.scheduler.max_thread_count: 1` | 회전 디스크에서는 동시 merge가 오히려 느립니다 | [Elastic] |
+| merge 스레드 | HDD(bare-metal) 또는 Hybrid vSAN이면 `index.merge.scheduler.max_thread_count: 1`. 기본값은 프로세서 수의 절반(9.3 이하·8.x 는 최대 4) | 회전 디스크에서는 동시 merge가 오히려 느립니다 | [Elastic] |
 | 샤드 크기 | 샤드당 10~50GB 범위 | 너무 작으면 segment·mmap이 늘고, 너무 크면 복구가 오래 걸립니다 | [Elastic] |
 
 ---
 
 ## 4. 상시 감시: 이 도구와 같은 기준으로 경보 걸기
 
-진단 도구은 점검할 때만 돌립니다. 평소에는 Elastic 자체 모니터링이 같은 기준으로 경보를 내도록 연결해 두는 것이 guardline의 마지막 단계입니다.
+진단 도구는 점검할 때만 돌립니다. 평소에는 Elastic 자체 모니터링이 같은 기준으로 경보를 내도록 연결해 두는 것이 guardline의 마지막 단계입니다.
 
 ### 4-1. OS 디스크 지표
 
-수집 방식에 따라 필드 위치가 다릅니다.
+응답시간·대기 I/O 는 **Linux integration**(또는 Metricbeat `linux` 모듈)의 `iostat` 데이터셋에만 있습니다. System integration 과 Metricbeat `system` 모듈의 `diskio` 에는 이 값이 없습니다.
 
-| 수집 방식 | 데이터 위치 | 상태 |
+| 수집 방식 | 켜야 하는 것 | 필드 |
 |---|---|---|
-| Metricbeat `system` 모듈의 `diskio` | `system.diskio.iostat.*` | 기존 방식 |
-| Elastic Agent (Fleet) | **Linux integration**의 `linux.iostat.*` (System integration에는 없음) | beta |
+| Elastic Agent (Fleet) | Linux integration 의 iostat (GA, 1.1.0부터 TSDS) | `linux.iostat.*` |
+| Metricbeat | `linux` 모듈의 `iostat` metricset | `linux.iostat.*` |
 
-두 방식 모두 이 도구가 `/proc/diskstats`에서 계산하는 값과 같은 원본입니다. 아래 필드명은 Metricbeat 기준이며, Elastic Agent는 앞부분만 `linux.iostat.`으로 바뀝니다.
+예전 문서의 `system.diskio.iostat.*` 는 Metricbeat 7.17 까지만 있었고 8.0에서 없어졌습니다. 두 방식 모두 이 도구가 `/proc/diskstats`에서 계산하는 값과 같은 원본입니다.
 
 | 경보 | 필드 | 주의 | 경고 | 출처 |
 |---|---|---|---|---|
-| 읽기 응답시간 (vSAN) | `system.diskio.iostat.read.await` | All-Flash 5ms / Hybrid 10ms | 10ms / 20ms | [실무] Broadcom KB 389082 기반 |
+| 읽기 응답시간 (vSAN) | `linux.iostat.read.await` | flash 5ms / hybrid 10ms | 10ms / 20ms | [실무] Broadcom KB 389082 기반 |
 | 읽기 응답시간 (bare-metal·SAN) | 위와 같음 | NVMe 1ms / SSD 3ms / HDD 25ms | 3ms / 6ms / 30ms | [실무] Broadcom KB 424485 장치별 경보 기준 기반 |
-| 쓰기 응답시간 | `system.diskio.iostat.write.await` | 읽기와 같음 | 읽기와 같음 | [실무] |
-| 대기 I/O | `system.diskio.iostat.queue.avg_size` | queue_depth의 50% | 80% | [실무] |
+| 쓰기 응답시간 | `linux.iostat.write.await` | 읽기와 같음 | 읽기와 같음 | [실무] |
+| 대기 I/O | `linux.iostat.queue.avg_size` | queue_depth의 50% | 80% | [실무] |
 
 - 5분 평균처럼 창을 두고 걸어야 순간 튐에 경보가 난무하지 않습니다.
 - `busy`(%util)에는 경보를 걸지 않습니다. vSAN, NVMe, RAID처럼 병렬 처리하는 장치는 100%여도 여유가 있을 수 있습니다.
 - stripe로 묶은 디스크는 묶음 장치(md, dm)와 구성원 디스크 양쪽에 경보를 거세요. 한 디스크만 느린 경우는 묶음 장치 지표에서 희석됩니다.
-- Elastic Agent의 Linux iostat은 beta라 필드나 동작이 바뀔 수 있습니다. 운영 경보로 쓰기 전에 사용 중인 버전의 문서를 확인하세요.
 
 ### 4-2. ES 지표 (Stack Monitoring)
 
@@ -138,6 +137,8 @@ Storage I/O Control·디스크 IOPS 한도, ESXi 경로 정책(Round Robin 등)�
 | Disk usage | 기본 규칙 사용 (80%) | Kibana Stack Monitoring 기본 제공 |
 | Thread pool write/search rejections | 기본 규칙 사용 | 기본 제공 |
 | 인덱싱 스로틀 | `indices.indexing.throttle_time_in_millis` 증가 | ES 로그의 "now throttling indexing"과 함께 확인 |
+| merge 적체 | `thread_pool.merge` 의 queue·active 가 계속 높음 (9.1+, 8.19+) | merge 가 디스크를 못 따라가는 직접 신호. 인덱싱 스로틀로 이어짐 |
+| merge 디스크 여유 | `indices.merge.disk.watermark.high` (기본 95%, 여유 100GB) | 넘으면 새 merge 를 멈춰 segment 가 쌓이고 인덱싱이 느려짐 |
 | 노드 간 쏠림 | 특정 노드의 디스크 사용 시간이 중앙값의 2배 이상 | `es_cluster_probe.sh`로 주기 확인 가능 |
 
 ---

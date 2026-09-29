@@ -84,8 +84,10 @@ bare-metal에서는 하드웨어 상태 조회를 자동으로 합니다. VM에�
 |---|---|---|
 | SMART | `smartctl -H -A -i -n standby` (잠든 HDD는 깨우지 않음, 장치당 15초 상한) | smartmontools 설치, RAID 컨트롤러 뒤가 아닌 디스크 |
 | Broadcom·Dell RAID | `storcli64` 또는 `perccli64` 의 `/call show all J`, `/call/vall show all J`, `/call/eall/sall show all J`, `/call show patrolread J`, `/call show cc J` | megaraid_sas·mpt3sas 드라이버, 도구 설치 |
-| HPE RAID | `ssacli ctrl all show config detail` | hpsa·smartpqi 드라이버, 도구 설치 |
+| Broadcom MegaRAID 96xx·Dell PERC 12 이후 | `storcli2` 또는 `perccli2` 의 `/call show all J`, `/call/vall show all J`, `/cN/eall/sall show all J`, `/cN/sall show all J`, patrolread·cc | mpi3mr 드라이버, 도구 설치. JSON 키가 공개 문서로 확정되지 않아 해석을 못 하면 원문만 번들에 남기고 알림 |
+| HPE RAID | `ssacli ctrl all show config detail` (SR 컨트롤러). HPE MR 컨트롤러는 storcli | hpsa·smartpqi 드라이버, 도구 설치 |
 | Microchip·Adaptec RAID | `arcconf getconfig <n> AL` | aacraid·smartpqi 드라이버, 도구 설치 |
+| AWS EBS 한도 초과 | `nvme amzn stats` (nvme-cli amzn 플러그인) 또는 `ebsnvme stats -j`, 수집 시작·끝 두 번 | EBS NVMe 볼륨, 도구가 있을 때 (Amazon Linux 는 기본 포함) |
 
 벤더 도구는 실행한 디렉터리에 로그 파일(storcli.log, UcliEvt.log)을 남기는 것이 있어 결과 디렉터리 안의 임시 위치에서 실행하고 지웁니다.
 명령마다 30초 상한이 있습니다. 도구가 없으면 건너뛰고, 리포트에 "설치하면 캐시·배터리까지 자동으로 본다"고 안내합니다.
@@ -407,7 +409,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | `es_cluster_probe.sh` | (선택) 노드 접속 없이 클러스터만 원격 조회 | 조회 API GET만 |
 | `es_disk_bench.sh` | (선택) 최대 성능 측정 | 부하를 검. 점검 시간에만 |
 | `GUARDLINE.md` | 설계, 구성, 상시 감시 기준과 변경 원칙 | 문서 |
-| `tests/` | 합성 번들 생성기와 판정 테스트 (플랫폼·매체·RAID 도구별 20개 시나리오) | 서버에서 안 돌림 |
+| `tests/` | 합성 번들 생성기와 판정 테스트 (플랫폼·매체·RAID 도구별 22개 시나리오) | 서버에서 안 돌림 |
 
 ---
 
@@ -512,33 +514,35 @@ virtio-blk처럼 queue_depth가 없는 가상 디스크는 권한 문제가 아�
 | 항목 | 기준 | 출처 |
 |---|---|---|
 | readahead | 128KiB (LVM·RAID는 수 MiB로 커질 수 있음) | [Elastic 공식] Tune for search speed |
-| vm.max_map_count | 최소 262144, 권장 1048576 | [Elastic 공식] Bootstrap checks |
+| vm.max_map_count | 최소 262144, 권장 1048576 (8.16부터) | [Elastic 공식] Bootstrap checks |
 | swap | 비활성 > memory_lock > swappiness=1 | [Elastic 공식] Disable swapping |
-| JVM heap | RAM 50% 이하, 약 31GB 이하 | [Elastic 공식] Set the JVM heap size |
+| JVM heap | 자동 설정 권장. 직접 정하면 RAM 50% 이하, compressed oops 한도 이하(대부분 26GB, 일부 30GB). 노드가 알려 주는 compressed oops 사용 여부로 판정 | [Elastic 공식] JVM settings |
 | 파일 핸들 | 65535 이상 | [Elastic 공식] File descriptors |
-| disk watermark | 기본 85/90/95% | [Elastic 공식] Disk-based shard allocation |
-| 스토리지 종류 | 로컬 block device, 원격 파일시스템 회피 | [Elastic 공식] Hardware |
+| disk watermark | 기본 85/90/95%. 비율을 직접 지정하지 않았으면 max_headroom(200/150/100GB)도 적용해 실제 경계를 계산 (8.5+) | [Elastic 공식] Cluster-level shard allocation and routing settings |
+| 스토리지 종류 | 직결 로컬 스토리지가 일반적으로 더 빠름 [Elastic 공식] Tune for indexing speed. 네트워크 파일시스템(NFS·SMB) 위 data 경로는 위험으로 판정 | [실무 기준] |
 | translog durability | 기본 request는 요청마다 fsync, async는 sync_interval(기본 5s) 단위 | [Elastic 공식] Translog settings |
-| merge 스레드 수 | 기본은 프로세서 수의 절반, 회전 디스크면 1로 낮춤 | [Elastic 공식] Merge settings |
+| merge 스레드 수 | 기본은 프로세서 수의 절반(9.3 이하·8.x 는 최대 4), 회전 디스크면 1로 낮춤 | [Elastic 공식] Merge settings |
 | index.store.type | 기본 hybridfs | [Elastic 공식] Store |
 | 인덱싱용 스토리지 | SSD 권장, RAID 0 stripe, 원격 스토리지 회피 | [Elastic 공식] Tune for indexing speed |
-| vSAN 지연 (VM 관점) | All-Flash 5ms / Hybrid 20ms 미만을 정상으로 제시 | [VMware 공식] Broadcom KB 389082 |
-| vSAN 지연 (장치 관점) | NVMe 0.5ms 미만, SAS/SATA SSD 1ms 내외, HDD 10~20ms | [VMware 공식] Broadcom KB 424485 |
+| vSAN 지연 | vSAN 성능 화면 기준 flash 5ms / hybrid 20ms 미만을 정상으로 제시 (vSAN 7·8. ESA 별도 수치 없음) | [VMware 공식] Broadcom KB 389082 |
+| vSAN 지연 (장치 관점) | NVMe 0.5ms 미만, SSD 1ms 이하, HDD 10~20ms | [VMware 공식] Broadcom KB 424485 |
 | bare-metal·SAN 지연 (주의 선) | NVMe 1ms, 엔터프라이즈 SSD 3ms, HDD 25ms 초과 | [VMware 공식] Broadcom KB 424485 의 장치별 경보 기준. HDD 30ms 초과는 KB가 critical로 제시 |
 | bare-metal·SAN 지연 (경고·위험) | NVMe 3/10ms, SSD 6/15ms, HDD 30/50ms | [실무 기준] |
-| 그 밖의 VM 지연 | 5 / 10 / 20ms | [실무 기준] KB 389082 VM 관점 수치를 공통 기준으로 차용 |
+| 그 밖의 VM 지연 | 5 / 10 / 20ms | [실무 기준] KB 389082 flash 수치를 공통 기준으로 차용 |
 | I/O scheduler (bare-metal) | 고성능 SSD·NVMe none/kyber, 기존 HDD mq-deadline/bfq | [Red Hat 공식] Disk schedulers for different use cases |
 | tuned profile (bare-metal) | throughput-performance. 설치 시 컴퓨트 노드에 자동 선택, 절전 기능을 끔 | [Red Hat 공식] TuneD profiles |
 | merge 스레드 (bare-metal HDD) | 회전 디스크면 `max_thread_count` 1 | [Elastic 공식] Merge settings |
 | 로컬 대 원격 스토리지 | 직결 로컬 스토리지가 일반적으로 더 빠르고, 일부 원격 스토리지는 ES 부하에서 매우 느림 | [Elastic 공식] Tune for indexing/search speed |
-| NVMe 온도 | hwmon temp1_max(WCTEMP) 도달 시 경고 | Linux nvme hwmon, NVMe 규격 |
+| NVMe 온도 | hwmon temp1_max(현재 과열 임계값, 기본 WCTEMP) 도달 시 경고 | Linux nvme hwmon, NVMe 규격 |
 | Guest와 VMDK 지연 차이 | queue depth 낮은 컨트롤러의 큐 고갈 가능성 | [VMware 공식] Troubleshooting vSAN Performance |
-| PVSCSI 큐 | 기본 64(device) / 254(adapter), ring_pages 8에서 32로 | [VMware 공식] KB 2053145 |
+| PVSCSI 큐 | 기본 64(device) / 254(adapter), ring_pages 8에서 32로 | [VMware 공식] Broadcom KB 343323 (구 2053145) |
 | 가상 SCSI 컨트롤러 | 레거시 어댑터는 queue depth 32, PVSCSI는 64 | [VMware 공식] Troubleshooting vSAN Performance |
-| NIC | VMXNET3 | [VMware 공식] KB 1001805 |
-| vSAN 네트워크 | 패킷 손실 2%면 스토리지 성능 32% 저하 | [VMware 공식] Troubleshooting vSAN Performance |
+| NIC | VMXNET3 | [VMware 공식] Broadcom KB 321259 (구 1001805) |
+| vSAN 네트워크 | 패킷 손실 2%면 스토리지 성능 32% 저하 | [VMware 공식] Troubleshooting vSAN Performance (VCF 9.1판) |
+| esxtop DAVG·KAVG·GAVG | 10ms 넘는 상태가 이어지면 문제 | [VMware 공식] Broadcom KB 344099 |
+| AWS EBS 한도 초과 | Nitro 가 보고하는 볼륨·인스턴스 한도 초과 누적 시간. 측정 시간의 1% 이상이면 주의, 10% 이상이면 경고 | [AWS 공식] EBS detailed performance statistics. 구간은 [실무 기준] |
 | I/O scheduler | mq-deadline 또는 none | [Red Hat 공식] Setting the disk scheduler |
-| tuned profile | VM은 virtual-guest. throughput-performance 기반이고 dirty_ratio를 올림 | [Red Hat 공식] TuneD profiles |
+| tuned profile | VM은 virtual-guest. throughput-performance 기반 (swappiness 30·dirty_ratio 30, throughput-performance 는 10·40) | [Red Hat 공식] TuneD profiles (RHEL 10) |
 | 응답시간 3단계 구분 | 주의 / 경고 / 위험 | [실무 기준] KB 389082(vSAN), KB 424485(장치)를 기준으로 단계화. Elastic 공식 수치 없음 |
 | 큐 사용률 구간 | 40% / 80% | [실무 기준] 공식 수치 없음 |
 | PSI 단계 | 5% / 20% | [실무 기준] 커널 문서에 임계값 제시 없음 |
@@ -581,7 +585,7 @@ bare-metal에는 그 계층이 없어 장치 관점 수치(KB 424485)가 곧 기
 | VMware (SAN·NFS 데이터스토어) | 데이터스토어 종류와 뒤의 어레이, 어레이 쪽 응답시간, Storage I/O Control·디스크 IOPS 한도, VM snapshot, 호스트·데이터스토어 배치, ESXi 경로 정책 |
 | bare-metal 로컬 | BIOS 전원 정책. RAID 컨트롤러 도구가 없으면 캐시 정책·배터리, RAID 레벨·재구성 일정, 구성 디스크 상태도 여기에 들어감 |
 | bare-metal SAN | 어레이 쪽 응답시간과 컨트롤러 부하, 같은 어레이의 다른 서버, 볼륨 QoS 한도, SAN 스위치 포트 오류, 어레이 복제·스냅샷 일정 |
-| 그 밖의 VM·클라우드 | 호스트 스토리지 백엔드와 캐시, 볼륨 IOPS·처리량 한도, 같은 호스트의 다른 VM, ES 노드 배치 |
+| 그 밖의 VM·클라우드 | 호스트 스토리지 백엔드와 캐시, 볼륨 IOPS·처리량 한도(AWS EBS 는 nvme-cli 가 있으면 한도 초과 시간을 직접 읽음), 같은 호스트의 다른 VM, ES 노드 배치 |
 
 RAID 컨트롤러 캐시는 커널의 `queue/write_cache` 값으로 판단하지 않습니다.
 배터리로 보호되는 캐시를 "write through"로 보고하는 컨트롤러가 있어서, 그 값만으로는 캐시가 켜졌는지 알 수 없습니다.
@@ -594,7 +598,7 @@ RAID 컨트롤러 캐시는 커널의 `queue/write_cache` 값으로 판단하지
 실제 서버 없이 플랫폼·매체·부하 조합별 판정을 확인할 수 있습니다. Python 표준 라이브러리만 씁니다.
 
 ```bash
-python3 tests/run_tests.py                 # 20개 시나리오 기대 판정 검사
+python3 tests/run_tests.py                 # 22개 시나리오 기대 판정 검사
 ./es_disk_summary.sh <번들 디렉터리>         # 셸 요약 판정만 따로
 python3 tests/run_tests.py --dump /tmp/t   # 시나리오별 HTML 리포트와 판정 목록(JSON) 저장
 python3 tests/make_bundle.py --list        # 시나리오 목록
@@ -612,8 +616,8 @@ python3 tests/make_bundle.py --list        # 시나리오 목록
 | `path.data` 표기 5종 파싱 | 통과 |
 | HTML과 차트 | 태그 검증 + 가짜 DOM 실행 검증 통과 |
 | 호환성 | Python 3.6 문법, bash 4.2, mawk 검사 통과 |
-| 셸 요약 판정 | 합성 번들 20종 모두 HTML 판정과 결론 일치. `tests/run_tests.py` 가 매번 비교 (gawk 없는 mawk 환경에서도 확인) |
-| 플랫폼별 판정 | 합성 번들 20종 통과 (`python3 tests/run_tests.py`): VMware 5(vSAN·기본·VMFS), bare-metal NVMe 2, HDD RAID, md SSD stripe, FC SAN, Ceph RBD, RAID 도구 4(perccli·ssacli·arcconf·도구 없음), KVM, AWS EBS 한도, ECK, 컨테이너 |
+| 셸 요약 판정 | 합성 번들 22종 모두 HTML 판정과 결론 일치. `tests/run_tests.py` 가 매번 비교 (gawk 없는 mawk 환경에서도 확인) |
+| 플랫폼별 판정 | 합성 번들 22종 통과 (`python3 tests/run_tests.py`): VMware 5(vSAN·기본·VMFS), bare-metal NVMe 2, HDD RAID, md SSD stripe, FC SAN, Ceph RBD, RAID 도구 5(perccli·ssacli·arcconf·도구 없음·perccli2 해석 불가), KVM, AWS EBS 2(한도 모양·Nitro 보고), ECK, 컨테이너, OS 기본 점검 |
 | RAID 도구 출력 해석 | storcli JSON 키는 Prometheus storcli exporter 가 쓰는 키, ssacli·arcconf 는 공개된 출력 레이블을 기준으로 만든 합성 출력으로만 검증. 실제 장비 출력 확인 필요 |
 | 0.9.x → 0.10 회귀 | VMware 합성 번들 3종의 판정 목록이 0.9.5와 동일 |
 | 실제 vSphere Guest | 미검증 |
@@ -634,7 +638,7 @@ python3 tests/make_bundle.py --list        # 시나리오 목록
 측정한 시간대의 부하가 낮았다는 뜻입니다. 인덱싱이나 검색 피크 시간대에 `-d 600` 이상으로 다시 실행하세요.
 
 **PSI 미지원 표시 (RHEL 8)**
-커널에 들어 있지만 기본 비활성입니다. 부트 파라미터에 `psi=1`을 넣고 재부팅하면 포화 판정이 정확해집니다.
+RHEL 8·9·10 커널에 들어 있지만 기본 비활성입니다. 부트 파라미터에 `psi=1`을 넣고 재부팅하면 포화 판정이 정확해집니다.
 없어도 D 상태, 큐, 지연으로 판정합니다.
 
 **플랫폼이 다르게 판별됨, 또는 "플랫폼 미확정"**

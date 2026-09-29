@@ -81,7 +81,7 @@ VMware 판정은 그대로다 (합성 번들 3종에서 0.9.5 와 판정 목록 
 
 ### 서버에서는 셸만으로 끝나게 (OS 기본 도구)
 - `es_disk_summary.sh` 추가: bash + awk(mawk·gawk 모두)만으로 요약 판정. 수집이 끝나면 자동 실행하고 summary.txt 로 남김.
-  Python 이 없는 서버에서도 판정·조치·담당자를 바로 봄. 판정 규칙은 HTML 과 같고, 테스트가 20개 시나리오에서 두 판정이 같은지 매번 확인
+  Python 이 없는 서버에서도 판정·조치·담당자를 바로 봄. 판정 규칙은 HTML 과 같고, 테스트가 모든 시나리오에서 두 판정이 같은지 매번 확인
 - `es_disk_bench.sh`: fio 가 없으면 dd 로 순차 쓰기·읽기(direct I/O)와 4KiB fsync 지연을 잼. 결과는 다음 수집 때 자동 포함
 - 수집기의 모든 수집은 /proc, /sys, coreutils, util-linux 기본 명령. 컨트롤러 도구·smartctl 은 있을 때만 씀
 
@@ -95,6 +95,24 @@ VMware 판정은 그대로다 (합성 번들 3종에서 0.9.5 와 판정 목록 
 - 장치 상태: SCSI 장치 state, 명령 타임아웃·오류 카운터(iotmo_cnt·ioerr_cnt), PCIe AER 오류, NVMe controller state
 - md: mismatch_cnt. RAID 컨트롤러 커널 로그 이벤트(megaraid AEN FATAL·CRIT 등)는 도구 없이도 판정
 - ECK·컨테이너: ES 프로세스의 마운트 네임스페이스로 data 경로를 찾아 호스트 장치와 연결
+
+### 최신 공식 문서 대조 (2026-09 기준: Elasticsearch 9.5, VCF 9.1, RHEL 10, kernel master)
+- disk watermark: 8.5부터 있는 max_headroom(high 150GB)을 반영. 비율을 직접 지정하지 않은 큰 디스크는 실제 경계가 90%보다 늦게 옴
+- JVM heap: 31GB 고정 경계 대신 노드가 알려 주는 compressed oops 사용 여부로 판정. 권고 문구를 "자동 설정 권장, 대부분 26GB·일부 30GB"로
+- merge 스레드 기본값: 9.4부터 최대 4 제한이 없어진 것을 반영. merge 스레드 풀(9.1+, 8.19+)과 merge 디스크 watermark 를 상시 감시 항목에 추가, 수집에 thread_pool.merge 추가
+- 복구 속도 기본값: 전용 cold·frozen 노드는 메모리에 따라 최대 250mb
+- 상시 감시 필드: `system.diskio.iostat.*`(Metricbeat 8.0에서 제거)를 `linux.iostat.*`로 바꾸고, Linux integration 이 GA 인 것을 반영
+- 원격 파일시스템 금지를 Elastic 공식으로 달아 둔 출처를 실무 기준으로 정정 (공식 문서는 "직결 로컬이 일반적으로 더 빠름"까지)
+- Broadcom KB 번호 변경 반영: PVSCSI 큐 343323(구 2053145), VMXNET3 321259(구 1001805). KB 1010398 인용 오류를 KB 313507·392848 로 정정
+- vSAN 네트워크의 "vSwitch 드롭 0.0001%" 는 현재 문서에서 확인되지 않아 삭제. esxtop 기준은 KB 344099(셋 다 10ms 지속이면 문제)
+- KB 389082 는 vSAN 7·8 성능 화면 기준(flash 5ms, hybrid 20ms)으로 문구 정정. ESA 는 가상 NVMe 컨트롤러 권고 추가
+- SCSI 타임아웃: "VMware 권고 60초" 출처를 확인하지 못해 open-vm-tools 기본 180초만 공식으로 두고 60초 경계는 실무 기준으로 표시
+- RAID: megaraid_sas 논리 디스크는 channel 2 이상(VD = (channel-2)*128 + target)으로 연결 수정. MegaRAID 96xx·PERC 12 이후(mpi3mr)는 storcli2·perccli2 로 조회하고, JSON 을 해석하지 못하면 원문 보존을 알림
+- AWS EBS: nvme-cli(amzn 플러그인) 또는 ebsnvme 가 있으면 Nitro 가 보고하는 볼륨·인스턴스 한도 초과 시간을 읽어 판정. 셸 요약에도 반영
+- 클라우드 모델명: Azure NVMe 원격 디스크 "MSFT NVMe Accelerator", GCP 다중 컨트롤러 로컬 SSD "nvme_card0" 등 추가
+- systemd-detect-virt 새 값(vm-other, container-other, apple, sre 등) 반영
+- 문구 정정: TuneD virtual-guest(swappiness 30·dirty_ratio 30), PSI 는 RHEL 8·9·10 모두 psi=1 필요, NVMe temp1_max 는 "현재 과열 임계값(기본 WCTEMP)"
+- 셸 요약의 thin pool 파싱을 컬럼 위치 고정 대신 thin-pool 다음 칸 기준으로
 
 ### SMART
 - bare-metal 에서는 기본으로 조회 (`--no-hw` 로 끔). VM 에서는 가상 장치라 건너뜀. RAID 컨트롤러 뒤 디스크는 컨트롤러 도구가 대신 봄

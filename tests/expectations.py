@@ -106,3 +106,12 @@ EXPECT += [
       ("caution", None, "명령 타임아웃 기록 (sdb 3회)"), ("warn", None, "RAID 컨트롤러 이벤트")],
      [(None, "VMware 관리자", "")]),
 ]
+
+EXPECT += [
+    ("aws_ebs_throttle", "vm", "",
+     [("warn", "가상화·클라우드 관리자", "EBS 볼륨 성능 한도를 넘긴 시간이 있음")],
+     [(None, None, "EC2 인스턴스의 EBS 성능 한도")]),
+    ("bm_mpi3mr_unparsed", "baremetal", "",
+     [("info", None, "결과 형식을 해석하지 못함")],
+     [(None, None, "도구가 없어")]),
+]

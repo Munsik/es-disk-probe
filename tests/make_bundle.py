@@ -267,6 +267,31 @@ SCEN["bm_ceph_rbd"] = dict(virt=BM_VIRT, hostdrv={"host0": "ahci"}, governor="pe
     datadev=[("/usr/share/elasticsearch/data", "252:0", "rbd0", "ext4", "/dev/rbd0", "/usr/share/elasticsearch/data")],
     meta_extra="es_in_container=1\n")
 
+# 21) AWS EBS: Nitro 가 볼륨 한도 초과 시간을 직접 보고 (nvme amzn stats). 시작은 JSON, 끝은 사람이 읽는 형식
+EBS_START = ('#DEV nvme1n1\n{"total_read_ops": 100, "ebs_volume_performance_exceeded_iops": 1000000, '
+             '"ebs_volume_performance_exceeded_tp": 0, "ec2_instance_ebs_performance_exceeded_iops": 0, '
+             '"ec2_instance_ebs_performance_exceeded_tp": 200000, "volume_queue_length": 1}\n')
+EBS_END = """#DEV nvme1n1
+Total Ops
+  Read: 900000
+  Write: 800000
+EBS Volume Performance Exceeded (us)
+  IOPS: 31000000
+  Throughput: 0
+EC2 Instance EBS Performance Exceeded (us)
+  IOPS: 0
+  Throughput: 500000
+Queue Length (point in time): 12
+"""
+SCEN["aws_ebs_throttle"] = dict(SCEN["aws_ebs_cap"], raw={"ebs_stats_start": EBS_START, "ebs_stats_end": EBS_END})
+# 22) Dell PERC 12 (mpi3mr) + perccli2: 도구는 돌았지만 JSON 형식을 해석하지 못함 → 원문 보존 안내
+SCEN["bm_mpi3mr_unparsed"] = dict(virt=BM_VIRT, hostdrv={"host0": "mpi3mr"}, governor="performance", tuned="throughput-performance",
+    devs=[dev("sda", rot="0", qd="128", host="host0", vendor="DELL", model="PERC H965i Front", hctl="0:1:0:0",
+              lat_r=0.5, lat_w=0.8, iops_r=2000, iops_w=1500, aqu=2, inflight=2, util=40)],
+    raw={"raid_storcli": '#CMD /opt/MegaRAID/perccli2/perccli2 /call show all J\n'
+                         '{"Controllers":[{"Command Status":{"Status":"Success"},"Response Data":{"Basics":{"Controller":0}}}]}\n'
+                         '#TOOL storcli2\n'})
+
 # 20) bare-metal, OS 기본 도구만으로 보이는 문제 모음:
 #     LVM thin pool 92%, nobarrier, swap·snapshot 저장소가 data 디스크, 옆집 프로세스, 느린 flush,
 #     megaraid 커널 로그 이벤트(벤더 도구 없음), SCSI 타임아웃 카운터

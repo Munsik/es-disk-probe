@@ -58,7 +58,9 @@ FILENAME ~ /\/static\/klog_io$/ {
   if (l ~ /thin.*(out of data space|out-of-data-space)|snapshots: invalidating/) kl["LVM thin·snapshot 이상"]++
   next }
 FILENAME ~ /\/static\/dmsetup_status$/ {
-  if ($4 == "thin-pool") { split($7, dd, "/"); if (dd[2] > 0) { tp = 100.0 * dd[1] / dd[2]; if (tp > thinmax) { thinmax = tp; thinname = $1; sub(/:$/, "", thinname) } } }
+  for (i = 1; i < NF; i++) if ($i == "thin-pool") {
+    split($(i + 3), dd, "/"); if (dd[2] > 0) { tp = 100.0 * dd[1] / dd[2]; if (tp > thinmax) { thinmax = tp; thinname = $1; sub(/:$/, "", thinname) } }
+    break }
   next }
 FILENAME ~ /\/static\/mdstat$/ { if ($0 ~ /\[[U_]*_[U_]*\]/) mddeg++; if ($0 ~ /(resync|recovery|reshape|check) *=/) mdop++; next }
 FILENAME ~ /\/static\/raid_(storcli|ssacli|arcconf)$/ {
@@ -85,6 +87,30 @@ FILENAME ~ /\/static\/procio_(start|end)$/ {
   if (match($0, /^\/proc\/[0-9]+\/io:(read|write)_bytes: *[0-9]+/)) {
     split($0, a, "/"); pid = a[3]; v = $NF + 0; pio[st, pid] += v; seen[pid] = 1
   } else if ($0 ~ /^\/proc\/[0-9]+\/comm:/) { split($0, a, "/"); pid = a[3]; c = $0; sub(/^[^:]*:/, "", c); comm[pid] = c }
+  next }
+FILENAME ~ /\/static\/ebs_stats_(start|end)$/ {
+  # AWS EBS: 한도 초과 누적 시간(us). JSON 한 줄 또는 사람이 읽는 형식(섹션 제목 + IOPS/Throughput 줄)
+  es_ = (FILENAME ~ /start$/) ? 0 : 1
+  if ($1 == "#DEV") { edev = $2; esec = ""; next }
+  l = tolower($0)
+  if (l ~ /^ *\{/) {
+    n_ = split(l, kv_, ",")
+    for (i = 1; i <= n_; i++) {
+      x = kv_[i]; v = x; sub(/.*: */, "", v); gsub(/[^0-9]/, "", v)
+      if (x ~ /volume[a-z_]*exceeded[a-z_]*iops/) ebs[es_, edev, "vol"] += v
+      else if (x ~ /volume[a-z_]*exceeded[a-z_]*(tp|throughput)/) ebs[es_, edev, "vol"] += v
+      else if (x ~ /instance[a-z_]*exceeded[a-z_]*iops/) ebs[es_, edev, "inst"] += v
+      else if (x ~ /instance[a-z_]*exceeded[a-z_]*(tp|throughput)/) ebs[es_, edev, "inst"] += v
+    }
+    ebsdev[edev] = 1; next
+  }
+  if (l ~ /performance exceeded/) { esec = (l ~ /instance/) ? "inst" : "vol"; next }
+  if (esec != "" && l ~ /^ *(iops|throughput) *: *[0-9]+/) { v = l; sub(/.*: */, "", v); ebs[es_, edev, esec] += v + 0; ebsdev[edev] = 1; next }
+  if (l ~ /exceeded/ && l ~ /: *[0-9]+/) {
+    v = l; sub(/.*: */, "", v); gsub(/[^0-9]/, "", v)
+    if (l ~ /volume/) ebs[es_, edev, "vol"] += v; else if (l ~ /instance/) ebs[es_, edev, "inst"] += v
+    ebsdev[edev] = 1
+  }
   next }
 FILENAME ~ /samples\.raw$/ {
   if ($1 == "#T") { ns++; t[ns] = $2; sec = ""; next }
@@ -113,11 +139,11 @@ END {
   # ── 플랫폼·판정 기준 (HTML 리포트와 같은 기준) ─────────────────────
   vv = virt["detect_virt_vm"]; if (vv == "") vv = virt["detect_virt"]
   if (meta["platform"] == "baremetal") vv = "none"; else if (meta["platform"] == "vmware") vv = "vmware"; else if (meta["platform"] == "vm" && (vv == "none" || vv == "")) vv = "vm"
-  if (vv ~ /^(docker|podman|lxc|lxc-libvirt|systemd-nspawn|openvz|wsl)$/) vv = ""
+  if (vv ~ /^(docker|podman|lxc|lxc-libvirt|systemd-nspawn|openvz|rkt|wsl|proot|pouch|container-other)$/) vv = ""
   if (vv == "vmware" || tolower(virt["sys_vendor"]) ~ /vmware/) { plat = "VMware Guest"; media = "vmware" }
   else if (vv != "" && vv != "none" && vv != "unknown") {
     plat = vv " Guest"; media = "vm"
-    for (k in nv) { split(k, kk, SUBSEP); if (kk[2] == "model" && nv[k] ~ /Elastic Block Store|nvme_card-pd|PersistentDisk/) media = "cloud" }
+    for (k in nv) { split(k, kk, SUBSEP); if (kk[2] == "model" && nv[k] ~ /Elastic Block Store|MSFT NVMe Accelerator|nvme_card-pd|PersistentDisk/) media = "cloud" }
   }
   else if (vv == "none" || virt["cpu_hypervisor_flag"] == "0") { plat = "bare-metal"; media = "" }
   else { plat = "플랫폼 미확정"; media = "vm" }
@@ -128,9 +154,9 @@ END {
     for (i = 1; i <= ndev; i++) {
       d = dev[i]; hd = drv[host[d]]
       c = d; sub(/n[0-9]+$/, "", c)
-      if (d ~ /^nvme/ && nv[c, "model"] ~ /Elastic Block Store|nvme_card-pd|PersistentDisk/) mm = "cloud"
+      if (d ~ /^nvme/ && nv[c, "model"] ~ /Elastic Block Store|MSFT NVMe Accelerator|nvme_card-pd|PersistentDisk/) mm = "cloud"
       else if (d ~ /^nvme/) mm = "nvme"; else if (d ~ /^(rbd|nbd)/) mm = "network"; else mm = (attr[d, "queue/rotational"] == "1") ? "hdd" : "ssd"
-      if (hd ~ /^(megaraid_sas|hpsa|smartpqi|aacraid|arcmsr)$/) {
+      if (hd ~ /^(megaraid_sas|mpi3mr|hpsa|smartpqi|aacraid|arcmsr)$/) {
         if (raid_tool && raid_hdd) mm = "hdd"; else if (raid_tool && raid_ssd) mm = "ssd"; else unsure = 1
       }
       if (mm == "hdd" || ((mm == "network" || mm == "cloud") && media != "hdd") || (mm == "ssd" && media == "nvme")) media = mm
@@ -208,6 +234,12 @@ END {
     sv = (k ~ /I\/O 오류|파일시스템/) ? "위험" : (k ~ /타임아웃/ ? "주의" : "경고")
     add(sv, "커널 로그: " k " " kl[k] "건 (최근 7일)", "번들의 static/klog_io 원문 시각을 담당자에게 전달", "run")
   }
+  win = (ns >= 2) ? t[ns] - t[1] : 0
+  for (d in ebsdev) if (win > 0) {
+    ev = (ebs[1, d, "vol"] - ebs[0, d, "vol"]) / 1e6; ei = (ebs[1, d, "inst"] - ebs[0, d, "inst"]) / 1e6
+    if (ev >= 0.01 * win) add((ev >= 0.1 * win) ? "경고" : "주의", "AWS EBS 볼륨 성능 한도 초과 " f1(ev) "초 (" d ", 측정 " int(win) "초 중)", "볼륨 IOPS·처리량 설정 상향 또는 볼륨 분산 (가상화·클라우드 관리자)", "run")
+    if (ei >= 0.01 * win) add((ei >= 0.1 * win) ? "경고" : "주의", "EC2 인스턴스 EBS 한도 초과 " f1(ei) "초 (" d ", 측정 " int(win) "초 중)", "EBS 대역폭이 더 큰 인스턴스 유형으로 변경 (가상화·클라우드 관리자)", "run")
+  }
   mmc = sysctl["vm.max_map_count"] + 0
   if (mmc > 0 && mmc < 262144) add("위험", "vm.max_map_count " mmc " (ES 최소 262144)", "sysctl -w vm.max_map_count=1048576 + /etc/sysctl.d 영구화")
   for (i = 1; i <= ndev; i++) {
@@ -253,7 +285,7 @@ END {
   mlab["hybrid"] = "vSAN Hybrid"; mlab["vmfs"] = "VMware SAN·NFS 데이터스토어"; mlab["vm"] = "가상 디스크 공통"; mlab["network"] = "네트워크 블록"; mlab["cloud"] = "클라우드 볼륨"
   printf "=== es-disk-probe 요약 판정 (셸) ===\n"
   printf "호스트 %s · %s · 대상 디스크 %s%s\n", meta["host"], plat, devs, (guess ? " (data 경로 미확인, 전체 디스크)" : "")
-  cont = virt["detect_virt_container"]; if (cont == "" && virt["detect_virt"] ~ /^(docker|podman|lxc|systemd-nspawn)$/) cont = virt["detect_virt"]
+  cont = virt["detect_virt_container"]; if (cont == "" && virt["detect_virt"] ~ /^(docker|podman|lxc|lxc-libvirt|systemd-nspawn|openvz|rkt|wsl|proot|pouch|container-other)$/) cont = virt["detect_virt"]
   if (cont != "" && cont != "none") printf "주의: 컨테이너(%s) 안에서 실행한 결과입니다. 가능하면 호스트에서 다시 실행하세요\n", cont
   printf "판정 기준 %s%s · 응답시간 주의 %s / 경고 %s / 위험 %s ms\n", (media in mlab) ? mlab[media] : media, (unsure ? " (추정)" : ""), c1, c2, c3
   printf "\n판정: %s\n\n", verdict
@@ -273,4 +305,5 @@ END {
    $( [[ -r "$S/storage" ]] && echo "$S/storage" ) \
    $( for r in raid_storcli raid_ssacli raid_arcconf; do [[ -r "$S/$r" ]] && echo "$S/$r"; done ) \
    $( [[ -r "$S/procio_start" ]] && echo "$S/procio_start" "$S/procio_end" ) \
+   $( [[ -s "$S/ebs_stats_start" && -s "$S/ebs_stats_end" ]] && echo "$S/ebs_stats_start" "$S/ebs_stats_end" ) \
    "$B/samples.raw" 2>/dev/null | tee "$B/summary.txt"

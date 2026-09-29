@@ -416,6 +416,27 @@ if [[ $HW -eq 1 && $IS_BARE -eq 1 ]]; then
       echo "#TOOL_ABSENT storcli/perccli" > "$S/raid_storcli"
     fi
   fi
+  # Broadcom MegaRAID 96xx·Dell PERC 12 이후(mpi3mr 드라이버)는 storcli2·perccli2 로 관리한다.
+  # 명령 문법은 같고(/call, /vall, show ... J), 드라이브는 /eall/sall 대신 컨트롤러별로 조회한다
+  if [[ "$DRVS" == *" mpi3mr "* ]]; then
+    T=$(find_tool storcli2 perccli2 /opt/MegaRAID/storcli2/storcli2 /opt/MegaRAID/perccli2/perccli2)
+    if [[ -n "$T" ]]; then
+      for c in "/call show all J" "/call/vall show all J" "/call show patrolread J" "/call show cc J"; do
+        # shellcheck disable=SC2086
+        hw_run "$S/raid_storcli" "$T" $c
+      done
+      for n in 0 1 2 3; do
+        [[ $n -gt 0 ]] && ! grep -q "Controller = $n" "$S/raid_storcli" && break
+        hw_run "$S/raid_storcli" "$T" "/c$n/eall/sall" show all J
+        hw_run "$S/raid_storcli" "$T" "/c$n/sall" show all J
+      done
+      echo "#TOOL storcli2" >> "$S/raid_storcli"
+      RAID_TOOLS+="storcli2 "
+    elif grep -qiE 'PERC|MR9[0-9]|MegaRAID|RAID' /sys/block/sd*/device/model 2>/dev/null; then
+      # mpi3mr 는 HBA 에도 쓰이므로 RAID 논리 디스크가 보일 때만 도구가 없다고 알린다
+      echo "#TOOL_ABSENT storcli2/perccli2" >> "$S/raid_storcli"
+    fi
+  fi
   if [[ "$DRVS" == *" hpsa "* || "$DRVS" == *" smartpqi "* ]]; then
     T=$(find_tool ssacli hpssacli /usr/sbin/ssacli /opt/smartstorageadmin/ssacli/bin/ssacli)
     if [[ -n "$T" ]]; then hw_run "$S/raid_ssacli" "$T" ctrl all show config detail; RAID_TOOLS+="ssacli "
@@ -444,7 +465,7 @@ if [[ $SMART -eq 1 ]]; then
       n=${d##*/}
       case "$n" in loop*|ram*|sr*|zram*|dm-*|md*|nbd*|rbd*) continue ;; esac
       hdrv=$(cat "$(readlink -f "$d/device" 2>/dev/null | grep -oE '.*/host[0-9]+')/scsi_host/"*/proc_name 2>/dev/null | head -1)
-      case "$hdrv" in megaraid_sas|hpsa|smartpqi|aacraid|arcmsr) continue ;; esac
+      case "$hdrv" in megaraid_sas|mpi3mr|hpsa|smartpqi|aacraid|arcmsr) continue ;; esac
       dev="/dev/$n"; [[ "$n" == nvme*n* ]] && dev="/dev/${n%n*}"
       [[ $SMART_N -ge 32 ]] && break
       echo "#DEV $n $dev"
@@ -465,6 +486,24 @@ cp /proc/interrupts "$S/interrupts_start" 2>/dev/null
 # /proc/<pid>/io 는 메모리에서 만들어지는 값이고, 사라진 프로세스는 grep 이 조용히 건너뛴다
 procio() { grep -HE '^(read_bytes|write_bytes):' /proc/[0-9]*/io 2>/dev/null; grep -H . /proc/[0-9]*/comm 2>/dev/null; }
 procio > "$S/procio_start"
+# AWS EBS(Nitro): 볼륨·인스턴스 성능 한도를 넘긴 시간(us)을 NVMe 로그 페이지로 준다. 조회 전용.
+# nvme-cli(amzn 플러그인) 또는 amazon-ec2-utils 의 ebsnvme 가 있을 때만 읽는다. 없으면 건너뛴다
+EBSNV=""
+if grep -qs 'Amazon Elastic Block Store' /sys/block/nvme*n*/device/model 2>/dev/null; then
+  if command -v nvme >/dev/null 2>&1 && nvme amzn help >/dev/null 2>&1; then EBSNV="nvme"
+  elif command -v ebsnvme >/dev/null 2>&1; then EBSNV="ebsnvme"; fi
+fi
+ebsstats() {
+  local d
+  [[ -z "$EBSNV" ]] && return 0
+  for d in /sys/block/nvme*n*; do
+    grep -qs 'Amazon Elastic Block Store' "$d/device/model" || continue
+    echo "#DEV ${d##*/}"
+    if [[ "$EBSNV" == nvme ]]; then timeout 10 nvme amzn stats -o json "/dev/${d##*/}" 2>/dev/null || timeout 10 nvme amzn stats "/dev/${d##*/}" 2>&1
+    else timeout 10 ebsnvme stats -j "/dev/${d##*/}" 2>&1; fi
+  done
+}
+ebsstats > "$S/ebs_stats_start"
 save dmsetup_table dmsetup table
 # thin pool 사용률, snapshot 채움 정도 (device-mapper 상태 조회, 읽기 전용)
 save dmsetup_status dmsetup status
@@ -641,7 +680,7 @@ if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
   echo "es_url=$ES_URL" >> "$OUT/meta"; echo "es_http=$c" >> "$OUT/meta"
   if [[ "$c" == "200" ]]; then
     ES_OK=1
-    es_get "_nodes/_local?filter_path=nodes.*.name,nodes.*.version,nodes.*.roles,nodes.*.process.mlockall,nodes.*.settings.path,nodes.*.jvm.mem,nodes.*.os.allocated_processors" "$S/es_nodeinfo.json" >/dev/null
+    es_get "_nodes/_local?filter_path=nodes.*.name,nodes.*.version,nodes.*.roles,nodes.*.process.mlockall,nodes.*.settings.path,nodes.*.jvm.mem,nodes.*.jvm.using_compressed_ordinary_object_pointers,nodes.*.os.allocated_processors" "$S/es_nodeinfo.json" >/dev/null
     es_get "_cluster/settings?include_defaults=true&flat_settings=true&filter_path=**.cluster.routing.allocation.disk*,**.cluster.routing.allocation.awareness*" "$S/es_cluster_settings.json" >/dev/null
     es_get "_cluster/health?filter_path=status,number_of_nodes,active_shards,relocating_shards,initializing_shards,unassigned_shards" "$S/es_health.json" >/dev/null
   elif [[ "$c" == "401" ]]; then
@@ -650,11 +689,11 @@ if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
     msg "⚠ ES API 접속 실패 (http=$c). OS 레벨만 수집합니다"
   fi
 fi
-NODE_STATS_PATH="_nodes/_local/stats/indices,fs,thread_pool,jvm,indexing_pressure?filter_path=nodes.*.timestamp,nodes.*.name,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.store,nodes.*.indices.segments,nodes.*.indices.translog,nodes.*.fs,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.jvm.gc,nodes.*.indexing_pressure,nodes.*.indices.shard_stats"
+NODE_STATS_PATH="_nodes/_local/stats/indices,fs,thread_pool,jvm,indexing_pressure?filter_path=nodes.*.timestamp,nodes.*.name,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.store,nodes.*.indices.segments,nodes.*.indices.translog,nodes.*.fs,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.thread_pool.merge,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.jvm.gc,nodes.*.indexing_pressure,nodes.*.indices.shard_stats"
 # 디스크와 직결되는 인덱스 설정. include_defaults 를 쓰지 않으므로 "명시적으로 바꾼 인덱스"만 응답에 들어온다
 IDX_SETTINGS_PATH="_all/_settings?flat_settings=true&filter_path=**.index.translog.durability,**.index.translog.sync_interval,**.index.translog.flush_threshold_size,**.index.merge.scheduler.max_thread_count,**.index.store.type,**.index.store.preload,**.index.refresh_interval"
 IDX_STATS_PATH="_nodes/_local/stats/indices?level=indices&filter_path=nodes.*.indices.*.indexing.index_total,nodes.*.indices.*.indexing.index_time_in_millis,nodes.*.indices.*.merges.total_time_in_millis,nodes.*.indices.*.merges.total_size_in_bytes,nodes.*.indices.*.refresh.total,nodes.*.indices.*.store.size_in_bytes,nodes.*.indices.*.segments.count,nodes.*.indices.*.search.query_total"
-CLUSTER_STATS_PATH="_nodes/stats/fs,indices,thread_pool,jvm,os?filter_path=nodes.*.name,nodes.*.roles,nodes.*.host,nodes.*.timestamp,nodes.*.fs.total,nodes.*.fs.io_stats,nodes.*.indices.store,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.segments.count,nodes.*.indices.translog,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.thread_pool.flush,nodes.*.jvm.mem.heap_used_percent,nodes.*.os.cpu.percent"
+CLUSTER_STATS_PATH="_nodes/stats/fs,indices,thread_pool,jvm,os?filter_path=nodes.*.name,nodes.*.roles,nodes.*.host,nodes.*.timestamp,nodes.*.fs.total,nodes.*.fs.io_stats,nodes.*.indices.store,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.segments.count,nodes.*.indices.translog,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.thread_pool.flush,nodes.*.thread_pool.merge,nodes.*.jvm.mem.heap_used_percent,nodes.*.os.cpu.percent"
 
 if [[ $ES_OK -eq 1 ]]; then
   es_get "$NODE_STATS_PATH" "$S/es_stats_start.json" >/dev/null
@@ -754,6 +793,7 @@ fi
 cat /proc/meminfo > "$S/meminfo_end" 2>/dev/null
 cp /proc/interrupts "$S/interrupts_end" 2>/dev/null
 procio > "$S/procio_end"
+ebsstats > "$S/ebs_stats_end"
 
 # ── 수집기 자체 자원 사용량 ────────────────────────────────────────────────
 # bash 내장 times: 자신 / 자식 프로세스의 user·sys CPU 누적
