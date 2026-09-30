@@ -1,5 +1,184 @@
 # Changelog
 
+## [0.10.0] - 2026-09-29
+
+VMware vSAN Guest 전용이던 판정을 bare-metal, SAN, 그 밖의 hypervisor·클라우드까지 넓혔다.
+플랫폼을 실행한 서버에서 자동으로 판별하고, 플랫폼마다 기준값과 병목 위치 해석, 담당자를 바꾼다.
+VMware 판정은 그대로다 (합성 번들 3종에서 0.9.5 와 판정 목록 동일).
+
+### 플랫폼 판별
+- `systemd-detect-virt -v/-c`, DMI, `/sys/hypervisor`, CPU hypervisor 플래그로 vmware / baremetal / vm / 미확정 구분.
+  bare-metal 은 "가상화 없음"이 확인될 때만 판정하고, 근거가 없으면 공통 기준으로 판정하며 `--platform` 지정을 안내
+- ES data 디스크별 매체와 연결 방식: NVMe(PCIe), NVMe-oF, FC·iSCSI HBA, 어레이 벤더, dm-multipath,
+  RAID 컨트롤러 논리 디스크, 로컬 SSD·HDD. RAID 논리 디스크는 매체를 "추정"으로 표시
+- 클라우드(AWS, Azure, Google Cloud)와 컨테이너 실행 여부 표시. 컨테이너 안이면 호스트에서 다시 실행하도록 경고
+
+### 판정 기준
+- bare-metal·SAN 응답시간: Broadcom KB 424485 장치별 경보 기준을 주의 선으로 (NVMe 1ms, SSD 3ms, HDD 25ms).
+  경고·위험 단계는 실무 기준. await 에 block layer 대기가 포함되므로 "정상 범위"가 아니라 "경보 기준"을 씀
+- 그 밖의 VM: 백엔드를 모르므로 vSAN All-Flash 수치를 공통 기준으로 차용 [실무 기준]
+- `-s` 기본값 auto. `nvme|ssd|hdd` 추가. 매체가 섞이면 가장 느린 매체 기준.
+  0.9.x 번들의 `storage=allflash` 는 사용자 선택과 구분이 안 돼 auto 로 해석
+
+### 병목 위치와 담당자
+- bare-metal 로컬: 큐가 차면 디스크 구성 포화(서버 담당자), 큐가 비었는데 느리면 디스크·컨트롤러 이상(하드웨어 담당자)
+- SAN: 서버 LUN 큐 대 어레이·SAN 경로(스토리지 관리자)
+- 그 밖의 VM: VM 안 대 VM 바깥(가상화·클라우드 관리자)
+- NVMe 와 virtio-blk 처럼 queue_depth 가 없는 장치를 권한 문제와 구분
+- 쓰기만 느림: RAID 컨트롤러 캐시, SSD write cliff, 스토리지 쓰기 경로로 플랫폼별 해석
+
+### 새로 점검하는 항목
+- 묶음(RAID 0, LVM stripe, md, multipath 경로) 안에서 한 장치만 느린 경우 (모든 플랫폼).
+  stripe 는 가장 느린 구성원 속도로 움직이는데 합산 지표에서는 희석되어 보이지 않았다
+- NVMe 온도(hwmon WCTEMP 도달·근접), PCIe 링크 속도·폭 저하
+- /proc/mdstat degraded, resync·recovery·check 진행
+- CPU governor 절전 정책, FC HBA 포트 상태
+- SMART (`--smart`, 기본 꺼짐): 자가 진단 실패, 보류·미정정 섹터, NVMe critical warning 등
+- 커널 로그 패턴: RAID·HBA 드라이버 오류, Medium Error, NVMe controller down, PCIe AER, md 디스크 장애, multipath 경로 소실
+
+### VMware 전용으로 한정한 항목
+- SCSI timeout 180초, PVSCSI·컨트롤러 분리, open-vm-tools, VMXNET3, vSAN 네트워크, vSAN TRIM, balloon 문구
+- 스케줄러는 Red Hat 용도별 권고(HDD mq-deadline/bfq, SSD·NVMe none/kyber), tuned 는 bare-metal 에서 throughput-performance
+- merge 스레드 1 권고를 bare-metal HDD 에도 적용
+- awareness 안내: ESXi 호스트 / 랙·전원 / 호스트·가용 영역
+
+### 리포트
+- 헤더에 플랫폼, 판정 기준 줄에 기준 매체와 임계값
+- 장치 종류·연결 방식·근거·모델 표, "원리상 볼 수 없는 것" 표를 플랫폼별로
+- 담당자 그룹에 가상화·클라우드 관리자, 하드웨어 담당자, 스토리지 관리자 추가
+
+### 수집기
+- 플랫폼 판별 원자료, NVMe·FC·iSCSI·mdstat, CPU governor 수집 (모두 /proc·/sys 읽기)
+- `--platform`, `--smart` 옵션. 분석기에도 `--platform`, `--storage auto|allflash|hybrid|nvme|ssd|hdd`
+
+### 사용성: 사람이 정하던 것을 도구가 판단
+- ES 주소: localhost:9200 만 시도하던 것을 ES 프로세스가 실제로 LISTEN 중인 포트(/proc/<pid>/net/tcp)에서 찾아
+  http, https 순서로 접속. network.host 를 특정 IP 로 묶은 운영 노드에서 --es-url 없이 붙음
+- ES 인증: 401 이고 계정을 안 줬으면 터미널에서 사용자·비밀번호를 물어봄. 비밀번호를 환경변수로 넘기지 않아도 되고 셸 history 에 남지 않음
+  (es_cluster_probe.sh 도 같음)
+- ES data 경로: ES 프로세스 인자와 elasticsearch.yml 의 path.data 를 수집 시작 전에 읽음. ES 가 내려가 있어도 장치를 특정
+- 결과 저장 위치: -o 를 안 줬고 /tmp 가 ES data 와 같은 디스크면 /var/tmp, /root 등 다른 디스크로 자동 변경.
+  예전에는 끝난 뒤 경고만 했다
+- 인덱스별 조회: 이 노드 샤드 2,000개 이상 또는 클러스터 샤드 20,000개 이상이면 자동 생략 [실무 기준]
+- 벤치 결과: 같은 서버의 최근 es_disk_bench.sh 결과(180일 이내)를 번들에 자동으로 넣음. --bench 로 따로 연결할 필요 없음
+- es_disk_bench.sh: -t 를 안 주면 elasticsearch.yml 의 path.data 를 씀 (하나일 때)
+- es_cluster_probe.sh: --es-url 이 없으면 localhost 를 http, https 순서로 시도. 끝나면 HTML 리포트까지 생성
+- 분석기가 끝날 때 플랫폼과 판정 기준을 한 줄로 출력. vSAN 종류는 Guest 에서 알 수 없으므로 "자동 판정"이 아니라
+  "기본값"으로 표시하고 Hybrid 면 다시 분석하는 방법을 안내
+- 한 서버에 ES 노드가 여러 개면 어느 노드 기준으로 수집하는지 알림
+
+### 하드웨어 RAID 컨트롤러 판정 (bare-metal)
+- 컨트롤러 도구가 있으면 자동 조회: Broadcom·Dell `storcli`·`perccli` (JSON), HPE `ssacli`, Microchip·Adaptec `arcconf`.
+  모두 show 명령, 명령당 30초 상한, 도구가 남기는 로그 파일은 결과 디렉터리 임시 위치에서 지움
+- 판정: 컨트롤러 상태, 배터리·CacheVault·ZMM 상태, 컨트롤러 캐시 꺼짐, 논리 디스크 상태(degraded·offline),
+  ES data 논리 디스크의 쓰기 캐시가 write-through 인지(설정은 write-back 인데 떨어진 경우 구분),
+  패리티 RAID(5/6), 구성 디스크 오류(predictive failure, media error, SMART 경고, failed), rebuild·patrol read·consistency check 진행
+- 구성 디스크 매체(HDD·SSD)로 RAID 논리 디스크의 매체를 확정. rotational 값에 기대던 "추정"이 도구가 있으면 사라짐
+- OS 장치 연결: storcli 의 OS Drive Name, ssacli 의 Disk Name, 없으면 SCSI 주소(megaraid channel 2 · aacraid channel 0 의 target 번호)
+- 커널 sysfs 만으로 보는 것: /sys/class/raid_devices(mpt*sas IR 볼륨 상태·resync), hpsa·smartpqi 의 raid_level, megaraid 펌웨어 크래시 기록
+- 도구가 없으면 무엇을 설치하면 되는지 안내
+- 쓰기만 느릴 때 안내가 컨트롤러 조회 결과를 반영 (write-back 정상이면 캐시 문제가 아니라고 명시)
+
+### 서버에서는 셸만으로 끝나게 (OS 기본 도구)
+- `es_disk_summary.sh` 추가: bash + awk(mawk·gawk 모두)만으로 요약 판정. 수집이 끝나면 자동 실행하고 summary.txt 로 남김.
+  Python 이 없는 서버에서도 판정·조치·담당자를 바로 봄. 판정 규칙은 HTML 과 같고, 테스트가 모든 시나리오에서 두 판정이 같은지 매번 확인
+- `es_disk_bench.sh`: fio 가 없으면 dd 로 순차 쓰기·읽기(direct I/O)와 4KiB fsync 지연을 잼. 결과는 다음 수집 때 자동 포함
+- 수집기의 모든 수집은 /proc, /sys, coreutils, util-linux 기본 명령. 컨트롤러 도구·smartctl 은 있을 때만 씀
+
+### 제로베이스 재점검으로 추가한 항목 (OS 기본 정보만 사용)
+- flush(장치 캐시 비우기) 지연: /proc/diskstats 확장 필드(커널 5.5+). fsync 가 느린 원인을 직접 봄
+- I/O 모양: 평균 I/O 크기, merge 비율. 작은 랜덤 I/O 위주인지 순차인지
+- 이웃 프로세스: /proc/<pid>/io 로 ES 가 아닌 프로세스의 디스크 사용량. 백업·로그 수집기 같은 원인을 짚음
+- LVM 계층: thin pool 사용률(데이터·메타), snapshot 원본(쓰기마다 복사), dm-crypt, dm-cache
+- 파일시스템: inode 사용률, `nobarrier`·`sync`·`data=journal` 마운트 옵션
+- 같은 디스크 공유: swap, path.repo(스냅샷 저장소), path.logs 가 ES data 디스크에 있는지
+- 장치 상태: SCSI 장치 state, 명령 타임아웃·오류 카운터(iotmo_cnt·ioerr_cnt), PCIe AER 오류, NVMe controller state
+- md: mismatch_cnt. RAID 컨트롤러 커널 로그 이벤트(megaraid AEN FATAL·CRIT 등)는 도구 없이도 판정
+- ECK·컨테이너: ES 프로세스의 마운트 네임스페이스로 data 경로를 찾아 호스트 장치와 연결
+
+### 최신 공식 문서 대조 (2026-09 기준: Elasticsearch 9.5, VCF 9.1, RHEL 10, kernel master)
+- disk watermark: 8.5부터 있는 max_headroom(high 150GB)을 반영. 비율을 직접 지정하지 않은 큰 디스크는 실제 경계가 90%보다 늦게 옴
+- JVM heap: 31GB 고정 경계 대신 노드가 알려 주는 compressed oops 사용 여부로 판정. 권고 문구를 "자동 설정 권장, 대부분 26GB·일부 30GB"로
+- merge 스레드 기본값: 9.4부터 최대 4 제한이 없어진 것을 반영. merge 스레드 풀(9.1+, 8.19+)과 merge 디스크 watermark 를 상시 감시 항목에 추가, 수집에 thread_pool.merge 추가
+- 복구 속도 기본값: 전용 cold·frozen 노드는 메모리에 따라 최대 250mb
+- 상시 감시 필드: `system.diskio.iostat.*`(Metricbeat 8.0에서 제거)를 `linux.iostat.*`로 바꾸고, Linux integration 이 GA 인 것을 반영
+- 원격 파일시스템 금지를 Elastic 공식으로 달아 둔 출처를 실무 기준으로 정정 (공식 문서는 "직결 로컬이 일반적으로 더 빠름"까지)
+- Broadcom KB 번호 변경 반영: PVSCSI 큐 343323(구 2053145), VMXNET3 321259(구 1001805). KB 1010398 인용 오류를 KB 313507·392848 로 정정
+- vSAN 네트워크의 "vSwitch 드롭 0.0001%" 는 현재 문서에서 확인되지 않아 삭제. esxtop 기준은 KB 344099(셋 다 10ms 지속이면 문제)
+- KB 389082 는 vSAN 7·8 성능 화면 기준(flash 5ms, hybrid 20ms)으로 문구 정정. ESA 는 가상 NVMe 컨트롤러 권고 추가
+- SCSI 타임아웃: "VMware 권고 60초" 출처를 확인하지 못해 open-vm-tools 기본 180초만 공식으로 두고 60초 경계는 실무 기준으로 표시
+- RAID: megaraid_sas 논리 디스크는 channel 2 이상(VD = (channel-2)*128 + target)으로 연결 수정. MegaRAID 96xx·PERC 12 이후(mpi3mr)는 storcli2·perccli2 로 조회하고, JSON 을 해석하지 못하면 원문 보존을 알림
+- AWS EBS: nvme-cli(amzn 플러그인) 또는 ebsnvme 가 있으면 Nitro 가 보고하는 볼륨·인스턴스 한도 초과 시간을 읽어 판정. 셸 요약에도 반영
+- 클라우드 모델명: Azure NVMe 원격 디스크 "MSFT NVMe Accelerator", GCP 다중 컨트롤러 로컬 SSD "nvme_card0" 등 추가
+- systemd-detect-virt 새 값(vm-other, container-other, apple, sre 등) 반영
+- 문구 정정: TuneD virtual-guest(swappiness 30·dirty_ratio 30), PSI 는 RHEL 8·9·10 모두 psi=1 필요, NVMe temp1_max 는 "현재 과열 임계값(기본 WCTEMP)"
+- 셸 요약의 thin pool 파싱을 컬럼 위치 고정 대신 thin-pool 다음 칸 기준으로
+- 남은 업데이트 항목과 버전별 재확인 기준을 `docs/UPDATE_NOTES.md` 로 정리
+
+### 읽기 전용 최종 점검: 쓰기·삭제·부하 제거
+- `es_disk_bench.sh` 삭제. 진단 도구가 ES data 경로에 테스트 파일을 쓰고 지우는 동작이 원칙에 맞지 않고, 운영 서버에는 이미 실제 부하가 있음.
+  부하가 있는 번들 32종(실측 UTM 번들 포함)에 일부러 나쁜 벤치 결과를 넣어도 HTML·셸 판정이 하나도 바뀌지 않는 것을 확인한 뒤 제거.
+  함께 없앤 것: 수집기의 벤치 결과 자동 포함, 분석기 `--bench`, "최대 능력 대비 사용률" 표, 구축 전(부하 전) 판정. 큐 기준 이론 상한은 부하 테스트 없이 계산하므로 유지
+- 진단 스크립트에서 `rm` 을 모두 없앰
+  - 수집기: 여유 공간 확인을 결과 디렉터리를 만들기 전으로 옮겨, 실패해도 지울 것이 없게
+  - 수집기: RAID 벤더 도구가 남기는 로그(storcli.log 등)를 지우지 않고 결과 디렉터리의 `hw_tool_logs/` 에 두어 번들에 포함
+  - 클러스터 프로브: ES 접속을 먼저 확인하고 성공했을 때만 결과 디렉터리를 만듦
+- 점검 결과: ES 호출은 모두 GET, 시스템 설정은 읽기만(sysctl -n, /sys 읽기), 벤더 도구는 show·getconfig·smartctl -H -A -i 만.
+  서버에 쓰는 곳은 결과 디렉터리 하나(ES data 와 다른 디스크를 자동 선택). 예외는 수집기가 자기 프로세스의 우선순위만 낮추는 renice·ionice
+
+### 실제 환경 검증에서 찾은 문제 (UTM, Rocky Linux 9.8 aarch64 + Elasticsearch 8.19.21)
+- `_cluster/settings` 가 빈 `{}` 로 오던 문제: `flat_settings=true` 에서는 filter_path 가 점이 든 키 이름과 맞지 않음.
+  중첩 응답으로 받고 분석기에서 펼치도록 수정. 예전 번들(flat 형식)도 그대로 읽음. watermark·복구·awareness 설정이 이제 실제로 들어옴
+- `_ilm/explain` 405: 대상 인덱스가 경로에 있어야 하는 API. `_all/_ilm/explain` 으로 수정
+- RHEL 패키지로 설치한 ES 를 컨테이너로 오판: systemd PrivateTmp 때문에 mount namespace 만 다른 경우였음.
+  루트 디렉터리(장치·inode)가 다를 때만 컨테이너로 보고, 분석기도 cgroup(system.slice/*.service)으로 한 번 더 확인
+- HTML 리포트가 번들(tar.gz)에 빠지던 문제: 번들을 묶기 전에 HTML 을 만들도록 순서 변경
+- 셸 요약에 swap 판정 3가지 추가(측정 중 swap 입출력, swap 켜짐 + memory_lock 꺼짐, swap 이 data 디스크에 있음). HTML 과 같은 규칙
+- 인덱스별 통계가 빈 응답이던 문제: level=indices 응답은 `nodes.<id>.indices.indices.<인덱스>` 로 한 단계 더 들어감(ES 소스 NodeIndicesStats 확인).
+  filter_path 와 해석 모두 수정. 부하를 건 두 번째 실측에서 발견
+- 인덱스 설정(`_all/_settings`)도 flat_settings + filter_path 문제로 빈 응답이던 것을 중첩 응답으로 수정. 명시 설정이 없을 때 "미수집"이 아니라 "바꾼 인덱스 없음"으로 표시
+- 회귀 테스트: PrivateTmp 서비스 시나리오, 중첩·flat cluster settings 해석, 인덱스별 통계 두 모양, 중첩 인덱스 설정 (35개 시나리오)
+
+### 구축 전 점검과 형식 변형 대응
+- 구축 전 점검: ES 부하가 없을 때 `es_disk_bench.sh` 결과로 "부하 전 점검" 판정(충족 / 확인할 항목 있음 / 기준보다 느림).
+  동기 쓰기(translog fsync) 한 건, 무작위 읽기(cache miss 검색) 한 건 지연을 매체별 응답시간 기준으로 판정. 셸 요약·HTML 모두
+- 벤치에 무작위 읽기 동시성 1 측정(randread_4k_qd1) 추가. 벤치가 끝나면 구축 전이면 바로 `--no-es` 수집을 안내
+- 부하가 낮고 벤치도 없을 때의 보류 판정 문구를 HTML 과 셸에서 같게 맞추고, 구축 전이면 벤치를 먼저 돌리라고 안내
+- storcli2·perccli2: 키 이름(공백·snake_case)과 값 표기(Optimal·OPTIMAL·Write Back 등) 변형을 storcli 표기로 맞춰 읽음. 셸 요약도 같은 변형을 읽음
+- nvme amzn stats: JSON(한 줄·여러 줄), 텍스트 표, 단위 붙은 텍스트까지 읽음
+- merge 스레드 풀 대기가 측정 시작·끝 모두 쌓여 있으면 참고 판정
+- 벡터 rescoring direct IO(-Dvector.rescoring.directio=true)가 켜진 노드는 읽기가 page cache 를 거치지 않는다고 안내
+- vSAN Hybrid(OSA) 기준으로 분석하면 VCF 9.0 공지(향후 중단 예정)를 안내
+- 테스트: 33개 시나리오. 셸·HTML 판정 일치에 더해 매체 추정 여부 일치, EBS 형식 변형별 값 일치까지 검사
+
+### SMART
+- bare-metal 에서는 기본으로 조회 (`--no-hw` 로 끔). VM 에서는 가상 장치라 건너뜀. RAID 컨트롤러 뒤 디스크는 컨트롤러 도구가 대신 봄
+
+### VMware 데이터스토어 중립화
+- VMware 면 vSAN 으로 가정하던 것을 고침. Guest 에서는 데이터스토어 종류를 알 수 없으므로 기본은 공통 기준(5ms)과
+  vSAN·SAN·NFS 를 함께 다루는 안내. `-s allflash|hybrid` 면 vSAN, `-s vmfs` 면 SAN·NFS 데이터스토어에 맞춘 안내
+- vSAN 에만 해당하는 문구(resync, vSAN 네트워크, vSAN TRIM, 디스크 그룹)를 데이터스토어 종류에 따라 분기
+
+### 클라우드·네트워크 스토리지
+- 클라우드 볼륨(EBS, Azure Disk, Persistent Disk)과 인스턴스 로컬 NVMe 를 모델명으로 구분. 로컬 NVMe 는 NVMe 기준, 볼륨은 클라우드 기준
+- Ceph RBD·NBD 를 네트워크 블록 장치로 판별. 스토리지 클러스터·네트워크 쪽 안내, 담당자는 스토리지 관리자
+- 모든 플랫폼: 요청은 쌓이는데 IOPS·처리량이 같은 값에서 더 오르지 않는 "한도에 걸린 모양" 판정
+  (상한 근처 구간 30~90%, 그 구간 대기 I/O 가 나머지의 2배 이상일 때) [실무 기준]
+
+### 컨테이너(ECK, Docker)
+- 호스트에서 실행하면 컨테이너 안 ES 를 찾아 /proc/<pid>/root 로 elasticsearch.yml 을 읽고,
+  ES 프로세스의 mountinfo 로 data 경로가 올라간 블록 장치를 찾음 (로컬 PV, Ceph RBD, 클라우드 볼륨)
+- 컨테이너 안에서 실행해도 data 장치를 찾으면 경고를 참고로 낮춤
+
+### 수정
+- --no-index-stats 를 줘도 종료 시점에 인덱스별 통계를 한 번 더 조회하던 문제
+
+### 문서·테스트
+- README: 빠른 시작을 옵션 없는 실행으로, "알아서 판단하는 것" 표 추가
+- README: 플랫폼별 판정 절, 병목 위치 표를 플랫폼별로, 기준값 출처 보강, 트러블슈팅
+- GUARDLINE: bare-metal 설계 기준(1-B), 하드웨어·스토리지 담당자 체크리스트(7-B, 7-C)
+- `tests/`: 합성 번들 생성기와 10개 시나리오 판정 테스트
+
 ## [0.9.5] - 2026-09-29
 
 ### 수정

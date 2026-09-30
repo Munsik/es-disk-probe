@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_cluster_probe.sh  (v0.9.5)
+# es_cluster_probe.sh  (v0.10.0)
 # Elasticsearch 클러스터를 "디스크 관점"에서 조회합니다. (READ-ONLY)
 #
 #  - ES 조회 API(GET)만 호출합니다. 설정 변경, 인덱스 쓰기 없음.
@@ -12,8 +12,9 @@
 #   ES_PASSWORD='***' ./es_cluster_probe.sh --es-url https://es:9200 --es-user elastic
 #   ES_API_KEY='...'  ./es_cluster_probe.sh --es-url https://es:9200 -g 120
 #
-#   --es-url URL  ES 주소 (기본 http://localhost:9200)
+#   --es-url URL  ES 주소 (기본: localhost:9200 을 http, https 순서로 시도)
 #   --es-user U   ES 사용자. 비밀번호는 환경변수 ES_PASSWORD, API Key 는 ES_API_KEY
+#                 둘 다 없고 ES 가 인증을 요구하면 터미널에서 물어봅니다
 #   -g SEC        두 스냅샷 사이 간격 (기본 60초, 길수록 안정적. 최소 10)
 #   -o DIR        결과 위치 (기본 /tmp)
 #   --deep        인덱스별 용량까지 수집 (인덱스가 많으면 응답이 커짐)
@@ -24,14 +25,14 @@
 # ⚠ 기본 동작은 curl -k (인증서 검증 생략)입니다. 사내 보안 정책상 검증이 필요하면
 #   --strict-tls 또는 --cacert 를 쓰세요.
 #
-# 결과: <출력>/escluster_<ts>/  →  es_disk_render.py <노드번들> --cluster <이 디렉터리>
-#       노드 번들 없이 클러스터만 볼 때:  es_disk_render.py --cluster-only <이 디렉터리>
+# 결과: <출력>/escluster_<ts>/ 와 그 안의 es_cluster_report.html (python3 가 있으면 자동 생성)
+#       노드 번들과 합쳐 보려면:  es_disk_render.py <노드번들> --cluster <이 디렉터리>
 # =============================================================================
 set -u
 umask 077
 export LC_ALL=C
 
-ES_URL="http://localhost:9200"; ES_USER=""; GAP=60; OUT_BASE="/tmp"; DEEP=0
+ES_URL=""; ES_USER=""; GAP=60; OUT_BASE="/tmp"; DEEP=0
 STRICT=0; CACERT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -55,7 +56,8 @@ command -v curl >/dev/null 2>&1 || { echo "curl이 필요합니다"; exit 1; }
 TLS=(-k); [[ $STRICT -eq 1 ]] && TLS=()
 [[ -n "$CACERT" ]] && TLS+=(--cacert "$CACERT")
 
-TS=$(date +%Y%m%d_%H%M%S); OUT="$OUT_BASE/escluster_$TS"; mkdir -p "$OUT" || exit 1
+# 결과 디렉터리는 ES 접속이 확인된 뒤에 만든다 (실패하면 아무것도 남기지 않고, 지울 것도 없게)
+TS=$(date +%Y%m%d_%H%M%S); OUT="$OUT_BASE/escluster_$TS"
 msg() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
 cfgesc() { local v=${1//\\/\\\\}; printf '%s' "${v//\"/\\\"}"; }   # curl -K 값 이스케이프 (\ 와 ")
@@ -67,16 +69,35 @@ es_get() {  # $1=path $2=outfile
       -o "$2" -w '%{http_code}' "${ES_URL}/$1" 2>/dev/null || true
 }
 
-CODE=$(es_get "" "$OUT/root.json")
-if [[ "$CODE" != "200" ]]; then
-  echo "ES 접속 실패 (http=$CODE). --es-url / 인증 정보를 확인하세요."
-  [[ $STRICT -eq 1 ]] && echo "  인증서 검증 모드입니다. 자체 서명 인증서라면 --cacert 로 CA를 지정하세요."
-  rm -rf "$OUT"; exit 2
+if [[ -z "$ES_URL" ]]; then
+  for ES_URL in http://localhost:9200 https://localhost:9200; do
+    CODE=$(es_get "" /dev/null)
+    [[ "$CODE" == "200" || "$CODE" == "401" ]] && break
+  done
+else
+  CODE=$(es_get "" /dev/null)
 fi
+if [[ "$CODE" == "401" && -z "$ES_USER" && -z "$ES_API_KEY" && -t 0 && -r /dev/tty ]]; then
+  msg "ES 가 인증을 요구합니다 ($ES_URL). 조회 전용 권한(monitor)이면 충분합니다"
+  read -r -p "  ES 사용자: " ES_USER < /dev/tty
+  read -rs -p "  비밀번호: " ES_PASSWORD < /dev/tty; echo >&2
+  CODE=$(es_get "" /dev/null)
+fi
+if [[ "$CODE" != "200" ]]; then
+  if [[ "$CODE" == "401" ]]; then
+    echo "ES 인증 실패 (401, $ES_URL). --es-user 와 ES_PASSWORD, 또는 ES_API_KEY 를 확인하세요."
+  else
+    echo "ES 접속 실패 (http=$CODE, 마지막 시도 $ES_URL). ES 가 다른 주소에 있으면 --es-url 로 지정하세요."
+  fi
+  [[ $STRICT -eq 1 ]] && echo "  인증서 검증 모드입니다. 자체 서명 인증서라면 --cacert 로 CA를 지정하세요."
+  exit 2
+fi
+mkdir -p "$OUT" || exit 1
+es_get "" "$OUT/root.json" >/dev/null
 echo "es_url=$ES_URL"$'\n'"gap=$GAP"$'\n'"start_wall=$(date '+%Y-%m-%d %H:%M:%S %z')" > "$OUT/meta"
 
 # 노드별 디스크·인덱싱 지표 (두 시점의 차분용)
-NODE_STATS="_nodes/stats/fs,indices,thread_pool,jvm,os?filter_path=nodes.*.name,nodes.*.roles,nodes.*.host,nodes.*.timestamp,nodes.*.fs.total,nodes.*.fs.io_stats,nodes.*.indices.store,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.segments.count,nodes.*.indices.translog,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.thread_pool.flush,nodes.*.jvm.mem.heap_used_percent,nodes.*.os.cpu.percent"
+NODE_STATS="_nodes/stats/fs,indices,thread_pool,jvm,os?filter_path=nodes.*.name,nodes.*.roles,nodes.*.host,nodes.*.timestamp,nodes.*.fs.total,nodes.*.fs.io_stats,nodes.*.indices.store,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.segments.count,nodes.*.indices.translog,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.thread_pool.flush,nodes.*.thread_pool.merge,nodes.*.jvm.mem.heap_used_percent,nodes.*.os.cpu.percent"
 
 msg "1차 스냅샷"
 es_get "$NODE_STATS" "$OUT/node_stats_1.json" >/dev/null
@@ -89,10 +110,10 @@ es_get "_cluster/health" "$OUT/health.json" >/dev/null
 es_get "_cat/recovery?format=json&active_only=true&h=index,shard,type,stage,source_node,target_node,bytes_total,bytes_percent,time" "$OUT/cat_recovery.json" >/dev/null
 es_get "_cat/pending_tasks?format=json" "$OUT/pending_tasks.json" >/dev/null
 es_get "_snapshot/_status" "$OUT/snapshot_status.json" >/dev/null
-es_get "_cluster/settings?include_defaults=true&flat_settings=true&filter_path=**.disk.watermark*,**.disk.threshold*,**.indices.recovery*,**.node_concurrent*,**.cluster_concurrent_rebalance*,**.allocation.awareness*,**.max_shards_per_node*" "$OUT/cluster_settings.json" >/dev/null
+es_get "_cluster/settings?include_defaults=true&filter_path=**.disk.watermark*,**.disk.threshold*,**.indices.recovery*,**.node_concurrent*,**.cluster_concurrent_rebalance*,**.allocation.awareness*,**.max_shards_per_node*" "$OUT/cluster_settings.json" >/dev/null
 es_get "_nodes?filter_path=nodes.*.name,nodes.*.roles,nodes.*.attributes,nodes.*.settings.path,nodes.*.process.mlockall,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.os.available_processors,nodes.*.os.name,nodes.*.host,nodes.*.ip" "$OUT/nodes_info.json" >/dev/null
 # ILM phase: 인덱스별 분포 리포트에서 hot/warm 구분에 사용. read_ilm 권한이 없으면 건너뜀
-es_get "_ilm/explain?only_managed=true&filter_path=indices.*.phase,indices.*.policy,indices.*.action" "$OUT/ilm_explain.json" >/dev/null
+es_get "_all/_ilm/explain?only_managed=true&filter_path=indices.*.phase,indices.*.policy,indices.*.action" "$OUT/ilm_explain.json" >/dev/null
 [[ $DEEP -eq 1 ]] && es_get "_cat/indices?format=json&bytes=b&h=index,health,pri,rep,docs.count,store.size,pri.store.size&s=store.size:desc" "$OUT/cat_indices.json" >/dev/null
 
 sleep "$GAP"
@@ -102,4 +123,13 @@ echo "end_wall=$(date '+%Y-%m-%d %H:%M:%S %z')" >> "$OUT/meta"
 
 tar -C "$OUT_BASE" -czf "$OUT.tar.gz" "$(basename "$OUT")" 2>/dev/null
 msg "완료: $OUT  (번들 $OUT.tar.gz)"
-msg "리포트에 반영: python3 es_disk_render.py <노드 번들> --cluster $OUT"
+HERE="$(cd "$(dirname "$0")" && pwd)"; PY=""
+for c in python3 /usr/libexec/platform-python; do
+  command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info>=(3,6) else 1)' 2>/dev/null && { PY="$c"; break; }
+done
+if [[ -n "$PY" && -f "$HERE/es_disk_render.py" ]]; then
+  "$PY" "$HERE/es_disk_render.py" --cluster-only "$OUT" -o "$OUT/es_cluster_report.html"
+else
+  msg "HTML 은 PC 에서: python3 es_disk_render.py --cluster-only $(basename "$OUT").tar.gz"
+fi
+msg "노드 번들과 합쳐 보려면: python3 es_disk_render.py <노드 번들> --cluster $OUT"
