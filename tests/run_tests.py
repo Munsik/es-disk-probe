@@ -62,6 +62,21 @@ if __name__ == "__main__":
             lim_, _ = R.wm_high(R.flat_settings(cs_), 4 * 1024 ** 4)
             if not lim_ or abs(lim_ - 96.34) > 0.1:
                 fails.append("cluster settings 해석 오류 ({}): {}".format("nested" if cs_ is nested else "flat", lim_))
+        # 인덱스별 통계: 실제 ES 응답은 nodes.<id>.indices.indices.<인덱스> (UTM ES 8.19 에서 확인). 예전 모양도 읽어야 한다
+        import tempfile as _tf
+        for shape in ("nested", "flat"):
+            d_ = _tf.mkdtemp()
+            for fn, n_ in (("es_idx_start.json", 1000), ("es_idx_end.json", 91000)):
+                ix = {"loadtest": {"indexing": {"index_total": n_, "index_time_in_millis": n_ // 10},
+                                   "merges": {"total_size_in_bytes": n_ * 100}, "store": {"size_in_bytes": n_ * 600},
+                                   "segments": {"count": 12}, "search": {"query_total": 0}, "refresh": {"total": 5}}}
+                body = {"indices": ix} if shape == "nested" else ix
+                with open(os.path.join(d_, fn), "w") as fh:
+                    json.dump({"nodes": {"n1": {"indices": body}}}, fh)
+            rows_ = R.analyze_local_indices(d_, None)
+            rows_ = (rows_ or {}).get("rows") if isinstance(rows_, dict) else rows_
+            if not rows_:
+                fails.append("인덱스별 통계 해석 실패 ({} 모양)".format(shape))
         # 셸 요약도 같은 초 단위 값을 내야 한다
         for name in ("aws_ebs_throttle", "aws_ebs_v2", "aws_ebs_v3"):
             if "한도 초과 30.0초" not in out[name].get("shell_text", ""):

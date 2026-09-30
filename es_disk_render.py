@@ -1364,7 +1364,13 @@ def analyze_local_indices(S, cdir):
     gb = list((b.get("nodes") or {}).values())
     if not ga or not gb:
         return None
-    ia, ib = ga[0].get("indices") or {}, gb[0].get("indices") or {}
+    # level=indices 응답은 nodes.<id>.indices.indices.<인덱스> 로 한 단계 더 들어간다 (ES NodeIndicesStats).
+    # 예전 수집기 번들은 filter_path 가 한 단계 모자라 빈 응답이었다
+    def per_index(g):
+        top = g.get("indices") or {}
+        inner = top.get("indices")
+        return inner if isinstance(inner, dict) else top
+    ia, ib = per_index(ga[0]), per_index(gb[0])
     ilm = {}
     if cdir:
         il = rjson(cdir, "ilm_explain.json") or {}
@@ -2488,11 +2494,13 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
     # ── 디스크와 직결되는 인덱스 설정 (명시적으로 바꾼 인덱스만 응답에 들어온다) ──
     idx_set = rjson(S, "es_idx_settings.json") or {}
     def idx_vals(key):
-        """key 를 명시적으로 설정한 인덱스를 {인덱스: 값} 으로"""
+        """key 를 명시적으로 설정한 인덱스를 {인덱스: 값} 으로.
+        수집은 중첩 응답(settings.index.translog.durability)이고, 예전 번들은 flat 키("index.translog.durability")다"""
         out = {}
         for name, blk in idx_set.items():
-            v = dig(blk, "settings", key)
-            if v is not None:
+            st = (blk or {}).get("settings") or {}
+            v = st.get(key) if key in st else dig(st, *key.split("."))
+            if v is not None and not isinstance(v, dict):
                 out[name] = str(v)
         return out
 
@@ -2508,7 +2516,7 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
             "[Elastic 공식] Translog settings (durability: request가 기본, async는 sync_interval 단위)")
     else:
         add("info", "ES 설정", "참고", "translog durability가 기본값(request). 쓰기 요청마다 fsync",
-            "durability를 async로 바꾼 인덱스 없음" if idx_set else "인덱스 설정 미수집",
+            "durability를 async로 바꾼 인덱스 없음" if (idx_set or rd(S, "es_idx_settings.json").strip() == "{}") else "인덱스 설정 미수집",
             "기본 설정에서는 bulk 요청 하나가 끝나려면 translog fsync가 끝나야 합니다. 그래서 디스크 쓰기 지연이 "
             "그대로 인덱싱 응답 시간이 됩니다. 이 리포트가 쓰기 지연을 중요하게 보는 이유입니다.",
             "조치 불필요. 쓰기 지연이 문제인데 스토리지를 바로 개선할 수 없는 상황이라면 async가 선택지이지만 "

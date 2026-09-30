@@ -159,3 +159,9 @@ EXPECT += [
      [],
      [(None, None, "컨테이너(Docker·Kubernetes) 안에서 실행 중"), (None, None, "컨테이너 안에서 실행됨")]),
 ]
+
+EXPECT += [
+    ("idx_settings_nested", "baremetal", "",
+     [("info", None, "durability: async")],
+     [(None, None, "인덱스 설정 미수집")]),
+]

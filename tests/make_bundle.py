@@ -432,6 +432,11 @@ SCEN["vmware_hybrid"] = dict(SCEN["vmware_ok"], storage="hybrid")
 SCEN["rhel_service_ns"] = dict(SCEN["kvm_slow"], meta_extra="es_in_container=1\n",
     raw={"es_cgroup": "0::/system.slice/elasticsearch.service\n"})
 
+# 32) 인덱스 설정: 실제 ES 가 돌려주는 중첩 모양 (flat_settings 없이 filter_path). async 인덱스를 찾아야 함
+SCEN["idx_settings_nested"] = dict(SCEN["bm_nvme_ok"], raw={"es_idx_settings.json": _json.dumps(
+    {"logs-a": {"settings": {"index": {"translog": {"durability": "async", "sync_interval": "30s"}}}},
+     "loadtest": {"settings": {"index": {"refresh_interval": "30s"}}}})})
+
 # 20) bare-metal, OS 기본 도구만으로 보이는 문제 모음:
 #     LVM thin pool 92%, nobarrier, swap·snapshot 저장소가 data 디스크, 옆집 프로세스, 느린 flush,
 #     megaraid 커널 로그 이벤트(벤더 도구 없음), SCSI 타임아웃 카운터

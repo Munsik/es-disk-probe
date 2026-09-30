@@ -123,7 +123,10 @@ VMware 판정은 그대로다 (합성 번들 3종에서 0.9.5 와 판정 목록 
   루트 디렉터리(장치·inode)가 다를 때만 컨테이너로 보고, 분석기도 cgroup(system.slice/*.service)으로 한 번 더 확인
 - HTML 리포트가 번들(tar.gz)에 빠지던 문제: 번들을 묶기 전에 HTML 을 만들도록 순서 변경
 - 셸 요약에 swap 판정 3가지 추가(측정 중 swap 입출력, swap 켜짐 + memory_lock 꺼짐, swap 이 data 디스크에 있음). HTML 과 같은 규칙
-- 회귀 테스트: PrivateTmp 서비스 시나리오, 중첩·flat cluster settings 해석
+- 인덱스별 통계가 빈 응답이던 문제: level=indices 응답은 `nodes.<id>.indices.indices.<인덱스>` 로 한 단계 더 들어감(ES 소스 NodeIndicesStats 확인).
+  filter_path 와 해석 모두 수정. 부하를 건 두 번째 실측에서 발견
+- 인덱스 설정(`_all/_settings`)도 flat_settings + filter_path 문제로 빈 응답이던 것을 중첩 응답으로 수정. 명시 설정이 없을 때 "미수집"이 아니라 "바꾼 인덱스 없음"으로 표시
+- 회귀 테스트: PrivateTmp 서비스 시나리오, 중첩·flat cluster settings 해석, 인덱스별 통계 두 모양, 중첩 인덱스 설정 (35개 시나리오)
 
 ### 구축 전 점검과 형식 변형 대응
 - 구축 전 점검: ES 부하가 없을 때 `es_disk_bench.sh` 결과로 "부하 전 점검" 판정(충족 / 확인할 항목 있음 / 기준보다 느림).
