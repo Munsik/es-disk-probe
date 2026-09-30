@@ -30,6 +30,32 @@
 # =============================================================================
 set -u
 umask 077
+# ── Language: --lang ko|en, otherwise ko when the locale starts with ko, else en ──
+# Text lives in i18n/<lang>.txt (key = "text"); missing keys fall back to ko.
+_LOC0="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+LNG=""; _p=""
+for _a in "$@"; do [[ "$_p" == --lang ]] && LNG="$_a"; [[ "$_a" == --lang=* ]] && LNG="${_a#--lang=}"; _p="$_a"; done
+[[ "$LNG" == ko || "$LNG" == en ]] || { [[ "$_LOC0" == ko* ]] && LNG=ko || LNG=en; }
+HERE="$(cd "$(dirname "$0")" && pwd)"
+declare -A _M=()
+_catload() {  # $1=file $2=key prefix
+  local line k v
+  [[ -r "$1" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "$2"* && "$line" == *' = "'* ]] || continue
+    k="${line%% = \"*}"; [[ -n "${_M[$k]+x}" ]] && continue
+    v="${line#* = \"}"; v="${v%\"}"
+    v="${v//\\\"/\"}"; v="${v//\\n/$'\n'}"; v="${v//\\\\/\\}"
+    _M[$k]="$v"
+  done < "$1"
+}
+t() {  # t key [values...]  → {1}, {2} ... 자리에 값
+  local s="${_M[$1]:-$1}" i=1 a
+  shift
+  for a in "$@"; do s="${s//\{$i\}/$a}"; i=$((i + 1)); done
+  printf '%s' "$s"
+}
+_catload "$HERE/i18n/$LNG.txt" p.; _catload "$HERE/i18n/ko.txt" p.
 export LC_ALL=C
 
 ES_URL=""; ES_USER=""; GAP=60; OUT_BASE="/tmp"; DEEP=0
@@ -44,15 +70,17 @@ while [[ $# -gt 0 ]]; do
     --insecure) STRICT=0; shift ;;
     --strict-tls) STRICT=1; shift ;;
     --cacert) CACERT="$2"; STRICT=1; shift 2 ;;
-    -h|--help) awk 'NR>1 && /^#/{print;next} NR>1{exit}' "$0"; exit 0 ;;
-    *) echo "알 수 없는 옵션: $1"; exit 1 ;;
+    --lang) shift 2 ;;
+    --lang=*) shift ;;
+    -h|--help) t p.help; echo; exit 0 ;;
+    *) t p.badopt "$1"; echo; exit 1 ;;
   esac
 done
 ES_PASSWORD="${ES_PASSWORD:-}"; ES_API_KEY="${ES_API_KEY:-}"
 ES_URL="${ES_URL%/}"
-[[ "$GAP" =~ ^[0-9]+$ && "$GAP" -ge 10 ]] || { echo "-g 는 10 이상 정수(초)"; exit 1; }
-command -v curl >/dev/null 2>&1 || { echo "curl이 필요합니다"; exit 1; }
-[[ -z "$CACERT" || -r "$CACERT" ]] || { echo "--cacert 파일을 읽을 수 없습니다: $CACERT"; exit 1; }
+[[ "$GAP" =~ ^[0-9]+$ && "$GAP" -ge 10 ]] || { t p.bad_g; echo; exit 1; }
+command -v curl >/dev/null 2>&1 || { t p.nocurl; echo; exit 1; }
+[[ -z "$CACERT" || -r "$CACERT" ]] || { t p.cacert "$CACERT"; echo; exit 1; }
 TLS=(-k); [[ $STRICT -eq 1 ]] && TLS=()
 [[ -n "$CACERT" ]] && TLS+=(--cacert "$CACERT")
 
@@ -78,18 +106,18 @@ else
   CODE=$(es_get "" /dev/null)
 fi
 if [[ "$CODE" == "401" && -z "$ES_USER" && -z "$ES_API_KEY" && -t 0 && -r /dev/tty ]]; then
-  msg "ES 가 인증을 요구합니다 ($ES_URL). 조회 전용 권한(monitor)이면 충분합니다"
-  read -r -p "  ES 사용자: " ES_USER < /dev/tty
-  read -rs -p "  비밀번호: " ES_PASSWORD < /dev/tty; echo >&2
+  msg "$(t p.auth_ask "$ES_URL")"
+  read -r -p "  $(t p.user): " ES_USER < /dev/tty
+  read -rs -p "  $(t p.password): " ES_PASSWORD < /dev/tty; echo >&2
   CODE=$(es_get "" /dev/null)
 fi
 if [[ "$CODE" != "200" ]]; then
   if [[ "$CODE" == "401" ]]; then
-    echo "ES 인증 실패 (401, $ES_URL). --es-user 와 ES_PASSWORD, 또는 ES_API_KEY 를 확인하세요."
+    t p.auth_fail "$ES_URL"; echo
   else
-    echo "ES 접속 실패 (http=$CODE, 마지막 시도 $ES_URL). ES 가 다른 주소에 있으면 --es-url 로 지정하세요."
+    t p.es_fail "$CODE" "$ES_URL"; echo
   fi
-  [[ $STRICT -eq 1 ]] && echo "  인증서 검증 모드입니다. 자체 서명 인증서라면 --cacert 로 CA를 지정하세요."
+  [[ $STRICT -eq 1 ]] && t p.strict; echo
   exit 2
 fi
 mkdir -p "$OUT" || exit 1
@@ -99,11 +127,11 @@ echo "es_url=$ES_URL"$'\n'"gap=$GAP"$'\n'"start_wall=$(date '+%Y-%m-%d %H:%M:%S 
 # 노드별 디스크·인덱싱 지표 (두 시점의 차분용)
 NODE_STATS="_nodes/stats/fs,indices,thread_pool,jvm,os?filter_path=nodes.*.name,nodes.*.roles,nodes.*.host,nodes.*.timestamp,nodes.*.fs.total,nodes.*.fs.io_stats,nodes.*.indices.store,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.segments.count,nodes.*.indices.translog,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.thread_pool.flush,nodes.*.thread_pool.merge,nodes.*.jvm.mem.heap_used_percent,nodes.*.os.cpu.percent"
 
-msg "1차 스냅샷"
+msg "$(t p.snap1)"
 es_get "$NODE_STATS" "$OUT/node_stats_1.json" >/dev/null
 
 # 변하지 않는 정보는 대기 시간 동안 수집
-msg "구성 정보 수집 (대기 ${GAP}초 동안)"
+msg "$(t p.config "$GAP")"
 es_get "_cat/nodes?format=json&h=name,node.role,master,disk.used_percent,disk.avail,disk.total,heap.percent,ram.percent,cpu,load_1m,version" "$OUT/cat_nodes.json" >/dev/null
 es_get "_cat/allocation?format=json&bytes=b&h=node,shards,disk.indices,disk.used,disk.avail,disk.total,disk.percent" "$OUT/cat_allocation.json" >/dev/null
 es_get "_cluster/health" "$OUT/health.json" >/dev/null
@@ -117,19 +145,21 @@ es_get "_all/_ilm/explain?only_managed=true&filter_path=indices.*.phase,indices.
 [[ $DEEP -eq 1 ]] && es_get "_cat/indices?format=json&bytes=b&h=index,health,pri,rep,docs.count,store.size,pri.store.size&s=store.size:desc" "$OUT/cat_indices.json" >/dev/null
 
 sleep "$GAP"
-msg "2차 스냅샷"
+msg "$(t p.snap2)"
 es_get "$NODE_STATS" "$OUT/node_stats_2.json" >/dev/null
 echo "end_wall=$(date '+%Y-%m-%d %H:%M:%S %z')" >> "$OUT/meta"
 
-tar -C "$OUT_BASE" -czf "$OUT.tar.gz" "$(basename "$OUT")" 2>/dev/null
-msg "완료: $OUT  (번들 $OUT.tar.gz)"
-HERE="$(cd "$(dirname "$0")" && pwd)"; PY=""
+PY=""
 for c in python3 /usr/libexec/platform-python; do
   command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info>=(3,6) else 1)' 2>/dev/null && { PY="$c"; break; }
 done
+# HTML 은 번들을 묶기 전에 두 언어로 만든다 (es_cluster_report.ko.html, es_cluster_report.en.html)
 if [[ -n "$PY" && -f "$HERE/es_disk_render.py" ]]; then
-  "$PY" "$HERE/es_disk_render.py" --cluster-only "$OUT" -o "$OUT/es_cluster_report.html"
+  "$PY" "$HERE/es_disk_render.py" --cluster-only "$OUT" --lang both -o "$OUT/es_cluster_report.html" >/dev/null && \
+    msg "$(t p.html "$OUT/es_cluster_report.$LNG.html")"
 else
-  msg "HTML 은 PC 에서: python3 es_disk_render.py --cluster-only $(basename "$OUT").tar.gz"
+  msg "$(t p.nopy "$(basename "$OUT").tar.gz")"
 fi
-msg "노드 번들과 합쳐 보려면: python3 es_disk_render.py <노드 번들> --cluster $OUT"
+tar -C "$OUT_BASE" -czf "$OUT.tar.gz" "$(basename "$OUT")" 2>/dev/null
+msg "$(t p.done "$OUT" "$OUT.tar.gz")"
+msg "$(t p.merge "$OUT")"

@@ -52,6 +52,32 @@
 # =============================================================================
 set -u
 umask 077
+# ── Language: --lang ko|en, otherwise ko when the locale starts with ko, else en ──
+# Text lives in i18n/<lang>.txt (key = "text"); missing keys fall back to ko.
+_LOC0="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+LNG=""; _p=""
+for _a in "$@"; do [[ "$_p" == --lang ]] && LNG="$_a"; [[ "$_a" == --lang=* ]] && LNG="${_a#--lang=}"; _p="$_a"; done
+[[ "$LNG" == ko || "$LNG" == en ]] || { [[ "$_LOC0" == ko* ]] && LNG=ko || LNG=en; }
+HERE="$(cd "$(dirname "$0")" && pwd)"
+declare -A _M=()
+_catload() {  # $1=file $2=key prefix
+  local line k v
+  [[ -r "$1" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == "$2"* && "$line" == *' = "'* ]] || continue
+    k="${line%% = \"*}"; [[ -n "${_M[$k]+x}" ]] && continue
+    v="${line#* = \"}"; v="${v%\"}"
+    v="${v//\\\"/\"}"; v="${v//\\n/$'\n'}"; v="${v//\\\\/\\}"
+    _M[$k]="$v"
+  done < "$1"
+}
+t() {  # t key [values...]  → {1}, {2} ... 자리에 값
+  local s="${_M[$1]:-$1}" i=1 a
+  shift
+  for a in "$@"; do s="${s//\{$i\}/$a}"; i=$((i + 1)); done
+  printf '%s' "$s"
+}
+_catload "$HERE/i18n/$LNG.txt" c.; _catload "$HERE/i18n/ko.txt" c.
 export LC_ALL=C
 
 VERSION="0.10.0"
@@ -78,16 +104,18 @@ while [[ $# -gt 0 ]]; do
     --platform)  PLATFORM="$2"; shift 2 ;;
     --smart)     SMART=1; shift ;;
     --no-hw)     HW=0; shift ;;
-    -h|--help) awk 'NR>1 && /^#/{print;next} NR>1{exit}' "$0"; exit 0 ;;
-    *) echo "알 수 없는 옵션: $1"; exit 1 ;;
+    --lang) shift 2 ;;
+    --lang=*) shift ;;
+    -h|--help) t c.help; echo; exit 0 ;;
+    *) t c.badopt "$1"; echo; exit 1 ;;
   esac
 done
 ES_PASSWORD="${ES_PASSWORD:-}"; ES_API_KEY="${ES_API_KEY:-}"
 
-[[ "$INT" =~ ^[0-9]+$ && "$INT" -ge 1 ]] || { echo "-i 는 1 이상 정수"; exit 1; }
-[[ "$DUR" =~ ^[0-9]+$ && "$DUR" -ge $((INT*3)) ]] || { echo "-d 는 간격의 3배 이상"; exit 1; }
-case "$STORAGE" in auto|allflash|hybrid|vmfs|nvme|ssd|hdd) ;; *) echo "-s 는 auto|allflash|hybrid|vmfs|nvme|ssd|hdd"; exit 1 ;; esac
-case "$PLATFORM" in auto|vmware|baremetal|vm) ;; *) echo "--platform 은 auto|vmware|baremetal|vm"; exit 1 ;; esac
+[[ "$INT" =~ ^[0-9]+$ && "$INT" -ge 1 ]] || { t c.bad_i; echo; exit 1; }
+[[ "$DUR" =~ ^[0-9]+$ && "$DUR" -ge $((INT*3)) ]] || { t c.bad_d; echo; exit 1; }
+case "$STORAGE" in auto|allflash|hybrid|vmfs|nvme|ssd|hdd) ;; *) t c.bad_s; echo; exit 1 ;; esac
+case "$PLATFORM" in auto|vmware|baremetal|vm) ;; *) t c.bad_platform; echo; exit 1 ;; esac
 ES_URL="${ES_URL%/}"        # 뒤 슬래시 제거. 붙어 있으면 //_cluster/health 로 요청이 나감
 
 msg() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
@@ -97,7 +125,7 @@ renice -n 19 -p $$ >/dev/null 2>&1 || true
 command -v ionice >/dev/null 2>&1 && ionice -c 3 -p $$ >/dev/null 2>&1 || true
 
 IS_ROOT=0; [[ $EUID -eq 0 ]] && IS_ROOT=1
-[[ $IS_ROOT -eq 0 ]] && msg "⚠ root가 아닙니다. ES 프로세스 I/O, dmesg, 가상화·장치 정보 일부가 빠질 수 있습니다."
+[[ $IS_ROOT -eq 0 ]] && msg "$(t c.notroot)"
 
 # ── ES 프로세스와 data 경로를 먼저 찾는다 ─────────────────────────────────
 # 결과 저장 위치를 고르고 ES 주소를 찾는 데 쓴다. 사용자가 경로·주소를 몰라도 되게 하려는 것
@@ -110,7 +138,7 @@ for p in $(pgrep -f 'org\.elasticsearch\.bootstrap\.Elasticsearch' 2>/dev/null);
   if [[ "$c" == "java" || "${a0##*/}" == java* ]]; then ES_PID=$p; break; fi
 done
 N_ES=$(for p in $(pgrep -x java 2>/dev/null); do grep -qa 'org.elasticsearch.bootstrap.Elasticsearch' /proc/$p/cmdline 2>/dev/null && echo $p; done | wc -l)
-[[ "$N_ES" -gt 1 ]] && msg "⚠ 이 서버에 ES 노드가 ${N_ES}개 떠 있습니다. 첫 번째(pid $ES_PID) 기준으로 수집합니다. 다른 노드는 -p 로 data 경로를 지정하세요"
+[[ "$N_ES" -gt 1 ]] && msg "$(t c.multi_es "$N_ES" "$ES_PID")"
 ES_CMDLINE=""; [[ -n "$ES_PID" ]] && ES_CMDLINE=$(tr '\0' ' ' < /proc/$ES_PID/cmdline 2>/dev/null)
 CONF_DIR=$(printf '%s' "$ES_CMDLINE" | grep -oE 'es\.path\.conf=[^ ]+' | head -1 | cut -d= -f2)
 CONF_DIR=${CONF_DIR:-${ES_PATH_CONF:-/etc/elasticsearch}}
@@ -121,7 +149,7 @@ ES_ROOT=""
 if [[ -n "$ES_PID" && -r /proc/$ES_PID/root/ ]] && \
    [[ "$(stat -L -c '%d:%i' /proc/$ES_PID/root/ 2>/dev/null)" != "$(stat -L -c '%d:%i' / 2>/dev/null)" ]]; then
   ES_ROOT="/proc/$ES_PID/root"
-  msg "ES 가 컨테이너 안에서 실행 중입니다 (pid $ES_PID). 컨테이너의 mount 정보로 data 디스크를 찾습니다"
+  msg "$(t c.container "$ES_PID")"
 fi
 
 # elasticsearch.yml 의 path.data. 한 줄(path.data: /a, [/a, /b])과 중첩(path:\n  data: ...), 목록(- /a) 표기를 모두 읽는다
@@ -164,7 +192,7 @@ if [[ $OUT_GIVEN -eq 0 ]] && same_fs_as_data "$OUT_BASE"; then
     [[ -d "$cand" && -w "$cand" ]] || continue
     same_fs_as_data "$cand" && continue
     [[ "$(df -Pk "$cand" 2>/dev/null | awk 'NR==2{print $4}')" -ge 51200 ]] 2>/dev/null || continue
-    msg "결과 저장 위치를 $cand 로 정했습니다 ($OUT_BASE 는 ES data 와 같은 디스크)"
+    msg "$(t c.outdir_moved "$cand" "$OUT_BASE")"
     OUT_BASE="$cand"; break
   done
 fi
@@ -175,8 +203,8 @@ OUT="$OUT_BASE/esdisk_${HOST}_${TS}"
 S="$OUT/static"
 # 출력 위치 여유 공간 (50MB 미만이면 중단. 서비스 디스크를 채우지 않으려고). 디렉터리를 만들기 전에 본다
 AVAIL_KB=$(df -Pk "$OUT_BASE" 2>/dev/null | awk 'NR==2{print $4}')
-[[ "${AVAIL_KB:-0}" -lt 51200 ]] && { echo "출력 경로 여유 공간 부족 (<50MB): $OUT_BASE"; exit 1; }
-mkdir -p "$S" || { echo "출력 디렉터리 생성 실패: $OUT"; exit 1; }
+[[ "${AVAIL_KB:-0}" -lt 51200 ]] && { t c.nospace "$OUT_BASE"; echo; exit 1; }
+mkdir -p "$S" || { t c.mkdir_fail "$OUT"; echo; exit 1; }
 
 cat > "$OUT/meta" <<EOF
 tool_version=$VERSION
@@ -212,7 +240,7 @@ for p in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do
 done > "$S/datadev" 2>/dev/null
 [[ -n "$ES_ROOT" ]] && echo "es_in_container=1" >> "$OUT/meta"
 
-msg "수집 시작 → $OUT  (측정 ${DUR}s / 간격 ${INT}s)"
+msg "$(t c.start "$OUT" "$DUR" "$INT")"
 
 # ── 헬퍼 ──────────────────────────────────────────────────────────────────
 save()  { local f="$1"; shift; "$@" > "$S/$f" 2>&1 || true; }
@@ -221,7 +249,7 @@ catf()  { [[ -r "$1" ]] && cat "$1" 2>/dev/null; }
 # =============================================================================
 # 1. 정적 스냅샷 (설정·구성)
 # =============================================================================
-msg "[1/4] 시스템 구성 스냅샷"
+msg "$(t c.step1)"
 save uname      uname -a
 save os-release cat /etc/os-release
 save nproc      nproc
@@ -601,7 +629,7 @@ if [[ $NO_ESLOG -eq 0 && -d "$ES_LOG_DIR" ]]; then
     sz=$(stat -c %s "$lf" 2>/dev/null || echo 0)
     want=$((mb*1048576)); [[ "$sz" -lt "$want" ]] && want=$sz
     ESLOG_BYTES=$((ESLOG_BYTES + want))
-    echo "#FILE $lf (끝 ${mb}MB)"
+    echo "#FILE $lf (tail ${mb}MB)"
     tail -c "$((mb*1048576))" "$lf" 2>/dev/null | grep -Eia "$ESLOGPAT" | tail -100
   done < <(find -H "$ES_LOG_DIR" -maxdepth 1 -name '*.log' -mtime -7 -size -2G -printf '%T@\t%p\n' 2>/dev/null \
             | grep -vE '(gc|deprecation|audit|slowlog|index_search|index_indexing)[^/]*\.log$' \
@@ -667,18 +695,18 @@ if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
         [[ "$c" == "200" || "$c" == "401" ]] && break 2
       done
     done
-    [[ "$c" == "200" || "$c" == "401" ]] && msg "ES 주소 자동 탐지: $ES_URL"
+    [[ "$c" == "200" || "$c" == "401" ]] && msg "$(t c.es_found "$ES_URL")"
   fi
   [[ -n "$c" ]] || c=$(es_get "" "$S/es_root.json")
   # 인증이 필요한데 계정을 안 줬으면, 터미널에서 실행 중일 때 직접 물어본다.
   # 비밀번호가 셸 history 나 프로세스 목록에 남지 않는다
   if [[ "$c" == "401" && -z "$ES_USER" && -z "$ES_API_KEY" && -t 0 && -r /dev/tty ]]; then
-    msg "ES 가 인증을 요구합니다. 조회 전용 권한(monitor)이면 충분합니다. 빈 값으로 Enter 를 누르면 ES 조회 없이 진행합니다"
-    read -r -p "  ES 사용자: " ES_USER < /dev/tty
+    msg "$(t c.auth_ask)"
+    read -r -p "  $(t c.user): " ES_USER < /dev/tty
     if [[ -n "$ES_USER" ]]; then
-      read -rs -p "  비밀번호: " ES_PASSWORD < /dev/tty; echo >&2
+      read -rs -p "  $(t c.password): " ES_PASSWORD < /dev/tty; echo >&2
       c=$(es_get "" "$S/es_root.json")
-      [[ "$c" == "401" ]] && msg "⚠ 인증 실패 (401). OS 레벨만 수집합니다"
+      [[ "$c" == "401" ]] && msg "$(t c.auth_fail)"
     fi
   fi
   echo "es_url=$ES_URL" >> "$OUT/meta"; echo "es_http=$c" >> "$OUT/meta"
@@ -688,9 +716,9 @@ if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
     es_get "_cluster/settings?include_defaults=true&filter_path=**.cluster.routing.allocation.disk*,**.cluster.routing.allocation.awareness*" "$S/es_cluster_settings.json" >/dev/null
     es_get "_cluster/health?filter_path=status,number_of_nodes,active_shards,relocating_shards,initializing_shards,unassigned_shards" "$S/es_health.json" >/dev/null
   elif [[ "$c" == "401" ]]; then
-    msg "⚠ ES 인증 필요 (401). --es-user + ES_PASSWORD 또는 ES_API_KEY 지정 시 ES 지표 포함"
+    msg "$(t c.auth_need)"
   else
-    msg "⚠ ES API 접속 실패 (http=$c). OS 레벨만 수집합니다"
+    msg "$(t c.es_fail "$c")"
   fi
 fi
 NODE_STATS_PATH="_nodes/_local/stats/indices,fs,thread_pool,jvm,indexing_pressure?filter_path=nodes.*.timestamp,nodes.*.name,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.store,nodes.*.indices.segments,nodes.*.indices.translog,nodes.*.fs,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.thread_pool.merge,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.jvm.gc,nodes.*.indexing_pressure,nodes.*.indices.shard_stats"
@@ -708,7 +736,7 @@ if [[ $ES_OK -eq 1 ]]; then
     CL_SHARDS=$(grep -oE '"active_shards": *[0-9]+' "$S/es_health.json" 2>/dev/null | head -1 | tr -dc '0-9')
     if [[ "${NODE_SHARDS:-0}" -ge 2000 || "${CL_SHARDS:-0}" -ge 20000 ]]; then
       NO_IDXSTATS=1; echo "index_stats_auto_skip=1" >> "$OUT/meta"
-      msg "샤드가 많아(이 노드 ${NODE_SHARDS:-?}개, 클러스터 ${CL_SHARDS:-?}개) 인덱스별 조회는 생략합니다"
+      msg "$(t c.idx_skip "${NODE_SHARDS:-?}" "${CL_SHARDS:-?}")"
     fi
   fi
   [[ $NO_IDXSTATS -eq 0 ]] && es_get "$IDX_STATS_PATH" "$S/es_idx_start.json" >/dev/null
@@ -721,8 +749,8 @@ if [[ $ES_OK -eq 1 ]]; then
       echo "cluster=ok" >> "$OUT/meta"
     else
       echo "cluster=failed_$CC" >> "$OUT/meta"
-      msg "⚠ 클러스터 조회 실패 (http=$CC). 이 노드 결과만으로 리포트를 만듭니다"
-      msg "  필요 권한: cluster monitor. 권한이 없으면 --no-cluster 로 경고 없이 실행하세요."
+      msg "$(t c.cluster_fail "$CC")"
+      msg "$(t c.cluster_perm)"
       NO_CLUSTER=1
     fi
   fi
@@ -731,7 +759,7 @@ fi
 # =============================================================================
 # 2. 샘플링 루프: 한 번에 awk 1회 (fork 1개)
 # =============================================================================
-msg "[2/4] 샘플링 ${DUR}초 (Ctrl+C 시 그때까지의 데이터로 진행)"
+msg "$(t c.step2 "$DUR")"
 STOP=0; trap 'STOP=1' INT TERM
 
 FILES=(/proc/diskstats /proc/stat /proc/vmstat /proc/meminfo /proc/net/dev /proc/net/snmp)
@@ -784,7 +812,7 @@ echo "end_wall=$(date '+%Y-%m-%d %H:%M:%S %z')" >> "$OUT/meta"
 # =============================================================================
 # 3. 종료 스냅샷
 # =============================================================================
-msg "[3/4] 종료 스냅샷"
+msg "$(t c.step3)"
 if [[ $ES_OK -eq 1 ]]; then
   es_get "$NODE_STATS_PATH" "$S/es_stats_end.json" >/dev/null
   [[ $NO_IDXSTATS -eq 0 ]] && es_get "$IDX_STATS_PATH"  "$S/es_idx_end.json"   >/dev/null
@@ -810,7 +838,7 @@ awk -F'\t' '{n++; b+=$2} END{printf "es_api_calls=%d\nes_api_bytes=%d\n", n+0, b
   echo "light_mode=$(( NO_ESLOG & NO_KLOG & NO_SAR & NO_MAPS ))"
   echo "skipped=$( [[ $NO_ESLOG -eq 1 ]] && printf 'eslog '; [[ $NO_KLOG -eq 1 ]] && printf 'klog '; \
                    [[ $NO_SAR -eq 1 ]] && printf 'sar '; [[ $NO_MAPS -eq 1 ]] && printf 'maps '; \
-                   [[ $NO_IDXSTATS -eq 1 ]] && printf 'index-stats%s ' "$(grep -q '^index_stats_auto_skip=1' "$OUT/meta" && echo '(자동)')" )"
+                   [[ $NO_IDXSTATS -eq 1 ]] && printf 'index-stats%s ' "$(grep -q '^index_stats_auto_skip=1' "$OUT/meta" && echo '(auto)')" )"
 } >> "$OUT/meta"
 
 # 결과를 ES data 와 같은 파일시스템에 쓰고 있으면 경고.
@@ -819,8 +847,8 @@ OUT_DEV=$(df -Pk "$OUT_BASE" 2>/dev/null | awk 'NR==2{print $1}')
 for dp in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do
   [[ -d "$dp" ]] || continue
   if [[ "$(df -Pk "$dp" 2>/dev/null | awk 'NR==2{print $1}')" == "$OUT_DEV" ]]; then
-    msg "⚠ 결과 저장 위치($OUT_BASE)가 ES data 경로($dp)와 같은 파일시스템입니다."
-    msg "  측정 대상 디스크에 쓰기를 더하게 됩니다. 다음부터는 -o 로 다른 디스크를 지정하세요."
+    msg "$(t c.samefs "$OUT_BASE" "$dp")"
+    msg "$(t c.samefs2)"
     echo "out_on_data_fs=1" >> "$OUT/meta"
     break
   fi
@@ -829,15 +857,18 @@ done
 # =============================================================================
 # 4. 번들 + HTML
 # =============================================================================
-msg "[4/4] 요약 판정과 번들 생성"
-HERE="$(cd "$(dirname "$0")" && pwd)"
-# 셸(awk)만으로 만드는 요약 판정. Python 이 없는 서버에서도 결과를 바로 본다 (summary.txt 로도 남김)
+msg "$(t c.step4)"
+# 셸(awk)만으로 만드는 요약 판정. Python 이 없는 서버에서도 결과를 바로 본다.
+# 화면에는 고른 언어로 보여 주고, 번들에는 두 언어(summary.ko.txt, summary.en.txt)를 모두 남긴다
 echo >&2
 if [[ -f "$HERE/es_disk_summary.sh" ]]; then
-  bash "$HERE/es_disk_summary.sh" "$OUT" >&2 || true
+  bash "$HERE/es_disk_summary.sh" "$OUT" --lang "$LNG" >&2 || true
+  for l in ko en; do
+    [[ "$l" == "$LNG" ]] || bash "$HERE/es_disk_summary.sh" "$OUT" --lang "$l" >/dev/null 2>&1 || true
+  done
 fi
 echo >&2
-# HTML 은 번들을 묶기 전에 만든다. 번들 하나만 전달해도 리포트가 같이 가도록
+# HTML 은 번들을 묶기 전에 두 언어로 만든다 (es_disk_report.ko.html, es_disk_report.en.html)
 PY=""
 for c in python3 /usr/libexec/platform-python python; do
   command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info>=(3,6) else 1)' 2>/dev/null && { PY="$c"; break; }
@@ -845,12 +876,12 @@ done
 if [[ $NO_RENDER -eq 1 ]]; then
   :
 elif [[ -n "$PY" && -f "$HERE/es_disk_render.py" ]]; then
-  "$PY" "$HERE/es_disk_render.py" "$OUT" -o "$OUT/es_disk_report.html" >/dev/null && \
-    msg "HTML 리포트: $OUT/es_disk_report.html"
+  "$PY" "$HERE/es_disk_render.py" "$OUT" --lang both -o "$OUT/es_disk_report.html" >/dev/null && \
+    msg "$(t c.html "$OUT/es_disk_report.$LNG.html")"
 else
-  msg "이 서버에는 Python 3.6+ 가 없어 HTML 리포트는 만들지 않았습니다. 위 요약이 셸 판정 결과입니다."
-  msg "전체 리포트는 번들을 PC 로 옮겨: python3 es_disk_render.py $(basename "$OUT").tar.gz"
+  msg "$(t c.nopy)"
+  msg "$(t c.nopy2 "$(basename "$OUT").tar.gz")"
 fi
 tar -C "$OUT_BASE" -czf "$OUT.tar.gz" "$(basename "$OUT")" 2>/dev/null
-msg "요약: $OUT/summary.txt"
-msg "완료. 번들: $OUT.tar.gz"
+msg "$(t c.summary "$OUT/summary.$LNG.txt")"
+msg "$(t c.done "$OUT.tar.gz")"

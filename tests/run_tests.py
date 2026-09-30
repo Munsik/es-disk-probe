@@ -22,7 +22,7 @@ def run(name, work):
 def shell_verdict(bundle):
     """es_disk_summary.sh(bash+awk)의 판정 문구와 전체 출력. 셸 요약과 HTML 판정이 같아야 한다."""
     sh = os.path.join(os.path.dirname(HERE), "es_disk_summary.sh")
-    out = subprocess.run(["bash", sh, bundle], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    out = subprocess.run(["bash", sh, bundle, "--lang", "ko"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          universal_newlines=True).stdout
     m = re.search(r"^판정: (.*)$", out, re.M)
     return (m.group(1) if m else "(판정 없음) " + out[-200:]), out

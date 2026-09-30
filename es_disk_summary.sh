@@ -10,12 +10,24 @@
 # 판정 기준은 HTML 리포트와 같습니다 (README "기준값 출처").
 # =============================================================================
 set -u
+# 언어: --lang ko|en, 없으면 로케일(LC_ALL, LC_MESSAGES, LANG)이 ko 로 시작하면 ko, 아니면 en
+B="" LNG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in --lang) LNG="${2:-}"; shift 2 ;; --lang=*) LNG="${1#--lang=}"; shift ;; *) B="$1"; shift ;; esac
+done
+if [[ "$LNG" != ko && "$LNG" != en ]]; then
+  _loc="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"; [[ "$_loc" == ko* ]] && LNG=ko || LNG=en
+fi
 export LC_ALL=C
-B="${1:-}"
-[[ -n "$B" && -d "$B/static" ]] || { echo "사용: $0 <번들 디렉터리>"; exit 1; }
+HERE="$(cd "$(dirname "$0")" && pwd)"
+CATF="$HERE/i18n/$LNG.txt"; CATFB="$HERE/i18n/ko.txt"
+if [[ -z "$B" || ! -d "$B/static" ]]; then
+  [[ "$LNG" == ko ]] && echo "사용: $0 <번들 디렉터리> [--lang ko|en]" || echo "usage: $0 <bundle dir> [--lang ko|en]"
+  exit 1
+fi
 S="$B/static"
 
-awk -v B="$B" '
+awk -v B="$B" -v CATF="$CATF" -v CATFB="$CATFB" '
 function kv(line,   i) { i = index(line, "="); return i ? substr(line, i + 1) : "" }
 function sortn(a, n,   i, j, t) { for (i = 2; i <= n; i++) { t = a[i]; j = i - 1; while (j >= 1 && a[j] > t) { a[j+1] = a[j]; j-- } a[j+1] = t } }
 function pct(a, n, p,   k) { if (n < 1) return -1; sortn(a, n); k = int(p * (n - 1) + 0.5) + 1; return a[k] }
@@ -26,13 +38,31 @@ function f2(x) { return (x < 0) ? "-" : sprintf("%.2f", x) }
 function add(sev, title, act, kind) { nf++; FS_[nf] = sev; FT[nf] = title; FA[nf] = act
   if (kind == "run") { if (rank[sev] > wrun) wrun = rank[sev] }
   else if (rank[sev] > wcfg) wcfg = rank[sev] }
+# 문구 카탈로그 (i18n/<lang>.txt, key = "text"). 없는 키는 ko 로, 그래도 없으면 키 그대로
+function catline(line, A,   p, k, v) {
+  if (line ~ /^[ \t]*#/) return
+  p = index(line, " = \""); if (!p) return
+  k = substr(line, 1, p - 1); gsub(/[ \t]+$/, "", k)
+  v = substr(line, p + 4); sub(/"[ \t]*$/, "", v)
+  gsub(/\\"/, "\"", v); gsub(/\\n/, "\n", v); gsub(/\\\\/, "\\", v)
+  A[k] = v
+}
+function msg(k) { return (k in M) ? M[k] : ((k in MF) ? MF[k] : k) }
+function tr(k, a1, a2, a3, a4, a5,   s) {
+  s = msg(k)
+  gsub(/\{1\}/, a1, s); gsub(/\{2\}/, a2, s); gsub(/\{3\}/, a3, s); gsub(/\{4\}/, a4, s); gsub(/\{5\}/, a5, s)
+  return s
+}
 function phys(k, depth,   s, out, i, n, arr) {
   if (depth > 8 || k == "") return ""
   if (k in part_parent) return phys(part_parent[k], depth + 1)
   if (k in slaves) { n = split(slaves[k], arr, " "); out = ""; for (i = 1; i <= n; i++) if (arr[i] != "") out = out " " phys(arr[i], depth + 1); return out }
   return " " k
 }
-BEGIN { rank["참고"] = 1; rank["주의"] = 2; rank["경고"] = 3; rank["위험"] = 4; wrun = 0; wcfg = 0 }
+BEGIN { rank["info"] = 1; rank["caution"] = 2; rank["warn"] = 3; rank["crit"] = 4; wrun = 0; wcfg = 0
+  while ((getline cl < CATF) > 0) catline(cl, M); close(CATF)
+  while ((getline cl < CATFB) > 0) catline(cl, MF); close(CATFB)
+  SEVK["info"] = "r.0013"; SEVK["caution"] = "r.0014"; SEVK["warn"] = "r.0015"; SEVK["crit"] = "r.0016" }
 FILENAME ~ /\/meta$/ { split($0, m, "="); meta[m[1]] = kv($0); next }
 FILENAME ~ /\/static\/virt$/ { split($0, m, "="); virt[m[1]] = kv($0); next }
 FILENAME ~ /\/static\/sysctl$/ { split($0, m, "="); sysctl[m[1]] = kv($0); next }
@@ -52,13 +82,13 @@ FILENAME ~ /\/static\/swaps$/ { if (FNR > 1 && NF) { swaps++; swdev[swaps] = $1 
 FILENAME ~ /\/static\/es_nodeinfo\.json$/ { if ($0 ~ /"mlockall" *: *true/) mlock = "true"; else if ($0 ~ /"mlockall" *: *false/) mlock = "false"; next }
 FILENAME ~ /\/static\/klog_io$/ {
   l = tolower($0)
-  if (l ~ /i\/o error|blk_update_request|medium error|rejecting i\/o/) kl["I/O 오류"]++
-  if (l ~ /xfs .*(error|shutdown|corruption)|ext4-fs error|read-only/) kl["파일시스템 오류"]++
+  if (l ~ /i\/o error|blk_update_request|medium error|rejecting i\/o/) kl["io_err"]++
+  if (l ~ /xfs .*(error|shutdown|corruption)|ext4-fs error|read-only/) kl["fs_err"]++
   if (l ~ /hung_task|blocked for more than/) kl["hung task"]++
   if (l ~ /abort|reset/) kl["abort/reset"]++
-  if (l ~ /timed out|timing out|timeout/) kl["타임아웃"]++
-  if (l ~ /megaraid_sas.*\/0x[0-9a-f]+\/(fatal|crit|dead|warn)|(megaraid|hpsa|smartpqi|aacraid|mpt3sas).*(battery|bbu|cachevault|degraded|offline|predictive|rebuild)/) kl["RAID 컨트롤러 이벤트"]++
-  if (l ~ /thin.*(out of data space|out-of-data-space)|snapshots: invalidating/) kl["LVM thin·snapshot 이상"]++
+  if (l ~ /timed out|timing out|timeout/) kl["timeout"]++
+  if (l ~ /megaraid_sas.*\/0x[0-9a-f]+\/(fatal|crit|dead|warn)|(megaraid|hpsa|smartpqi|aacraid|mpt3sas).*(battery|bbu|cachevault|degraded|offline|predictive|rebuild)/) kl["raid_evt"]++
+  if (l ~ /thin.*(out of data space|out-of-data-space)|snapshots: invalidating/) kl["thin"]++
   next }
 FILENAME ~ /\/static\/dmsetup_status$/ {
   for (i = 1; i < NF; i++) if ($i == "thin-pool") {
@@ -155,7 +185,7 @@ END {
     for (k in nv) { split(k, kk, SUBSEP); if (kk[2] == "model" && nv[k] ~ /Elastic Block Store|MSFT NVMe Accelerator|nvme_card-pd|PersistentDisk/) media = "cloud" }
   }
   else if (vv == "none" || virt["cpu_hypervisor_flag"] == "0") { plat = "bare-metal"; media = "" }
-  else { plat = "플랫폼 미확정"; media = "vm" }
+  else { plat = msg("s.plat_unknown"); media = "vm" }
   st = meta["storage"]; if (st != "" && st != "auto" && !(meta["tool_version"] ~ /^0\.9/)) media = st
   unsure = 0
   if (media == "") {
@@ -220,7 +250,7 @@ END {
     no = 0; split("", Y); for (i = 1; i <= nbusy; i++) if (busyd[i] != wd) Y[++no] = devp[busyd[i]]
     med = pct(Y, no, 0.5)
     if (med > 0 && wv >= c1 && wv >= 2 * med) {
-      add("경고", "묶음 디스크 중 " wd " 만 느림 (p95 " f2(wv) " ms, 나머지 중앙값 " f2(med) " ms)", "그 디스크의 SMART·커널 로그·경로를 확인하고 교체 검토", "run")
+      add("warn", tr("s.outlier", wd, f2(wv), f2(med)), msg("s.outlier.act"), "run")
       if (wv >= c3) outl = 4; else if (wv >= c2) outl = 3; else outl = 2
       if (outl > wrun) wrun = outl
     }
@@ -229,19 +259,19 @@ END {
   # ── 판정 ────────────────────────────────────────────────────────────
   lat = (rp > wp) ? rp : wp
   lowload = (ip < 50 && mp_ < 5)
-  if (nr + nw == 0) latj = "평가 불가 (I/O 가 거의 없음)"
-  else if (lat >= c3) { latj = "위험"; add("위험", "디스크 응답시간이 기준의 위험 수준 (p95 " f2(lat) " ms)", "HTML 리포트의 병목 위치 판정을 먼저 보세요", "run") }
-  else if (lat >= c2) { latj = "경고"; add("경고", "디스크 응답시간이 기준의 경고 수준 (p95 " f2(lat) " ms)", "HTML 리포트의 병목 위치 판정을 먼저 보세요", "run") }
-  else if (lat >= c1) { latj = "주의"; add("주의", "디스크 응답시간이 기준의 주의 수준 (p95 " f2(lat) " ms)", "피크 시간대 추세를 확인하세요", "run") }
-  else latj = "정상"
-  if (qd > 0 && qp >= 0 && qp / qd >= 0.8 && lat >= c1) add("경고", "큐 사용률 " int(100 * qp / qd) "% (aqu-sz p95 " f1(qp) " / queue_depth " qd ")", "디스크(가상 디스크)를 늘려 stripe 로 묶거나 부하를 나누세요", "run")
-  if (pp >= 20) add("경고", "I/O 압박(PSI io full) p95 " f1(pp) "%", "응답시간·D 상태와 함께 원인을 가르세요", "run")
-  else if (pp >= 5) add("주의", "I/O 압박(PSI io full) p95 " f1(pp) "%", "응답시간·D 상태와 함께 원인을 가르세요", "run")
-  if (dp >= 8) add("경고", "ES 스레드가 디스크 대기(D 상태)로 자주 멈춤 (p95 " dp "개)", "쓰기면 translog·merge, 읽기면 page cache 부족을 의심", "run")
-  if (hasf && tf / tdt >= 1 && tft / tf >= c1) add((tft / tf >= c2) ? "경고" : "주의", "flush(장치 캐시 비우기) 평균 " f2(tft / tf) " ms, 초당 " f1(tf / tdt) "회", "전원 차단 보호가 있는 SSD, 배터리 보호 RAID 캐시인지 확인")
+  if (nr + nw == 0) latj = msg("s.lat.na")
+  else if (lat >= c3) { latj = msg("r.0016"); add("crit", tr("s.lat.crit", f2(lat)), msg("s.lat.act_bad"), "run") }
+  else if (lat >= c2) { latj = msg("r.0015"); add("warn", tr("s.lat.warn", f2(lat)), msg("s.lat.act_bad"), "run") }
+  else if (lat >= c1) { latj = msg("r.0014"); add("caution", tr("s.lat.caution", f2(lat)), msg("s.lat.act_caution"), "run") }
+  else latj = msg("r.0011")
+  if (qd > 0 && qp >= 0 && qp / qd >= 0.8 && lat >= c1) add("warn", tr("s.queue", int(100 * qp / qd), f1(qp), qd), msg("s.queue.act"), "run")
+  if (pp >= 20) add("warn", tr("s.psi", f1(pp)), msg("s.psi.act"), "run")
+  else if (pp >= 5) add("caution", tr("s.psi", f1(pp)), msg("s.psi.act"), "run")
+  if (dp >= 8) add("warn", tr("s.dstate", dp), msg("s.dstate.act"), "run")
+  if (hasf && tf / tdt >= 1 && tft / tf >= c1) add((tft / tf >= c2) ? "warn" : "caution", tr("s.flush", f2(tft / tf), f1(tf / tdt)), msg("s.flush.act"))
   for (k in kl) if (kl[k] > 0) {
-    sv = (k ~ /I\/O 오류|파일시스템/) ? "위험" : (k ~ /타임아웃/ ? "주의" : "경고")
-    add(sv, "커널 로그: " k " " kl[k] "건 (최근 7일)", "번들의 static/klog_io 원문 시각을 담당자에게 전달", "run")
+    sv = (k ~ /^(io_err|fs_err)$/) ? "crit" : (k == "timeout" ? "caution" : "warn")
+    add(sv, tr("s.klog", msg("s.kl." k), kl[k]), msg("s.klog.act"), "run")
   }
   win = (ns >= 2) ? t[ns] - t[1] : 0
   for (d in ebsdev) if (win > 0) {
@@ -249,29 +279,29 @@ END {
     ev = ebsv[1, d, "vol", "i"] - ebsv[0, d, "vol", "i"]; x = ebsv[1, d, "vol", "t"] - ebsv[0, d, "vol", "t"]; if (x > ev) ev = x
     ei = ebsv[1, d, "inst", "i"] - ebsv[0, d, "inst", "i"]; x = ebsv[1, d, "inst", "t"] - ebsv[0, d, "inst", "t"]; if (x > ei) ei = x
     ev /= 1e6; ei /= 1e6
-    if (ev >= 0.01 * win) add((ev >= 0.1 * win) ? "경고" : "주의", "AWS EBS 볼륨 성능 한도 초과 " f1(ev) "초 (" d ", 측정 " int(win) "초 중)", "볼륨 IOPS·처리량 설정 상향 또는 볼륨 분산 (가상화·클라우드 관리자)", "run")
-    if (ei >= 0.01 * win) add((ei >= 0.1 * win) ? "경고" : "주의", "EC2 인스턴스 EBS 한도 초과 " f1(ei) "초 (" d ", 측정 " int(win) "초 중)", "EBS 대역폭이 더 큰 인스턴스 유형으로 변경 (가상화·클라우드 관리자)", "run")
+    if (ev >= 0.01 * win) add((ev >= 0.1 * win) ? "warn" : "caution", tr("s.ebs.vol", f1(ev), d, int(win)), msg("s.ebs.vol.act"), "run")
+    if (ei >= 0.01 * win) add((ei >= 0.1 * win) ? "warn" : "caution", tr("s.ebs.inst", f1(ei), d, int(win)), msg("s.ebs.inst.act"), "run")
   }
   mmc = sysctl["vm.max_map_count"] + 0
-  if (mmc > 0 && mmc < 262144) add("위험", "vm.max_map_count " mmc " (ES 최소 262144)", "sysctl -w vm.max_map_count=1048576 + /etc/sysctl.d 영구화")
+  if (mmc > 0 && mmc < 262144) add("crit", tr("s.mmc", mmc), msg("s.mmc.act"))
   for (i = 1; i <= ndev; i++) {
     d = dev[i]; ra = attr[d, "queue/read_ahead_kb"] + 0
-    if (ra > 128) add((ra >= 1024) ? "경고" : "주의", d " readahead " ra "KB (Elastic 권고 128KiB)", "blockdev --setra 256 /dev/" d " + udev 규칙")
-    sc = attr[d, "queue/scheduler"]; if (sc ~ /\[(cfq|bfq)\]/ && !(media == "hdd")) add("주의", d " I/O 스케줄러 " sc, "mq-deadline 또는 none")
-    stt = attr[d, "device/state"]; if (stt != "" && stt != "running") add("위험", d " 장치 상태 " stt, "커널 로그와 하드웨어 상태 즉시 확인", "run")
-    tmo = attr[d, "device/iotmo_cnt"]; if (tmo ~ /^0x/ && tmo != "0x0") add("주의", d " 명령 타임아웃 기록 " tmo " (부팅 후 누적)", "커널 로그의 timeout·reset 시각 확인", "run")
-    if (plat == "VMware Guest") { to = attr[d, "device/timeout"] + 0; if (to > 0 && to < 60) add("경고", d " SCSI timeout " to "초 (VMware 권고 180초)", "open-vm-tools 설치로 udev 규칙 적용") }
+    if (ra > 128) add((ra >= 1024) ? "warn" : "caution", tr("s.ra", d, ra), tr("s.ra.act", d))
+    sc = attr[d, "queue/scheduler"]; if (sc ~ /\[(cfq|bfq)\]/ && !(media == "hdd")) add("caution", tr("s.sched", d, sc), msg("s.sched.act"))
+    stt = attr[d, "device/state"]; if (stt != "" && stt != "running") add("crit", tr("s.devstate", d, stt), msg("s.devstate.act"), "run")
+    tmo = attr[d, "device/iotmo_cnt"]; if (tmo ~ /^0x/ && tmo != "0x0") add("caution", tr("s.iotmo", d, tmo), msg("s.iotmo.act"), "run")
+    if (plat == "VMware Guest") { to = attr[d, "device/timeout"] + 0; if (to > 0 && to < 60) add("warn", tr("s.scsito", d, to), msg("s.scsito.act")) }
     c = d; sub(/n[0-9]+$/, "", c)
     if (d ~ /^nvme/ && nv[c, "temp"] != "" && nv[c, "temp_max"] != "" && nv[c, "temp"] + 0 >= nv[c, "temp_max"] + 0)
-      add("경고", c " 온도 " int(nv[c, "temp"] / 1000) "C, 경고 온도 도달", "냉각·공기 흐름 점검")
+      add("warn", tr("s.nvmetemp", c, int(nv[c, "temp"] / 1000)), msg("s.nvmetemp.act"))
   }
   # swap: HTML 과 같은 규칙. 측정 중 swap 입출력, swap 켜짐 + memory_lock 꺼짐, swap 이 data 디스크에 있음
   swmax = 0
   for (s = 2; s <= ns; s++) if (((s - 1) in vmsw) && (s in vmsw) && t[s] > t[s - 1]) { r_ = (vmsw[s] - vmsw[s - 1]) / (t[s] - t[s - 1]); if (r_ > swmax) swmax = r_ }
-  if (swmax > 0) add("경고", "측정 중 swap 입출력 발생 (최대 " f1(swmax) " pages/s)", "swap 끄기(swapoff -a, /etc/fstab 정리) 또는 bootstrap.memory_lock: true")
+  if (swmax > 0) add("warn", tr("s.swapio", f1(swmax)), msg("s.swapio.act"))
   if (swaps > 0 && mlock != "true") {
     swp_ = sysctl["vm.swappiness"]
-    add((swp_ != "" && swp_ + 0 <= 1) ? "주의" : "경고", "swap 이 켜져 있고 memory_lock 도 " (mlock == "false" ? "꺼져 있음" : "확인 안 됨") " (swappiness " (swp_ == "" ? "-" : swp_) ")", "Elastic 권고 순서: swap 끄기 > bootstrap.memory_lock: true > vm.swappiness=1")
+    add((swp_ != "" && swp_ + 0 <= 1) ? "caution" : "warn", tr("s.swapml", msg(mlock == "false" ? "s.swapml.off" : "s.swapml.unknown"), (swp_ == "" ? "-" : swp_)), msg("s.swapml.act"))
   }
   if (!guess) for (i = 1; i <= swaps; i++) {
     k = swdev[i]; if (k !~ /^\/dev\//) continue
@@ -279,54 +309,54 @@ END {
     sp = phys(k, 0); n_ = split(sp, spa, " ")
     hit_ = 0
     for (j = 1; j <= n_; j++) for (q_ = 1; q_ <= ndev; q_++) if (spa[j] != "" && spa[j] == dev[q_]) hit_ = 1
-    if (hit_) add("주의", "swap 이 ES data 디스크에 있음 (" swdev[i] ")", "swap 을 다른 디스크로 옮기거나 끄기")
+    if (hit_) add("caution", tr("s.swapdata", swdev[i]), msg("s.swapdata.act"))
   }
   for (i = 1; i <= ndp; i++) if (dmount[dpath[i]]) {
     o = mnt_opt[dmount[dpath[i]]]; fs_ = mnt_fs[dmount[dpath[i]]]
-    if (o ~ /(^|,)(nobarrier|barrier=0)(,|$)/) add("경고", dpath[i] " barrier 꺼짐 (" o ")", "전원 차단 시 데이터 손실 위험. 옵션 제거")
-    if (o ~ /(^|,)(sync|dirsync)(,|$)/) add("경고", dpath[i] " sync 마운트", "sync 옵션 제거")
-    if (fs_ ~ /^(nfs|nfs4|cifs|tmpfs)$/) add("위험", dpath[i] " 파일시스템 " fs_, "로컬 블록 장치의 xfs/ext4 로 이전")
+    if (o ~ /(^|,)(nobarrier|barrier=0)(,|$)/) add("warn", tr("s.barrier", dpath[i], o), msg("s.barrier.act"))
+    if (o ~ /(^|,)(sync|dirsync)(,|$)/) add("warn", tr("s.syncmnt", dpath[i]), msg("s.syncmnt.act"))
+    if (fs_ ~ /^(nfs|nfs4|cifs|tmpfs)$/) add("crit", tr("s.netfs", dpath[i], fs_), msg("s.netfs.act"))
   }
-  if (thinmax >= 85) add((thinmax >= 95) ? "위험" : "경고", "LVM thin pool " thinname " 데이터 " sprintf("%.0f", thinmax) "% 사용", "pool 확장(lvextend) 또는 정리. 가득 차면 쓰기 중단")
-  else if (thinmax >= 70) add("주의", "LVM thin pool " thinname " 데이터 " sprintf("%.0f", thinmax) "% 사용", "사용률 상시 감시")
-  if (mddeg) add("경고", "소프트웨어 RAID degraded", "빠진 디스크 교체·재구성")
-  if (raid_vd) add("경고", "RAID 논리 디스크가 정상 상태가 아님 (컨트롤러 도구 조회)", "빠진 디스크 교체·재구성 확인")
-  if (raid_pd) add("경고", "RAID 구성 디스크 고장·재구성 (컨트롤러 도구 조회)", "해당 디스크 교체 검토")
-  if (raid_bat) add("경고", "RAID 배터리·캐시 보호 모듈이 정상이 아님 (컨트롤러 도구 조회)", "배터리·캐시 모듈 상태 확인. 캐시가 write-through 로 떨어졌을 수 있음")
-  if (raid_wt) add("주의", "RAID 쓰기 캐시가 write-through 로 동작 (컨트롤러 도구 조회)", "배터리 상태와 캐시 정책 확인. HDD 에서는 쓰기 지연이 크게 늘어남")
-  if (mdop) add("참고", "소프트웨어 RAID resync·check 진행 중 (측정값이 평소보다 나쁠 수 있음)", "작업 종료 후 재측정")
-  if (virt["cpu_governor"] ~ /^(powersave|conservative|ondemand)$/ && plat == "bare-metal") add("주의", "CPU governor " virt["cpu_governor"], "tuned-adm profile throughput-performance")
-  if (unsure && st == "auto") add("참고", "RAID 논리 디스크라 매체를 rotational 값으로 추정", "실제 매체가 다르면 -s ssd|hdd 로 다시 실행")
+  if (thinmax >= 85) add((thinmax >= 95) ? "crit" : "warn", tr("s.thin", thinname, sprintf("%.0f", thinmax)), msg("s.thin.act"))
+  else if (thinmax >= 70) add("caution", tr("s.thin", thinname, sprintf("%.0f", thinmax)), msg("s.thin.act_watch"))
+  if (mddeg) add("warn", msg("s.md"), msg("s.md.act"))
+  if (raid_vd) add("warn", msg("s.raidvd"), msg("s.raidvd.act"))
+  if (raid_pd) add("warn", msg("s.raidpd"), msg("s.raidpd.act"))
+  if (raid_bat) add("warn", msg("s.raidbat"), msg("s.raidbat.act"))
+  if (raid_wt) add("caution", msg("s.raidwt"), msg("s.raidwt.act"))
+  if (mdop) add("info", msg("s.mdop"), msg("s.mdop.act"))
+  if (virt["cpu_governor"] ~ /^(powersave|conservative|ondemand)$/ && plat == "bare-metal") add("caution", tr("s.gov", virt["cpu_governor"]), msg("s.gov.act"))
+  if (unsure && st == "auto") add("info", msg("s.unsure"), msg("s.unsure.act"))
 
   # 옆집 프로세스
   esp = meta["es_pid"]; tot = 0; top1 = ""; topv = 0
   for (pid in seen) { v = pio[1, pid] - pio[0, pid]; if (v <= 0 || !((0, pid) in pio)) continue; tot += v; if (pid == esp) esv = v; else if (v > topv) { topv = v; top1 = comm[pid] "(pid " pid ")" } }
-  if (tot >= 52428800 && esp != "" && (tot - esv) / tot >= 0.3 && !lowload) add("주의", "ES 가 아닌 프로세스의 디스크 I/O 비중 " int(100 * (tot - esv) / tot) "% (상위: " top1 " " int(topv / 1048576) "MB)", "그 프로세스가 ES data 디스크를 쓰는지 확인")
+  if (tot >= 52428800 && esp != "" && (tot - esv) / tot >= 0.3 && !lowload) add("caution", tr("s.neighbor", int(100 * (tot - esv) / tot), top1, int(topv / 1048576)), msg("s.neighbor.act"))
 
   # ── 출력 ────────────────────────────────────────────────────────────
-  if (wrun >= 3) verdict = "디스크 성능 저하 징후가 있습니다"
-  else if (lowload && wrun <= 2) { verdict = "설정 점검은 완료, 성능 판정은 보류합니다"; vnote = "측정 시간대 부하가 낮습니다. 인덱싱·검색 피크 시간대에 다시 실행하세요" }
-  else if (wcfg >= 3 || wrun == 2) verdict = "지금은 버티고 있지만 위험 요인이 있습니다"
-  else verdict = "디스크는 정상입니다"
-  mlab["nvme"] = "NVMe"; mlab["ssd"] = "SSD"; mlab["hdd"] = "HDD"; mlab["vmware"] = "VMware 공유 스토리지"; mlab["allflash"] = "vSAN All-Flash"
-  mlab["hybrid"] = "vSAN Hybrid"; mlab["vmfs"] = "VMware SAN·NFS 데이터스토어"; mlab["vm"] = "가상 디스크 공통"; mlab["network"] = "네트워크 블록"; mlab["cloud"] = "클라우드 볼륨"
-  printf "=== es-disk-probe 요약 판정 (셸) ===\n"
-  printf "호스트 %s · %s · 대상 디스크 %s%s\n", meta["host"], plat, devs, (guess ? " (data 경로 미확인, 전체 디스크)" : "")
+  if (wrun >= 3) verdict = msg("r.0946")
+  else if (lowload && wrun <= 2) { verdict = msg("r.0950"); vnote = msg("s.hold_note") }
+  else if (wcfg >= 3 || wrun == 2) verdict = msg("r.0952")
+  else verdict = msg("r.0954")
+  mlab["nvme"] = "NVMe"; mlab["ssd"] = "SSD"; mlab["hdd"] = "HDD"; mlab["vmware"] = msg("r.0002"); mlab["allflash"] = "vSAN All-Flash"
+  mlab["hybrid"] = "vSAN Hybrid"; mlab["vmfs"] = msg("r.0003"); mlab["vm"] = msg("r.0001"); mlab["network"] = msg("s.label.network"); mlab["cloud"] = msg("s.label.cloud")
+  printf "%s\n", msg("s.head")
+  printf "%s\n", tr("s.host", meta["host"], plat, devs, (guess ? msg("s.host.guess") : ""))
   cont = virt["detect_virt_container"]; if (cont == "" && virt["detect_virt"] ~ /^(docker|podman|lxc|lxc-libvirt|systemd-nspawn|openvz|rkt|wsl|proot|pouch|container-other)$/) cont = virt["detect_virt"]
-  if (cont != "" && cont != "none") printf "주의: 컨테이너(%s) 안에서 실행한 결과입니다. 가능하면 호스트에서 다시 실행하세요\n", cont
-  printf "판정 기준 %s%s · 응답시간 주의 %s / 경고 %s / 위험 %s ms\n", (media in mlab) ? mlab[media] : media, (unsure ? " (추정)" : ""), c1, c2, c3
-  printf "\n판정: %s\n", verdict
+  if (cont != "" && cont != "none") printf "%s\n", tr("s.container", cont)
+  printf "%s\n", tr("s.basis", (media in mlab) ? mlab[media] : media, (unsure ? msg("s.basis.guess") : ""), c1, c2, c3)
+  printf "\n%s\n", tr("s.verdict", verdict)
   if (vnote != "") printf "      %s\n", vnote
   printf "\n"
-  printf "응답시간 p95  읽기 %s ms · 쓰기 %s ms  → %s\n", f2(rp), f2(wp), latj
-  printf "부하 p95      IOPS %s · %s MB/s · aqu-sz %s%s · %%util %s\n", f1(ip), f1(mp_), f1(qp), (qd > 0 ? " / queue_depth " qd : ""), f1(up)
-  if (hasf && tf > 0) printf "flush         초당 %s회 · 평균 %s ms\n", f1(tf / tdt), f2(tft / tf)
-  printf "포화          PSI io full p95 %s%% · ES D 상태 스레드 p95 %s\n", (np_ ? f1(pp) : "-"), (nds ? dp : "-")
+  printf "%s\n", tr("s.l.lat", f2(rp), f2(wp), latj)
+  printf "%s\n", tr("s.l.load", f1(ip), f1(mp_), f1(qp), (qd > 0 ? " / queue_depth " qd : ""), f1(up))
+  if (hasf && tf > 0) printf "%s\n", tr("s.l.flush", f1(tf / tdt), f2(tft / tf))
+  printf "%s\n", tr("s.l.sat", (np_ ? f1(pp) : "-"), (nds ? dp : "-"))
   if (nf) {
-    printf "\n확인할 항목 (심각한 순)\n"
-    for (r = 4; r >= 1; r--) for (i = 1; i <= nf; i++) if (rank[FS_[i]] == r) printf "  [%s] %s\n         → %s\n", FS_[i], FT[i], FA[i]
-  } else printf "\n확인할 항목 없음\n"
-  printf "\n전체 판정(병목 위치, 클러스터 비교, 기준 출처)은 HTML 리포트에 있습니다.\n"
+    printf "\n%s\n", msg("s.items")
+    for (r = 4; r >= 1; r--) for (i = 1; i <= nf; i++) if (rank[FS_[i]] == r) printf "  [%s] %s\n         → %s\n", msg(SEVK[FS_[i]]), FT[i], FA[i]
+  } else printf "\n%s\n", msg("s.noitems")
+  printf "\n%s\n", msg("s.more")
 }' "$B/meta" "$S/virt" "$S/sysctl" "$S/sysfs" \
    $( [[ -r "$S/datadev" ]] && echo "$S/datadev" ) $( [[ -r "$S/data_paths" ]] && echo "$S/data_paths" ) \
    "$S/mounts" "$S/swaps" "$S/klog_io" \
@@ -336,4 +366,4 @@ END {
    $( [[ -r "$S/procio_start" ]] && echo "$S/procio_start" "$S/procio_end" ) \
    $( [[ -s "$S/ebs_stats_start" && -s "$S/ebs_stats_end" ]] && echo "$S/ebs_stats_start" "$S/ebs_stats_end" ) \
    $( [[ -r "$S/es_nodeinfo.json" ]] && echo "$S/es_nodeinfo.json" ) \
-   "$B/samples.raw" 2>/dev/null | tee "$B/summary.txt"
+   "$B/samples.raw" 2>/dev/null | tee "$B/summary.$LNG.txt"
