@@ -3,7 +3,7 @@
 [English](GUARDLINE.md) | 한국어
 
 이 문서는 디스크 때문에 Elasticsearch가 불안정해지는 일을 **미리 막기 위한 기준**입니다.
-진단 도구(`es_disk_collect.sh`)이 점검하는 항목과 기준값이 같습니다. 리포트의 "Best practice 대조표"와 나란히 보면 됩니다.
+진단 도구(`es_disk_collect.sh`)가 점검하는 항목과 기준값이 같습니다. 리포트의 "Best practice 대조표"와 나란히 보면 됩니다.
 
 기준마다 출처 종류를 붙였습니다.
 
@@ -86,7 +86,7 @@ Storage I/O Control·디스크 IOPS 한도, ESXi 경로 정책(Round Robin 등)�
 | 같은 디스크 공유 | swap, path.repo(스냅샷 저장소), path.logs 는 ES data 와 다른 디스크 | `swapon --show`, `findmnt -T <경로>` | [Elastic] |
 | 장치 오류 카운터 | `iotmo_cnt`·`ioerr_cnt` 가 늘면 경로·장치 점검 | `cat /sys/block/sdX/device/iotmo_cnt` | [OS] |
 
-**PVSCSI queue depth 상향(cmd_per_lun=254, ring_pages=32)은 VMware에서도 기본 적용 대상이 아닙니다.** 진단 리포트에서 "Guest 큐 포화"가 확인됐을 때만 적용합니다. 재부팅이 필요합니다. [Broadcom KB 343323 (구 2053145)]
+**PVSCSI queue depth 상향(cmd_per_lun=254, ring_pages=32)은 VMware에서도 기본 적용 대상이 아닙니다.** 진단 리포트에서 "Guest 쪽 큐가 가득 참"이 확인됐을 때만 적용합니다. 재부팅이 필요합니다. [Broadcom KB 343323 (구 2053145)]
 
 ---
 
@@ -147,7 +147,7 @@ Storage I/O Control·디스크 IOPS 한도, ESXi 경로 정책(Round Robin 등)�
 
 ## 5. 설정을 바꿀 때의 원칙
 
-이 도구킷은 아무것도 바꾸지 않습니다. 리포트의 조치 안내를 적용할 때는 아래 원칙을 지키세요.
+이 툴킷은 아무것도 바꾸지 않습니다. 리포트의 조치 안내를 적용할 때는 아래 원칙을 지키세요.
 
 1. **한 번에 하나씩** 바꿉니다. 여러 개를 동시에 바꾸면 어느 것이 효과였는지 알 수 없습니다.
 2. 바꾸기 전과 후에 같은 시간대로 이 도구를 돌려 비교합니다. 측정 없는 변경은 추측입니다.

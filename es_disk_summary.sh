@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_summary.sh  (v0.11.0)
+# es_disk_summary.sh  (v0.11.1)
 # Summarizes a collected bundle into a verdict with bash + awk only. Shows results right away even on servers without Python (RHEL 7 etc.).
 # Runs automatically when es_disk_collect.sh finishes. To run it separately:
 #
@@ -13,13 +13,13 @@ set -u
 # Language: --lang ko|en; if absent, ko when the locale (LC_ALL, LC_MESSAGES, LANG) starts with ko, else en
 B="" LNG=""
 while [[ $# -gt 0 ]]; do
-  case "$1" in --lang) LNG="${2:-}"; shift 2 ;; --lang=*) LNG="${1#--lang=}"; shift ;; *) B="$1"; shift ;; esac
+  case "$1" in --lang) LNG="${2:-}"; shift; [[ $# -gt 0 ]] && shift ;; --lang=*) LNG="${1#--lang=}"; shift ;; *) B="$1"; shift ;; esac
 done
 if [[ "$LNG" != ko && "$LNG" != en ]]; then
   _loc="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"; [[ "$_loc" == ko* ]] && LNG=ko || LNG=en
 fi
 export LC_ALL=C
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
 CATF="$HERE/i18n/$LNG.txt"; CATFB="$HERE/i18n/ko.txt"
 if [[ -z "$B" || ! -d "$B/static" ]]; then
   [[ "$LNG" == ko ]] && echo "사용: $0 <번들 디렉터리> [--lang ko|en]" || echo "usage: $0 <bundle dir> [--lang ko|en]"
@@ -48,9 +48,11 @@ function catline(line, A,   p, k, v) {
   A[k] = v
 }
 function msg(k) { return (k in M) ? M[k] : ((k in MF) ? MF[k] : k) }
+# "&" in a gsub replacement means the matched text, so escape it in values
+function amp(x) { gsub(/&/, "\\&", x); return x }
 function tr(k, a1, a2, a3, a4, a5,   s) {
   s = msg(k)
-  gsub(/\{1\}/, a1, s); gsub(/\{2\}/, a2, s); gsub(/\{3\}/, a3, s); gsub(/\{4\}/, a4, s); gsub(/\{5\}/, a5, s)
+  gsub(/\{1\}/, amp(a1), s); gsub(/\{2\}/, amp(a2), s); gsub(/\{3\}/, amp(a3), s); gsub(/\{4\}/, amp(a4), s); gsub(/\{5\}/, amp(a5), s)
   return s
 }
 function phys(k, depth,   s, out, i, n, arr) {
@@ -62,6 +64,9 @@ function phys(k, depth,   s, out, i, n, arr) {
 BEGIN { rank["info"] = 1; rank["caution"] = 2; rank["warn"] = 3; rank["crit"] = 4; wrun = 0; wcfg = 0
   while ((getline cl < CATF) > 0) catline(cl, M); close(CATF)
   while ((getline cl < CATFB) > 0) catline(cl, MF); close(CATFB)
+  n = split("kvm KVM qemu QEMU microsoft Hyper-V xen Xen amazon AWS_Nitro google Google_Compute_Engine oracle VirtualBox powervm IBM_PowerVM zvm IBM_z/VM parallels Parallels bhyve bhyve", hv_, " ")
+  for (i = 1; i < n; i += 2) { HVL[hv_[i]] = hv_[i + 1]; gsub(/_/, " ", HVL[hv_[i]]) }
+  HVL["vm"] = HVL["vm-other"] = HVL["unknown-vm"] = msg("r.0018")
   SEVK["info"] = "r.0013"; SEVK["caution"] = "r.0014"; SEVK["warn"] = "r.0015"; SEVK["crit"] = "r.0016" }
 FILENAME ~ /\/meta$/ { split($0, m, "="); meta[m[1]] = kv($0); next }
 FILENAME ~ /\/static\/virt$/ { split($0, m, "="); virt[m[1]] = kv($0); next }
@@ -84,8 +89,8 @@ FILENAME ~ /\/static\/klog_io$/ {
   l = tolower($0)
   if (l ~ /i\/o error|blk_update_request|medium error|rejecting i\/o/) kl["io_err"]++
   if (l ~ /xfs .*(error|shutdown|corruption)|ext4-fs error|read-only/) kl["fs_err"]++
-  if (l ~ /hung_task|blocked for more than/) kl["hung task"]++
-  if (l ~ /abort|reset/) kl["abort/reset"]++
+  if (l ~ /hung_task|blocked for more than/) kl["hung_task"]++
+  if (l ~ /abort|reset/) kl["abort_reset"]++
   if (l ~ /timed out|timing out|timeout/) kl["timeout"]++
   if (l ~ /megaraid_sas.*\/0x[0-9a-f]+\/(fatal|crit|dead|warn)|(megaraid|hpsa|smartpqi|aacraid|mpt3sas).*(battery|bbu|cachevault|degraded|offline|predictive|rebuild)/) kl["raid_evt"]++
   if (l ~ /thin.*(out of data space|out-of-data-space)|snapshots: invalidating/) kl["thin"]++
@@ -181,7 +186,7 @@ END {
   if (vv ~ /^(docker|podman|lxc|lxc-libvirt|systemd-nspawn|openvz|rkt|wsl|proot|pouch|container-other)$/) vv = ""
   if (vv == "vmware" || tolower(virt["sys_vendor"]) ~ /vmware/) { plat = "VMware Guest"; media = "vmware" }
   else if (vv != "" && vv != "none" && vv != "unknown") {
-    plat = vv " Guest"; media = "vm"
+    plat = ((vv in HVL) ? HVL[vv] : vv) " Guest"; media = "vm"
     for (k in nv) { split(k, kk, SUBSEP); if (kk[2] == "model" && nv[k] ~ /Elastic Block Store|MSFT NVMe Accelerator|nvme_card-pd|PersistentDisk/) media = "cloud" }
   }
   else if (vv == "none" || virt["cpu_hypervisor_flag"] == "0") { plat = "bare-metal"; media = "" }
@@ -224,10 +229,10 @@ END {
     }
     if (rio >= 20) R[++nr] = rtk / rio
     if (wio >= 20) W[++nw] = wtk / wio
-    I[++ni] = (rio + wio) / dt; M[++nb] = (rsec + wsec) * 512 / 1048576 / dt; Q[++nq] = wtd / (dt * 1000); U[++nu] = (util > 100 ? 100 : util)
+    I[++ni] = (rio + wio) / dt; MBS[++nb] = (rsec + wsec) * 512 / 1048576 / dt; Q[++nq] = wtd / (dt * 1000); U[++nu] = (util > 100 ? 100 : util)
     tf += fl; tft += ftk; tdt += dt
   }
-  rp = pct(R, nr, 0.95); wp = pct(W, nw, 0.95); ip = pct(I, ni, 0.95); mp_ = pct(M, nb, 0.95); qp = pct(Q, nq, 0.95); up = pct(U, nu, 0.95)
+  rp = pct(R, nr, 0.95); wp = pct(W, nw, 0.95); ip = pct(I, ni, 0.95); mp_ = pct(MBS, nb, 0.95); qp = pct(Q, nq, 0.95); up = pct(U, nu, 0.95)
   np_ = 0; for (s = 2; s <= ns; s++) if (s in psi) { P[++np_] = (psi[s] - psi[s-1]) / ((t[s] - t[s-1]) * 1e6) * 100 }
   pp = pct(P, np_, 0.95)
   nds = 0; for (s = 1; s <= ns; s++) if (s in dst) DS[++nds] = dst[s]

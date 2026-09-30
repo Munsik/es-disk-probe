@@ -8,7 +8,7 @@ It tells you, from the OS, whether the disks on an Elasticsearch node are health
 On a VMware guest it separates inside the VM from outside the VM. On bare-metal it separates load saturation from disk or controller faults. On SAN it separates the server from the storage array.
 The platform is detected automatically on the server where it runs. Measurements are checked against Elastic, VMware and Red Hat official recommendations, and the result is an HTML report with actions for each owner.
 
-v0.11.0 · Unofficial tool · Read-only · Korean and English reports · Point-in-time diagnostic (not a continuous monitoring tool)
+v0.11.1 · Unofficial tool · Read-only · Korean and English reports · Point-in-time diagnostic (not a continuous monitoring tool)
 
 ---
 
@@ -16,7 +16,7 @@ v0.11.0 · Unofficial tool · Read-only · Korean and English reports · Point-i
 
 ### What this tool is
 
-This is not an official Elastic or VMware product. It is a diagnostic script built out of field need.
+This is not an official Elastic or VMware product. It is a set of diagnostic scripts written for real field work.
 
 The thresholds the report cites come from Elastic, VMware and Red Hat official documentation, and each item lists its source.
 The verdicts and actions built on top of those thresholds are this tool's interpretation.
@@ -36,7 +36,7 @@ It does not replace continuous monitoring. The two do different jobs.
 
 Do not schedule it with cron or a systemd timer. The measurement window is short, so it cannot show trends,
 and you only pile up disconnected reports. For always-on monitoring, use Elastic Agent.
-Alert thresholds that match this tool's criteria are in chapter 4 of `GUARDLINE.md`.
+Alert thresholds that match this tool's criteria are in section 4 of `GUARDLINE.md`.
 
 The report is also a snapshot of that moment. Measure again after you change settings or when the load changes.
 
@@ -57,7 +57,7 @@ Do not use it for:
 - Tuning after you have already confirmed the disk is the cause. This tool stops at isolating the cause
 - Always-on monitoring. See the table above
 - Capacity sizing evidence. It does not load the disk to measure peak performance. It only measures the real production load
-- Performance problems outside the disk. CPU, heap, GC and query tuning are out of scope. It does go as far as the verdict "the disk is not the cause"
+- Performance problems outside the disk. CPU, heap, GC and query tuning are out of scope. It does tell you when the disk is not the cause
 - Running inside a container (ECK, Docker). Run it on that node (the host). On the host it finds ES inside containers automatically
   and follows the ES process mount info to the device holding data (local PV, Ceph RBD, cloud volumes and so on)
 
@@ -92,7 +92,7 @@ Turn them off with `--no-hw`.
 | Microchip and Adaptec RAID | `arcconf getconfig <n> AL` | aacraid or smartpqi driver, tool installed |
 | AWS EBS limit exceeded | `nvme amzn stats` (nvme-cli amzn plugin) or `ebsnvme stats -j`, twice: at collection start and end | EBS NVMe volumes, tool present (included by default on Amazon Linux) |
 
-Some vendor tools leave log files (storcli.log, UcliEvt.log) in the directory they run from, so the tool runs them in a temporary location inside the output directory and removes that.
+Some vendor tools leave log files (storcli.log, UcliEvt.log) in the directory they run from, so the tool runs them in `hw_tool_logs/` inside the output directory and keeps those logs in the bundle instead of deleting them.
 Each command has a 30 s cap. If a tool is missing, it is skipped and the report notes that installing it lets the tool check cache and battery automatically.
 
 ---
@@ -111,7 +111,7 @@ plus `ru_inblock` and `ru_oublock` (actual block layer I/O, excluding page cache
 | Disk reads | 12.0 MB | 0 MB | All from ES server logs. Zero during sampling |
 | Disk writes | 0.39 MB | 0.18 MB | Output files (`-o` location) |
 | Memory (max RSS) | Collector 4.2 MB | 4.2 MB | The python process that builds the report uses 18.5 MB separately |
-| ES queries | Up to 19 GETs | 0 | 0 write requests |
+| ES queries | Up to 19 GETs | Up to 15 GETs | 0 write requests. `--light` skips the 4 per-index queries |
 
 Sampling does not read the disk. Every 5 s it reads `/proc/diskstats`, `/proc/stat`, `/proc/pressure/io`,
 ES threads' `/proc/<pid>/task/*/stat` and similar files. The kernel builds these values in memory,
@@ -126,8 +126,8 @@ so ES later reads that much more from disk. That is why there is a cap, and you 
 | Option | Effect | What you lose |
 |---|---|---|
 | `--no-eslog` | Disk reads from 12MB to 0 MB | Findings based on ES logs (throttle, watermark records) |
-| `--light` | The above + skips reading the kernel log, sar and maps | Traces of past incidents, 7-day history, mmap headroom finding |
-| `--no-index-stats` | Skips the 2 ES queries that grow with the index count | Per-index write distribution, ILM phase |
+| `--light` | The above + skips reading the kernel log, sar and maps, and the per-index ES queries | Traces of past incidents, 7-day history, mmap headroom finding, per-index write distribution |
+| `--no-index-stats` | Skips the 4 ES queries that grow with the index count (per-index stats at start and end, index settings, ILM) | Per-index write distribution, ILM phase |
 | `ESLOG_TAIL_MB=2` | Log reads from 12MB to 6MB | Older log events |
 
 The load on ES is 19 GETs in total, all monitoring queries. There are no write requests.
@@ -217,9 +217,9 @@ If the server has Python 3.6+, it also builds the HTML report in both languages 
 
 ### Language
 
-Screen output is Korean if the server locale (`LANG`) starts with `ko`, and English otherwise. Change it with `--lang ko|en`.
+Screen output is Korean if the server locale (`LC_ALL`, `LC_MESSAGES`, then `LANG`) starts with `ko`, and English otherwise. Change it with `--lang ko|en`.
 The bundle always contains the summary and HTML in both languages, so a bundle collected in Korea can go straight to a team abroad.
-To rebuild with the analyzer, use `python3 es_disk_render.py <bundle> --lang ko|en|both` (default both).
+To rebuild with the analyzer, use `python3 es_disk_render.py <bundle> --lang ko|en|auto|both` (default both).
 All screen text lives in `i18n/ko.txt` and `i18n/en.txt`, and both languages use the same code for the verdict rules.
 The HTML report adds the bottleneck location finding, the cluster comparison, the per-index distribution, and evidence and sources for every item.
 
@@ -301,7 +301,7 @@ If you need certificate verification in `es_cluster_probe.sh`, which queries rem
 --lang L      Screen output language ko | en (default: locale). Summary and HTML in the bundle are always in both languages
 
 Options that reduce load (see "Load this tool puts on the server" above)
---light           Skip all extra collection that reads the disk. Zero disk reads
+--light           Skip all extra collection that reads the disk, and the per-index ES queries. Zero disk reads
 --no-eslog        Skip reading the ES server logs only. Most of the read volume
 --no-index-stats  Skip ES queries that grow with the index count (skipped automatically with many shards)
 ```
@@ -375,19 +375,19 @@ Cross-checks catch these cases:
 
 ## Report layout
 
-The top shows a one-sentence verdict and a 9-item summary (Latency, Saturation, Errors, Elasticsearch impact, Memory and cache, Configuration, platform resources,
+The top shows a one-sentence verdict and a 9-item summary (Latency, Saturation, Errors, Elasticsearch impact, Memory and cache, Configuration, Platform resources,
 Network, Cluster), followed by up to 3 "do this first" items, each with its owner.
 Then, in this order:
 
 1. Key numbers and timeline. Latency, IOPS, aqu-sz and PSI charts (no external CDN)
-2. Findings and actions. Grouped by owner, with evidence, why it matters, action and source
-3. Best practice check table. Every item, including the ones that pass (about 30)
+2. Evidence and actions. Grouped by owner, with evidence, why it matters, action and source
+3. Best practice checklist. Every item, including the ones that pass (about 30)
 4. Elasticsearch impact. How the metrics changed over the measurement window
-5. Limit estimate. Theoretical queue-based ceiling and current utilization, calculated without a load test
+5. Estimated ceiling. Theoretical queue-based ceiling and current utilization, calculated without a load test
 6. Cluster view, and the indices using this node's disks
 7. Per-device detail, 7-day history (sar)
 8. Load this diagnostic put on the server. Measured values for that run
-9. Scope and limits. How it differs from continuously collected metrics, and what a guest cannot see
+9. What was measured, how, and what this cannot see. How it differs from continuously collected metrics, and what a guest cannot see
 10. Appendix. Raw kernel and memory settings, kernel log excerpts
 
 Sections without data (no cluster query, no sar records) are left out.
@@ -403,8 +403,8 @@ The record of checking thresholds against the latest documentation, and the rema
 
 | Verdict | Meaning |
 |---|---|
-| Disk is healthy | Latency, saturation and errors are all within thresholds, and no unfavorable settings |
-| Holding up for now, but risk factors exist | Measurements are fine, but some settings will cause trouble if load grows or the host gets contended |
+| Disk is healthy | Latency, saturation and errors are all within thresholds, and there are no unfavorable settings |
+| Holding up for now, but risk factors exist | Measurements are fine, but some settings will cause trouble if load grows or the host comes under contention |
 | Elasticsearch shows processing delays, but disk latency is normal | The cause is likely outside the disk (CPU, heap, bulk, shards) |
 | Signs of disk performance degradation | Disk latency, saturation or errors were observed during the measurement |
 | Configuration checked, performance verdict on hold | Load was too low during the measured window to judge. Measure again during indexing or search peaks |
@@ -447,7 +447,7 @@ Every item in the report shows its source level.
 | Storage for indexing | SSD recommended, RAID 0 stripe, avoid remote storage | [Elastic official] Tune for indexing speed |
 | vSAN latency | The vSAN performance view treats under 5ms (flash) / 20ms (hybrid) as normal (vSAN 7 and 8. No separate figure for ESA) | [VMware official] Broadcom KB 389082 |
 | vSAN latency (device view) | NVMe under 0.5ms, SSD 1ms or less, HDD 10-20ms | [VMware official] Broadcom KB 424485 |
-| bare-metal and SAN latency (Caution line) | Above NVMe 1ms, enterprise SSD 3ms, HDD 25ms | [VMware official] Per-device alert thresholds from Broadcom KB 424485. The KB gives HDD above 30ms as critical |
+| bare-metal and SAN latency (Caution line) | NVMe above 1ms, enterprise SSD above 3ms, HDD above 25ms | [VMware official] Per-device alert thresholds from Broadcom KB 424485. The KB gives HDD above 30ms as critical |
 | bare-metal and SAN latency (Warning and Critical) | NVMe 3/10ms, SSD 6/15ms, HDD 30/50ms | [Field practice] |
 | Other VM latency | 5 / 10 / 20ms | [Field practice] Borrows the KB 389082 flash figure as the common threshold |
 | I/O scheduler (bare-metal) | High-performance SSD and NVMe none/kyber, traditional HDD mq-deadline/bfq | [Red Hat official] Disk schedulers for different use cases |
@@ -481,7 +481,7 @@ That is why the Caution line uses the KB's "alert threshold", not the device's "
 
 This tool does not replace Elastic's System/Linux integration.
 Long-term trends, time series across many nodes and alert automation belong on the Elastic side.
-This tool is for one deep dig at the moment an alert fires, and it fills in the following, which continuous collection cannot see:
+This tool is for a single deep dive when an alert fires, and it fills in the following, which continuous collection cannot see:
 
 - Latency p95 (continuous metrics are mostly averages, which erase short spikes)
 - Bottleneck location finding (aqu-sz ÷ queue_depth)
@@ -492,7 +492,7 @@ This tool is for one deep dig at the moment an alert fires, and it fills in the 
 - Storage IRQ imbalance, mmap headroom
 - Full check table against official documentation
 
-Continuous alert thresholds are in chapter 4 of `GUARDLINE.md`.
+Continuous alert thresholds are in section 4 of `GUARDLINE.md`.
 
 ---
 

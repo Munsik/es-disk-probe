@@ -72,7 +72,9 @@ SCEN["bm_hdd_raid"] = dict(virt=BM_VIRT, hostdrv={"host0": "megaraid_sas"}, gove
     devs=[dev("sda", rot="1", qd="256", host="host0", vendor="DELL", model="PERC H740P Mini", timeout="90",
               lat_r=9, lat_w=45, iops_r=150, iops_w=250, aqu=6, inflight=6, util=90)],
     klog=["2026-09-28T03:11:02+0900 kernel: megaraid_sas 0000:18:00.0: 12567 (749175033s/0x0001/FATAL) - Controller cache pinned for missing or offline VD 00/0",
-          "2026-09-28T03:11:05+0900 kernel: sd 0:2:0:0: [sda] tag#12 timing out command, waited 180s"])
+          "2026-09-28T03:11:05+0900 kernel: sd 0:2:0:0: [sda] tag#12 timing out command, waited 180s",
+          "2026-09-28T03:13:40+0900 kernel: INFO: task java:4121 blocked for more than 120 seconds.",
+          "2026-09-28T03:13:41+0900 kernel: megaraid_sas 0000:18:00.0: [ 0]waiting for 1 commands to complete for scsi0, abort requested"])
 
 # 7) bare-metal 4x SATA SSD md RAID0, only one slow + md resync
 SCEN["bm_md_outlier"] = dict(virt=BM_VIRT, hostdrv={"host0": "mpt3sas"}, governor="performance",

@@ -2,6 +2,34 @@
 
 Entries from 0.11.0 on are in English. Older entries are kept in Korean as written.
 
+## [0.11.1] - 2026-09-30
+
+Fixes from a full review of both languages. Verdict rules are unchanged.
+
+### Fixes
+- Shell summary: hung task and command abort/reset lines from the kernel log printed a raw key (`s.kl.hung task`). They now have their own labels in both languages.
+- All tools now find `i18n/` when started through a symlink. Before, they printed raw keys.
+- Analyzer on Python 3.6 with `LC_ALL=C` (RHEL 8 platform-python): printing Korean to an ASCII stdout crashed after the Korean report, so the English report was not written. stdout is now UTF-8, and the collector and probe pass `PYTHONIOENCODING=utf-8`.
+- `--lang` or any option with a value given last on the command line made the shell tools loop forever. Missing values now end with the usual error. `--lang` accepts only `ko` or `en`.
+- A `&` in a value (path, URL) was replaced by the placeholder in messages (bash 5.2 `patsub_replacement`, awk `gsub`). Now escaped.
+- Report "What the OS cannot see" table: rows for RAID were removed by matching Korean text, so the English report kept rows the Korean one dropped. Now matched by catalog key.
+- Analyzer error and help messages follow `--lang` or the locale instead of always Korean. `--help` text comes from the catalogs.
+- Analyzer `--storage` accepts `vmfs`, as the collector `-s` does and as the report advice says.
+- Bundle files are read as UTF-8 regardless of the PC locale.
+- Shell summary shows hypervisor names as the HTML report does (`KVM Guest`, not `kvm Guest`).
+- Some evidence text written in English inside the Korean report (rejected counts, shard movement, partition start sector) now comes from the catalogs.
+
+### Text
+- Korean: particle errors in joined fragments, actions ending in `~하세요`, one term per concept (read-modify-write, 구성 디스크, 응답시간, Guest), `°C` and `KiB` units, source tag format.
+- English: owner names always capitalized, "Elasticsearch data" instead of "ES data", "filesystem" and lowercase "guest" throughout, plural forms that read wrong for a count of 1, several literal translations rewritten.
+- Facts: `--light` also skips the per-index ES queries (help, README), `--no-index-stats` skips 4 queries, not 2. Container advice no longer suggests `-p` with a host path. Bare-metal advice no longer suggests `--smart`, since SMART is collected there by default.
+- README: vendor tool logs are kept in `hw_tool_logs/` in the bundle (the text said they were removed), verdict names match the report, report section names match the English report, locale detection order (`LC_ALL`, `LC_MESSAGES`, `LANG`).
+- `docs/UPDATE_NOTES.md`: the two overlapping open-item tables are merged into one.
+
+### Tests
+- A kernel log with hung task and abort lines in one scenario. Any raw catalog key in shell output fails the run.
+- `tests/i18n_check.py` rejects backslashes and tabs in shell messages (the bash and awk loaders do not decode them).
+
 ## [0.11.0] - 2026-09-30
 
 Korean and English in every tool. Verdicts, thresholds and checks are unchanged.

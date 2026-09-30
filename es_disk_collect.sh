@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_collect.sh  (v0.11.0)
+# es_disk_collect.sh  (v0.11.1)
 # Elasticsearch node Disk I/O diagnostics: data collector (READ-ONLY)
 #
 #  - Does not change system settings. Only reads /proc and /sys and calls ES read APIs (GET).
-#  - Writes files only to one output directory (auto-picked on a disk other than ES data), and deletes nothing.
+#  - Writes only to one output directory (auto-picked on a disk other than ES data) and its .tar.gz next to it. Deletes nothing.
 #  - Runs no tests that put load on the disk. Measures the real production load as is.
 #  - No external packages needed (bash, awk, coreutils). Works without iostat/sysstat.
-#  - Only one process fork (awk) per sample. Runs itself at nice 19 / ionice idle.
+#  - Two short processes per sample (awk and sleep). Runs itself at nice 19 / ionice idle.
 #  - Does nothing that adds load or destroys caches, such as drop_caches, fio, dd, sync.
 #
 # Usage:
@@ -22,12 +22,12 @@
 #     --platform P  Force platform: auto | vmware | baremetal | vm (default auto)
 #     --es-url URL  ES address (default auto: tries ports the ES process listens on, http then https)
 #     --es-user U   ES user (password in env var ES_PASSWORD)
-#                   If neither is given and ES requires auth, prompts on the terminal
 #                   For API Key, env var ES_API_KEY (base64-encoded value)
+#                   If neither a user nor ES_API_KEY is given and ES requires auth, prompts on the terminal
 #     --no-es       Skip ES API queries (OS level only)
 #     --no-cluster  Skip cluster-wide queries (this node only)
 #     --no-render   Skip HTML generation (bundle only)
-#     --light       Skip all extra collection that reads the disk (ES logs, kernel logs, sar, mmap list)
+#     --light       Skip all extra collection that reads the disk (ES logs, kernel logs, sar, mmap list) and the per-index ES queries (as --no-index-stats)
 #                   → Disk reads drop below 1MB. Less evidence for the verdict
 #     --no-eslog    Skip only ES server log reading (largest reader among extra collection)
 #     --no-index-stats  Skip ES queries that grow with index count (auto-skipped with many shards)
@@ -59,7 +59,7 @@ _LOC0="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
 LNG=""; _p=""
 for _a in "$@"; do [[ "$_p" == --lang ]] && LNG="$_a"; [[ "$_a" == --lang=* ]] && LNG="${_a#--lang=}"; _p="$_a"; done
 [[ "$LNG" == ko || "$LNG" == en ]] || { [[ "$_LOC0" == ko* ]] && LNG=ko || LNG=en; }
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
 declare -A _M=()
 _catload() {  # $1=file $2=key prefix
   local line k v
@@ -75,13 +75,14 @@ _catload() {  # $1=file $2=key prefix
 t() {  # t key [values...]  → values go into {1}, {2} ...
   local s="${_M[$1]:-$1}" i=1 a
   shift
+  shopt -u patsub_replacement 2>/dev/null   # bash 5.2+: "&" in a value would insert the match
   for a in "$@"; do s="${s//\{$i\}/$a}"; i=$((i + 1)); done
   printf '%s' "$s"
 }
 _catload "$HERE/i18n/$LNG.txt" c.; _catload "$HERE/i18n/ko.txt" c.
 export LC_ALL=C
 
-VERSION="0.11.0"
+VERSION="0.11.1"
 DUR=300; INT=5; OUT_BASE="/tmp"; OUT_GIVEN=0; STORAGE="auto"; PLATFORM="auto"; SMART=0; HW=1
 ES_URL=""; ES_USER=""; NO_ES=0; NO_RENDER=0; NO_CLUSTER=0
 NO_ESLOG=0; NO_KLOG=0; NO_SAR=0; NO_MAPS=0; NO_IDXSTATS=0
@@ -89,23 +90,23 @@ USER_PATHS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -d) DUR="$2"; shift 2 ;;
-    -i) INT="$2"; shift 2 ;;
-    -p) USER_PATHS+=("$2"); shift 2 ;;
-    -o) OUT_BASE="$2"; OUT_GIVEN=1; shift 2 ;;
-    -s) STORAGE="$2"; shift 2 ;;
-    --es-url)  ES_URL="$2"; shift 2 ;;
-    --es-user) ES_USER="$2"; shift 2 ;;
+    -d) DUR="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+    -i) INT="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+    -p) USER_PATHS+=("${2:-}"); shift $(( $# > 1 ? 2 : 1 )) ;;
+    -o) OUT_BASE="${2:-}"; OUT_GIVEN=1; shift $(( $# > 1 ? 2 : 1 )) ;;
+    -s) STORAGE="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+    --es-url)  ES_URL="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+    --es-user) ES_USER="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
     --no-es)      NO_ES=1; shift ;;
     --no-cluster) NO_CLUSTER=1; shift ;;
     --no-render) NO_RENDER=1; shift ;;
     --no-eslog)  NO_ESLOG=1; shift ;;
     --light)     NO_ESLOG=1; NO_KLOG=1; NO_SAR=1; NO_MAPS=1; NO_IDXSTATS=1; shift ;;
     --no-index-stats) NO_IDXSTATS=1; shift ;;
-    --platform)  PLATFORM="$2"; shift 2 ;;
+    --platform)  PLATFORM="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
     --smart)     SMART=1; shift ;;
     --no-hw)     HW=0; shift ;;
-    --lang) shift 2 ;;
+    --lang) case "${2:-}" in ko|en) shift $(( $# > 1 ? 2 : 1 )) ;; *) t c.badopt "--lang ${2:-}"; echo; exit 1 ;; esac ;;
     --lang=*) shift ;;
     -h|--help) t c.help; echo; exit 0 ;;
     *) t c.badopt "$1"; echo; exit 1 ;;
@@ -401,7 +402,7 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
   n_is=$(ls -d /sys/class/iscsi_session/session* 2>/dev/null | wc -l)
   echo "ISCSI|sessions|$n_is"
 } > "$S/storage" 2>/dev/null
-# Software RAID state (resync, degraded). Values generated in memory
+# Software RAID state (resync, degraded). /proc/mdstat is generated in memory, so this reads no disk
 [[ -r /proc/mdstat ]] && cat /proc/mdstat > "$S/mdstat" 2>/dev/null
 
 # ── Hardware status (automatic on bare-metal, off with --no-hw) ─────────────────────
@@ -641,7 +642,7 @@ echo "read_eslog_bytes=$ESLOG_BYTES" >> "$OUT/meta"
 # ── mmap usage of the ES process (check headroom against max_map_count) ───────────────
 # Reads the ES process mapping list once. While reading it holds the target process mmap_lock in read mode,
 # so it only briefly contends with ES mmap/munmap (segment open/close). Measured: about 17ms for 40k mappings.
-# To avoid even this on nodes with very many mappings, skip it with --light or NO_MAPS.
+# To avoid even this on nodes with very many mappings, skip it with --light.
 if [[ $NO_MAPS -eq 0 && -n "$ES_PID" && -r /proc/$ES_PID/maps ]]; then
   MAPS_T0=$(date +%s%N)
   wc -l < /proc/$ES_PID/maps > "$S/es_mapcount" 2>/dev/null
@@ -758,7 +759,7 @@ if [[ $ES_OK -eq 1 ]]; then
 fi
 
 # =============================================================================
-# 2. Sampling loop: one awk run per iteration (1 fork)
+# 2. Sampling loop: one awk run per iteration (plus sleep)
 # =============================================================================
 msg "$(t c.step2 "$DUR")"
 STOP=0; trap 'STOP=1' INT TERM
@@ -831,7 +832,7 @@ ebsstats > "$S/ebs_stats_end"
 # ── Collector own resource usage ────────────────────────────────────────────────
 # bash builtin times: cumulative user/sys CPU of self / child processes
 times > "$OUT/self_overhead" 2>/dev/null
-# Max RSS (incl. children). The shell cannot see ru_maxrss, so recorded only if /usr/bin/time exists
+# Size of the output directory (all this tool writes)
 du -sk "$OUT" | awk '{print "output_kb="$1}' >> "$OUT/meta"
 # ES query cost
 awk -F'\t' '{n++; b+=$2} END{printf "es_api_calls=%d\nes_api_bytes=%d\n", n+0, b+0}' "$ES_CALLS" >> "$OUT/meta" 2>/dev/null
@@ -877,7 +878,7 @@ done
 if [[ $NO_RENDER -eq 1 ]]; then
   :
 elif [[ -n "$PY" && -f "$HERE/es_disk_render.py" ]]; then
-  "$PY" "$HERE/es_disk_render.py" "$OUT" --lang both -o "$OUT/es_disk_report.html" >/dev/null && \
+  PYTHONIOENCODING=utf-8 "$PY" "$HERE/es_disk_render.py" "$OUT" --lang both -o "$OUT/es_disk_report.html" >/dev/null && \
     msg "$(t c.html "$OUT/es_disk_report.$LNG.html")"
 else
   msg "$(t c.nopy)"
