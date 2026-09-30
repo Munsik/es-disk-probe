@@ -34,7 +34,7 @@ These items cannot be changed from the Guest OS. Changing them later requires st
 | vSAN free space | Keep the free space recommended for your vSAN version (operations / host rebuild reserve) | Without it, resync and reconfiguration slow down and write latency rises in the meantime | [VMware] |
 | CPU hot-add | Off | Turning it on disables vNUMA, which can slow memory access | [VMware] |
 
-**Include write amplification in the design.** With ES replica 1 and vSAN FTT=1 (RAID-1), each document is physically written 4 times. ES and vSAN each provide their own availability, so always include this multiplier when sizing capacity and write bandwidth. Whether to reduce replicas is a decision for the availability requirements. Do not make it based on disk alone.
+**Include write amplification in the design.** With ES replica 1 and vSAN FTT=1 (RAID-1), each document is physically written 4 times. ES and vSAN each provide their own availability, so always include this multiplier when sizing capacity and write bandwidth. Decide whether to reduce replicas from the availability requirements, not from disk alone.
 
 **If the VMware datastore is SAN (VMFS) or NFS**, use array-side criteria instead of the vSAN items above: volume RAID level, array write cache and replication method,
 Storage I/O Control and disk IOPS limits, and the ESXi path policy (Round Robin and so on). Pass `-s vmfs` to the diagnostic tool so its guidance matches.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-es_disk_render.py (v0.11.0)
+es_disk_render.py (v0.11.1)
 Reads a bundle (directory or .tar.gz) produced by es_disk_collect.sh and
 computes metrics → evaluates them → generates an HTML report.
 
@@ -10,18 +10,23 @@ computes metrics → evaluates them → generates an HTML report.
 
 Usage:
   python3 es_disk_render.py <bundle directory | bundle.tar.gz> [-o report.html]
+                            [--lang both|ko|en|auto] [--cluster <es_cluster_probe directory>]
                             [--platform auto|vmware|baremetal|vm]
-                            [--storage auto|allflash|hybrid|nvme|ssd|hdd]
-"""
-import argparse, html, json, os, re, sys, tarfile, tempfile, datetime
+                            [--storage auto|allflash|hybrid|vmfs|nvme|ssd|hdd]
+  python3 es_disk_render.py --cluster-only <es_cluster_probe directory> [-o report.html] [--lang ...]
 
-TOOL_VERSION = "0.11.0"
+With --lang both (default) it writes <name>.ko.html and <name>.en.html.
+A .tar.gz bundle is unpacked into the system temp directory and left there (the tool deletes nothing).
+"""
+import argparse, html, io, json, os, re, sys, tarfile, tempfile, datetime
+
+TOOL_VERSION = "0.11.1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Report language. All user-facing text lives in i18n/<lang>.txt (key = "text").
 # The code only holds keys, so Korean and English reports share one set of rules.
 # ─────────────────────────────────────────────────────────────────────────────
-I18N_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "i18n")
+I18N_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "i18n")
 LANGS = ("ko", "en")
 
 
@@ -136,7 +141,7 @@ SEV_ORDER = {"ok": 0, "na": 0, "info": 1, "caution": 2, "warn": 3, "crit": 4}
 def open_bundle(path):
     if os.path.isdir(path):
         return path
-    if tarfile.is_tarfile(path):
+    if os.path.isfile(path) and tarfile.is_tarfile(path):
         tmp = tempfile.mkdtemp(prefix="esdisk_")
         with tarfile.open(path) as t:
             for m in t.getmembers():
@@ -162,7 +167,7 @@ def open_bundle(path):
 def rd(base, name, default=""):
     p = os.path.join(base, name)
     try:
-        with open(p, "r", errors="replace") as f:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
     except Exception:
         return default
@@ -300,7 +305,7 @@ class Topo(object):
 # ─────────────────────────────────────────────────────────────────────────────
 # Platform detection
 #   kind   : vmware | baremetal | vm (other hypervisors and clouds) | unknown
-#   attach : virtual | local | san | nvmeof | cloud
+#   attach : virtual | local | san | cloud | network  (per-device classification also has nvmeof, counted as san)
 # The collector only gathers evidence; the decision is made here. Without clear evidence, do not conclude bare-metal.
 # ─────────────────────────────────────────────────────────────────────────────
 CONTAINER_IDS = ("docker", "podman", "lxc", "lxc-libvirt", "systemd-nspawn", "openvz", "rkt", "wsl", "proot", "pouch", "container-other")
@@ -2093,18 +2098,18 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         if (wr_rej or 0) > 0 or ip_rej > 0:
             es_sev = sev_max(es_sev, "warn")
             add("warn", T("r.0339"), T("r.0042"), T("r.0350"),
-                "write rejected {} · indexing pressure rejected {}".format(fmt(wr_rej, 0), fmt(ip_rej, 0)),
+                T("r.ev.rej").format(fmt(wr_rej, 0), fmt(ip_rej, 0)),
                 T("r.0351"),
                 T("r.0352"), "Elasticsearch thread pool / indexing pressure")
         if (se_rej or 0) > 0:
             es_sev = sev_max(es_sev, "caution")
-            add("caution", T("r.0339"), T("r.0042"), T("r.0353"), "search rejected {}".format(fmt(se_rej, 0)),
+            add("caution", T("r.0339"), T("r.0042"), T("r.0353"), T("r.ev.srej").format(fmt(se_rej, 0)),
                 T("r.0354"), T("r.0355"),
                 "Elasticsearch thread pool")
         # Whether cluster state is contaminating the measurement
         if health and ((health.get("relocating_shards") or 0) + (health.get("initializing_shards") or 0)) > 0:
             add("info", T("r.0339"), T("r.0013"), T("r.0356"),
-                "relocating {} · initializing {} · status {}".format(health.get("relocating_shards"), health.get("initializing_shards"), health.get("status")),
+                T("r.ev.shards").format(health.get("relocating_shards"), health.get("initializing_shards"), health.get("status")),
                 T("r.0357"), T("r.0358"),
                 "_cluster/health")
     else:
@@ -2308,7 +2313,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         for part, (parent, start) in topo.parts.items():
             if parent == d and start % 2048 != 0:
                 cfg_sevs.append("caution")
-                add("caution", T("r.0405"), T("r.0148"), T("r.0452"), "{} start sector {}".format(part, start),
+                add("caution", T("r.0405"), T("r.0148"), T("r.0452"), T("r.ev.sector").format(part, start),
                     T("r.0453"),
                     T("r.0454"), T("r.0455"))
     # SCSI timeout: for vSAN failover
@@ -3153,7 +3158,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 T("r.0779").format(worst[0], worst[3], fmt(worst[2], 1, "ms")),
                 T("r.0780"),
                 T("r.0781").format(
-                    "·" + VMB if is_vmware else (T("r.0782") if kind == "baremetal" else "")), T("r.0783"))
+                    T("r.0781a").format(VMB) if is_vmware else (T("r.0782") if kind == "baremetal" else "")), T("r.0783"))
 
     # ═════════════ Best practice checklist (all items, including passed) ═════════════
     BP = []
@@ -3981,7 +3986,7 @@ def render(R, out_path):
         blind = BLIND_BAREMETAL
         if (R.get("HW") or {}).get("raid"):
             # If cache, RAID level, and member disk state were read from controller tools, remove them from "what cannot be seen"
-            blind = [b for b in blind if not b[0].startswith("RAID")]
+            blind = [b for b in blind if getattr(b[0], "key", None) not in ("r.1004", "r.1007", "r.1010")]
     else:
         blind = BLIND_VM
     for r in blind:
@@ -4126,7 +4131,7 @@ def _init_texts():
     ]
 
 
-set_lang(os.environ.get("ESDP_LANG", "ko"))
+set_lang(os.environ.get("ESDP_LANG") or detect_lang())
 
 def out_paths(out, default_dir, default_name, langs):
     """If -o is given, append the language to that name; otherwise to the default name (report.html -> report.ko.html, report.en.html).
@@ -4139,15 +4144,21 @@ def out_paths(out, default_dir, default_name, langs):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("bundle", nargs="?")
-    ap.add_argument("--cluster-only")
-    ap.add_argument("-o", "--out")
-    ap.add_argument("--storage", choices=["auto", "allflash", "hybrid", "nvme", "ssd", "hdd"])
-    ap.add_argument("--platform", choices=["auto", "vmware", "baremetal", "vm"])
-    ap.add_argument("--cluster")
-    ap.add_argument("--lang", choices=["both", "auto", "ko", "en"], default="both",
-                    help="report language. both (default) writes <name>.ko.html and <name>.en.html")
+    # Python 3.6 under LC_ALL=C gives an ASCII stdout, and printing Korean would fail
+    if (getattr(sys.stdout, "encoding", "") or "").lower().replace("-", "") != "utf8" and hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+    # Messages before the per-language loop (help, errors) follow --lang, or the locale with both/auto
+    pre = [x.split("=", 1)[1] if x.startswith("--lang=") else y for x, y in zip(sys.argv, sys.argv[1:] + [""])
+           if x == "--lang" or x.startswith("--lang=")]
+    set_lang(pre[-1] if pre and pre[-1] in LANGS else detect_lang())
+    ap = argparse.ArgumentParser(description=T("r.cli.desc"))
+    ap.add_argument("bundle", nargs="?", help=T("r.cli.bundle"))
+    ap.add_argument("--cluster-only", metavar="DIR", help=T("r.cli.cluster_only"))
+    ap.add_argument("-o", "--out", help=T("r.cli.out"))
+    ap.add_argument("--storage", choices=["auto", "allflash", "hybrid", "vmfs", "nvme", "ssd", "hdd"], help=T("r.cli.storage"))
+    ap.add_argument("--platform", choices=["auto", "vmware", "baremetal", "vm"], help=T("r.cli.platform"))
+    ap.add_argument("--cluster", metavar="DIR", help=T("r.cli.cluster"))
+    ap.add_argument("--lang", choices=["both", "auto", "ko", "en"], default="both", help=T("r.cli.lang"))
     a = ap.parse_args()
     langs = list(LANGS) if a.lang == "both" else [detect_lang() if a.lang == "auto" else a.lang]
     if a.cluster_only:

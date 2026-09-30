@@ -54,6 +54,8 @@ def main():
             R.render(res, os.path.join(work, "{}.{}.html".format(name, lang)))
             html = open(os.path.join(work, "{}.{}.html".format(name, lang)), encoding="utf-8").read()
             text = shell(b, lang)
+            if re.search(r"(?<![\w./])(s\.[a-z_]+\.|r\.\d{4}\b)", text):
+                print("FAIL {} [{}]: raw catalog key in the shell summary".format(name, lang)); sys.exit(1)
             if any(d in html + text for d in i18n_check.DASHES) or (lang == "en" and i18n_check.HANGUL.search(html + text)):
                 print("FAIL {} [{}]: em/en dash or Hangul in output".format(name, lang)); sys.exit(1)
             out[lang][name] = {

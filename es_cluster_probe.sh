@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_cluster_probe.sh  (v0.11.0)
+# es_cluster_probe.sh  (v0.11.1)
 # Queries an Elasticsearch cluster "from the disk point of view". (READ-ONLY)
 #
 #  - Calls only ES read APIs (GET). No settings changes, no index writes.
@@ -37,7 +37,7 @@ _LOC0="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
 LNG=""; _p=""
 for _a in "$@"; do [[ "$_p" == --lang ]] && LNG="$_a"; [[ "$_a" == --lang=* ]] && LNG="${_a#--lang=}"; _p="$_a"; done
 [[ "$LNG" == ko || "$LNG" == en ]] || { [[ "$_LOC0" == ko* ]] && LNG=ko || LNG=en; }
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
 declare -A _M=()
 _catload() {  # $1=file $2=key prefix
   local line k v
@@ -53,6 +53,7 @@ _catload() {  # $1=file $2=key prefix
 t() {  # t key [values...]  → values go into {1}, {2} ...
   local s="${_M[$1]:-$1}" i=1 a
   shift
+  shopt -u patsub_replacement 2>/dev/null   # bash 5.2+: "&" in a value would insert the match
   for a in "$@"; do s="${s//\{$i\}/$a}"; i=$((i + 1)); done
   printf '%s' "$s"
 }
@@ -63,15 +64,15 @@ ES_URL=""; ES_USER=""; GAP=60; OUT_BASE="/tmp"; DEEP=0
 STRICT=0; CACERT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --es-url) ES_URL="$2"; shift 2 ;;
-    --es-user) ES_USER="$2"; shift 2 ;;
-    -g) GAP="$2"; shift 2 ;;
-    -o) OUT_BASE="$2"; shift 2 ;;
+    --es-url) ES_URL="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+    --es-user) ES_USER="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+    -g) GAP="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
+    -o) OUT_BASE="${2:-}"; shift $(( $# > 1 ? 2 : 1 )) ;;
     --deep) DEEP=1; shift ;;
     --insecure) STRICT=0; shift ;;
     --strict-tls) STRICT=1; shift ;;
-    --cacert) CACERT="$2"; STRICT=1; shift 2 ;;
-    --lang) shift 2 ;;
+    --cacert) CACERT="${2:-}"; STRICT=1; shift $(( $# > 1 ? 2 : 1 )) ;;
+    --lang) case "${2:-}" in ko|en) shift $(( $# > 1 ? 2 : 1 )) ;; *) t p.badopt "--lang ${2:-}"; echo; exit 1 ;; esac ;;
     --lang=*) shift ;;
     -h|--help) t p.help; echo; exit 0 ;;
     *) t p.badopt "$1"; echo; exit 1 ;;
@@ -156,7 +157,7 @@ for c in python3 /usr/libexec/platform-python; do
 done
 # HTML is built in both languages before packing the bundle (es_cluster_report.ko.html, es_cluster_report.en.html)
 if [[ -n "$PY" && -f "$HERE/es_disk_render.py" ]]; then
-  "$PY" "$HERE/es_disk_render.py" --cluster-only "$OUT" --lang both -o "$OUT/es_cluster_report.html" >/dev/null && \
+  PYTHONIOENCODING=utf-8 "$PY" "$HERE/es_disk_render.py" --cluster-only "$OUT" --lang both -o "$OUT/es_cluster_report.html" >/dev/null && \
     msg "$(t p.html "$OUT/es_cluster_report.$LNG.html")"
 else
   msg "$(t p.nopy "$(basename "$OUT").tar.gz")"

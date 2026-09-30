@@ -85,6 +85,9 @@ def check(ko, en, keys=None):
                 errs.append("{}: {} space differs".format(k, side))
         if HANGUL.search(b):
             errs.append("{}: Hangul in en".format(k))
+        # the bash and awk loaders only decode \" and \n
+        if k.startswith(("s.", "c.", "p.")) and any(x in s for s in (a, b) for x in ("\\", "\t")):
+            errs.append("{}: backslash or tab in a shell message".format(k))
     for name, cat, banned in (("ko", {k: ko[k] for k in keys}, BANNED_KO), ("en", {k: en[k] for k in keys if k in en}, BANNED_EN)):
         for k, v in cat.items():
             if any(d in v for d in DASHES):
