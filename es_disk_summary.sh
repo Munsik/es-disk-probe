@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_summary.sh  (v0.10.0)
-# 수집 번들을 bash + awk 만으로 요약 판정합니다. Python 이 없는 서버(RHEL 7 등)에서도 바로 결과를 봅니다.
-# es_disk_collect.sh 가 끝날 때 자동으로 실행합니다. 따로 돌릴 때:
+# es_disk_summary.sh  (v0.11.0)
+# Summarizes a collected bundle into a verdict with bash + awk only. Shows results right away even on servers without Python (RHEL 7 etc.).
+# Runs automatically when es_disk_collect.sh finishes. To run it separately:
 #
-#   ./es_disk_summary.sh <번들 디렉터리>
+#   ./es_disk_summary.sh <bundle directory> [--lang ko|en]
 #
-# 핵심 수치와 판정만 냅니다. 병목 위치·클러스터 비교·출처가 달린 전체 판정은 HTML 리포트(es_disk_render.py)에 있습니다.
-# 판정 기준은 HTML 리포트와 같습니다 (README "기준값 출처").
+# Gives only key numbers and verdicts. The full verdict with bottleneck location, cluster comparison and sources is in the HTML report (es_disk_render.py).
+# Verdict thresholds are the same as the HTML report (README "Threshold sources").
 # =============================================================================
 set -u
-# 언어: --lang ko|en, 없으면 로케일(LC_ALL, LC_MESSAGES, LANG)이 ko 로 시작하면 ko, 아니면 en
+# Language: --lang ko|en; if absent, ko when the locale (LC_ALL, LC_MESSAGES, LANG) starts with ko, else en
 B="" LNG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in --lang) LNG="${2:-}"; shift 2 ;; --lang=*) LNG="${1#--lang=}"; shift ;; *) B="$1"; shift ;; esac
@@ -33,12 +33,12 @@ function sortn(a, n,   i, j, t) { for (i = 2; i <= n; i++) { t = a[i]; j = i - 1
 function pct(a, n, p,   k) { if (n < 1) return -1; sortn(a, n); k = int(p * (n - 1) + 0.5) + 1; return a[k] }
 function f1(x) { return (x < 0) ? "-" : sprintf("%.1f", x) }
 function f2(x) { return (x < 0) ? "-" : sprintf("%.2f", x) }
-# kind: run = 측정 결과(지연·포화·오류), cfg = 설정·구성 위험.
-# 판정 문장은 HTML 리포트와 같은 규칙으로 고른다
+# kind: run = measurement results (latency, saturation, errors), cfg = settings/configuration risk.
+# Verdict sentences are chosen by the same rules as the HTML report
 function add(sev, title, act, kind) { nf++; FS_[nf] = sev; FT[nf] = title; FA[nf] = act
   if (kind == "run") { if (rank[sev] > wrun) wrun = rank[sev] }
   else if (rank[sev] > wcfg) wcfg = rank[sev] }
-# 문구 카탈로그 (i18n/<lang>.txt, key = "text"). 없는 키는 ko 로, 그래도 없으면 키 그대로
+# Message catalog (i18n/<lang>.txt, key = "text"). Missing keys fall back to ko, then to the key itself
 function catline(line, A,   p, k, v) {
   if (line ~ /^[ \t]*#/) return
   p = index(line, " = \""); if (!p) return
@@ -97,10 +97,10 @@ FILENAME ~ /\/static\/dmsetup_status$/ {
   next }
 FILENAME ~ /\/static\/mdstat$/ { if ($0 ~ /\[[U_]*_[U_]*\]/) mddeg++; if ($0 ~ /(resync|recovery|reshape|check) *=/) mdop++; next }
 FILENAME ~ /\/static\/raid_(storcli|ssacli|arcconf)$/ {
-  # 벤더 RAID 도구 결과 (있을 때만). 상세 판정은 HTML 리포트, 여기서는 상태 이상만 잡는다
+  # Vendor RAID tool results (only if present). Detailed verdict is in the HTML report; here we only catch abnormal states
   l = $0
-  # storcli·perccli JSON 은 한 줄에 키 하나. 어느 목록 안인지(rctx)로 상태 값을 해석한다.
-  # storcli2·perccli2 는 키 이름·값 표기가 다를 수 있어 흔한 변형을 함께 본다
+  # storcli/perccli JSON has one key per line. State values are interpreted by which list they are in (rctx).
+  # storcli2/perccli2 may differ in key names and value notation, so common variants are checked too
   if (FILENAME ~ /storcli/) {
     ll = tolower(l); gsub(/_/, " ", ll)
     if (ll ~ /"(vd list|virtual drives?( list)?|logical drives?( list)?|ld list)" *: *\[/ || ll ~ /"\/c[0-9]+\/v[0-9]+" *: *\[/) rctx = "vd"
@@ -119,7 +119,7 @@ FILENAME ~ /\/static\/raid_(storcli|ssacli|arcconf)$/ {
   if (l ~ /Cache Status: *(Temporarily|Permanently) Disabled/) raid_wt++
   if (l ~ /^ +State +: *(Failed|Offline)/) raid_pd++
   if (l !~ /^#TOOL_ABSENT/ && l != "") raid_tool = 1
-  # 구성 디스크 매체: 컨트롤러가 알려 주면 rotational 추정 대신 이것을 쓴다
+  # Member disk media: if the controller reports it, use it instead of guessing from rotational
   ln = tolower(l); gsub(/_/, " ", ln)
   if (ln ~ /"(med|media|media type)" *: *"(ssd|nvme|solid state)/ || l ~ /Interface Type: Solid State/ || l ~ /(, SSD,|Device Type +: SSD)/) raid_ssd++
   if (ln ~ /"(med|media|media type)" *: *"(hdd|hard disk)/ || l ~ /Rotational Speed:/ || l ~ /(, HDD,|Device Type +: HDD)/) raid_hdd++
@@ -133,7 +133,7 @@ FILENAME ~ /\/static\/procio_(start|end)$/ {
   } else if ($0 ~ /^\/proc\/[0-9]+\/comm:/) { split($0, a, "/"); pid = a[3]; c = $0; sub(/^[^:]*:/, "", c); comm[pid] = c }
   next }
 FILENAME ~ /\/static\/ebs_stats_(start|end)$/ {
-  # AWS EBS: 한도 초과 누적 시간(us). JSON(한 줄·여러 줄)과 텍스트(제목 + IOPS/Throughput 줄, 또는 이름: 값) 모두 읽는다
+  # AWS EBS: cumulative time over limit (us). Reads both JSON (single or multi-line) and text (title + IOPS/Throughput lines, or name: value)
   es_ = (FILENAME ~ /start$/) ? 0 : 1
   if ($1 == "#DEV") { edev = $2; esec = ""; next }
   n_ = split(tolower($0), part_, ",")
@@ -159,8 +159,8 @@ FILENAME ~ /samples\.raw$/ {
   else if (sec == "/proc/vmstat" && ($1 == "pswpin" || $1 == "pswpout")) vmsw[ns] += $2
   next }
 END {
-  # ── ES data 물리 디스크 ─────────────────────────────────────────────
-  if (ndp == 0) dpath[++ndp] = "/var/lib/elasticsearch"      # 수집기가 경로를 못 찾았을 때의 패키지 기본 경로
+  # ── ES data physical disk ─────────────────────────────────────────────
+  if (ndp == 0) dpath[++ndp] = "/var/lib/elasticsearch"      # package default path when the collector could not find one
   dlist = ""
   for (k in datak) dlist = dlist phys(k, 0)
   if (dlist == "") {
@@ -175,7 +175,7 @@ END {
   if (ndev == 0) { for (d in devseen) if (d !~ /^(dm-|md|loop|sr|zram|ram)/) dev[++ndev] = d; guess = 1 }
   devs = ""; for (i = 1; i <= ndev; i++) devs = devs (i > 1 ? ", " : "") dev[i]
 
-  # ── 플랫폼·판정 기준 (HTML 리포트와 같은 기준) ─────────────────────
+  # ── Platform and verdict thresholds (same as the HTML report) ─────────────────────
   vv = virt["detect_virt_vm"]; if (vv == "") vv = virt["detect_virt"]
   if (meta["platform"] == "baremetal") vv = "none"; else if (meta["platform"] == "vmware") vv = "vmware"; else if (meta["platform"] == "vm" && (vv == "none" || vv == "")) vv = "vm"
   if (vv ~ /^(docker|podman|lxc|lxc-libvirt|systemd-nspawn|openvz|rkt|wsl|proot|pouch|container-other)$/) vv = ""
@@ -208,7 +208,7 @@ END {
   else if (media == "hdd") { c1 = 25; c2 = 30; c3 = 50 }
   else { c1 = 5; c2 = 10; c3 = 20 }
 
-  # ── 구간별 합산 지표 ────────────────────────────────────────────────
+  # ── Aggregate metrics per interval ────────────────────────────────────────────────
   nr = nw = ni = nb = nq = nu = 0; tf = tft = tdt = 0
   for (s = 2; s <= ns; s++) {
     dt = t[s] - t[s-1]; if (dt <= 0) continue
@@ -233,7 +233,7 @@ END {
   nds = 0; for (s = 1; s <= ns; s++) if (s in dst) DS[++nds] = dst[s]
   dp = pct(DS, nds, 0.95)
   qd = 0; for (i = 1; i <= ndev; i++) qd += attr[dev[i], "device/queue_depth"]
-  # 묶음(stripe·md·multipath) 안에서 한 장치만 느린가: 장치별 p95 를 나머지 중앙값과 비교
+  # Is only one device slow within a group (stripe, md, multipath): compare each device p95 to the median of the rest
   nbusy = 0
   for (i = 1; i <= ndev; i++) {
     d = dev[i]; nx = 0; split("", X)
@@ -256,7 +256,7 @@ END {
     }
   }
 
-  # ── 판정 ────────────────────────────────────────────────────────────
+  # ── Verdict ────────────────────────────────────────────────────────────
   lat = (rp > wp) ? rp : wp
   lowload = (ip < 50 && mp_ < 5)
   if (nr + nw == 0) latj = msg("s.lat.na")
@@ -275,7 +275,7 @@ END {
   }
   win = (ns >= 2) ? t[ns] - t[1] : 0
   for (d in ebsdev) if (win > 0) {
-    # IOPS·처리량 중 큰 쪽 (Python 판정과 같다)
+    # Larger of IOPS and throughput (same as the Python verdict)
     ev = ebsv[1, d, "vol", "i"] - ebsv[0, d, "vol", "i"]; x = ebsv[1, d, "vol", "t"] - ebsv[0, d, "vol", "t"]; if (x > ev) ev = x
     ei = ebsv[1, d, "inst", "i"] - ebsv[0, d, "inst", "i"]; x = ebsv[1, d, "inst", "t"] - ebsv[0, d, "inst", "t"]; if (x > ei) ei = x
     ev /= 1e6; ei /= 1e6
@@ -295,7 +295,7 @@ END {
     if (d ~ /^nvme/ && nv[c, "temp"] != "" && nv[c, "temp_max"] != "" && nv[c, "temp"] + 0 >= nv[c, "temp_max"] + 0)
       add("warn", tr("s.nvmetemp", c, int(nv[c, "temp"] / 1000)), msg("s.nvmetemp.act"))
   }
-  # swap: HTML 과 같은 규칙. 측정 중 swap 입출력, swap 켜짐 + memory_lock 꺼짐, swap 이 data 디스크에 있음
+  # swap: same rules as HTML. swap I/O during measurement, swap on + memory_lock off, swap on the data disk
   swmax = 0
   for (s = 2; s <= ns; s++) if (((s - 1) in vmsw) && (s in vmsw) && t[s] > t[s - 1]) { r_ = (vmsw[s] - vmsw[s - 1]) / (t[s] - t[s - 1]); if (r_ > swmax) swmax = r_ }
   if (swmax > 0) add("warn", tr("s.swapio", f1(swmax)), msg("s.swapio.act"))
@@ -328,12 +328,12 @@ END {
   if (virt["cpu_governor"] ~ /^(powersave|conservative|ondemand)$/ && plat == "bare-metal") add("caution", tr("s.gov", virt["cpu_governor"]), msg("s.gov.act"))
   if (unsure && st == "auto") add("info", msg("s.unsure"), msg("s.unsure.act"))
 
-  # 옆집 프로세스
+  # Noisy neighbor processes
   esp = meta["es_pid"]; tot = 0; top1 = ""; topv = 0
   for (pid in seen) { v = pio[1, pid] - pio[0, pid]; if (v <= 0 || !((0, pid) in pio)) continue; tot += v; if (pid == esp) esv = v; else if (v > topv) { topv = v; top1 = comm[pid] "(pid " pid ")" } }
   if (tot >= 52428800 && esp != "" && (tot - esv) / tot >= 0.3 && !lowload) add("caution", tr("s.neighbor", int(100 * (tot - esv) / tot), top1, int(topv / 1048576)), msg("s.neighbor.act"))
 
-  # ── 출력 ────────────────────────────────────────────────────────────
+  # ── Output ────────────────────────────────────────────────────────────
   if (wrun >= 3) verdict = msg("r.0946")
   else if (lowload && wrun <= 2) { verdict = msg("r.0950"); vnote = msg("s.hold_note") }
   else if (wcfg >= 3 || wrun == 2) verdict = msg("r.0952")

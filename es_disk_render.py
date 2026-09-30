@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-es_disk_render.py (v0.10.0)
-es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
-지표 계산 → 판정 → HTML 리포트를 생성합니다.
+es_disk_render.py (v0.11.0)
+Reads a bundle (directory or .tar.gz) produced by es_disk_collect.sh and
+computes metrics → evaluates them → generates an HTML report.
 
-- Python 3.6+ 표준 라이브러리만 사용 (RHEL8 platform-python 호환)
-- 서버가 아닌 PC에서 실행해도 됩니다 (번들만 옮기면 됨)
+- Uses only the Python 3.6+ standard library (compatible with RHEL8 platform-python)
+- Can run on a PC instead of the server (just copy the bundle over)
 
-사용:
-  python3 es_disk_render.py <번들 디렉터리 | 번들.tar.gz> [-o report.html]
+Usage:
+  python3 es_disk_render.py <bundle directory | bundle.tar.gz> [-o report.html]
                             [--platform auto|vmware|baremetal|vm]
                             [--storage auto|allflash|hybrid|nvme|ssd|hdd]
 """
 import argparse, html, json, os, re, sys, tarfile, tempfile, datetime
 
-TOOL_VERSION = "0.10.0"
+TOOL_VERSION = "0.11.0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Report language. All user-facing text lives in i18n/<lang>.txt (key = "text").
@@ -102,16 +102,16 @@ def set_lang(lang):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 기준값 (출처를 함께 표기. 리포트에도 그대로 노출)
+# Thresholds (sources noted alongside; also shown as-is in the report)
 # ─────────────────────────────────────────────────────────────────────────────
-# OS에서 관측한 디스크 응답시간(ms). Elastic이 공식 수치를 제시하지는 않는다.
-# - vSAN(allflash/hybrid): Broadcom KB 389082 의 vSAN 성능 화면 정상 범위(flash <5ms, hybrid <20ms)를 기준. ESA 도 flash 기준
-# - bare-metal·SAN(nvme/ssd/hdd): Broadcom KB 424485 의 장치 관점 경보 기준
-#   (NVMe >1ms, 엔터프라이즈 SSD >3ms, HDD >25ms, HDD 30ms 초과는 critical)을 '주의' 선으로 둔다.
-#   bare-metal 에는 hypervisor·가상 SCSI 계층이 없어 장치 관점 수치가 곧 OS 관점 기대치다.
-#   단, await 에는 block layer 대기 시간이 포함되므로 부하가 몰리면 장치 지연보다 크게 나온다.
-# - vm(KVM, Hyper-V, 클라우드 등): 백엔드를 알 수 없어 vSAN All-Flash 수치를 공통 기준으로 빌려 쓴다.
-# 주의 위 단계(경고·위험)는 모두 실무 기준이다.
+# Disk response time (ms) as observed from the OS. Elastic does not publish official figures.
+# - vSAN(allflash/hybrid): based on the normal ranges in the vSAN performance view from Broadcom KB 389082 (flash <5ms, hybrid <20ms). ESA also uses the flash values
+# - bare-metal/SAN(nvme/ssd/hdd): device-level alarm thresholds from Broadcom KB 424485
+#   (NVMe >1ms, enterprise SSD >3ms, HDD >25ms, HDD above 30ms is critical) are used as the 'caution' line.
+#   bare-metal has no hypervisor or virtual SCSI layer, so the device-level figures are the expected OS-level values.
+#   However, await includes block layer queueing time, so under heavy load it comes out higher than device latency.
+# - vm(KVM, Hyper-V, cloud, etc.): the backend is unknown, so the vSAN All-Flash values are borrowed as a common baseline.
+# The levels above caution (warn, crit) are all practical field values.
 LAT_TH = {
     "allflash": {"caution": 5.0, "warn": 10.0, "crit": 20.0},
     "hybrid":   {"caution": 10.0, "warn": 20.0, "crit": 30.0},
@@ -119,19 +119,19 @@ LAT_TH = {
     "ssd":      {"caution": 3.0, "warn": 6.0, "crit": 15.0},
     "hdd":      {"caution": 25.0, "warn": 30.0, "crit": 50.0},
     "vm":       {"caution": 5.0, "warn": 10.0, "crit": 20.0},
-    "vmware":   {"caution": 5.0, "warn": 10.0, "crit": 20.0},   # VMware, 데이터스토어 종류 미확인 (기본값)
-    "vmfs":     {"caution": 5.0, "warn": 10.0, "crit": 20.0},   # VMware, SAN·NFS 데이터스토어
-    "cloud":    {"caution": 5.0, "warn": 10.0, "crit": 20.0},   # 클라우드 블록 볼륨 (EBS, Azure Disk, PD 등)
-    "network":  {"caution": 5.0, "warn": 10.0, "crit": 20.0},   # 네트워크 블록 장치 (Ceph RBD, NBD)
+    "vmware":   {"caution": 5.0, "warn": 10.0, "crit": 20.0},   # VMware, datastore type unknown (default)
+    "vmfs":     {"caution": 5.0, "warn": 10.0, "crit": 20.0},   # VMware, SAN/NFS datastore
+    "cloud":    {"caution": 5.0, "warn": 10.0, "crit": 20.0},   # Cloud block volume (EBS, Azure Disk, PD, etc.)
+    "network":  {"caution": 5.0, "warn": 10.0, "crit": 20.0},   # Network block device (Ceph RBD, NBD)
 }
-MIN_IOS_PER_INTERVAL = 20      # 이보다 I/O가 적은 구간은 응답시간 통계에서 제외 (소수 I/O 노이즈 방지)
-LOW_LOAD_IOPS = 50             # p95 IOPS 가 이보다 낮고
-LOW_LOAD_MBPS = 5.0            # p95 처리량도 이보다 낮으면 "부하 부족 → 한계 판정 보류"
+MIN_IOS_PER_INTERVAL = 20      # Intervals with fewer I/Os than this are excluded from response time stats (avoids noise from a handful of I/Os)
+LOW_LOAD_IOPS = 50             # If p95 IOPS is below this
+LOW_LOAD_MBPS = 5.0            # and p95 throughput is also below this, "insufficient load → defer limit evaluation"
 
 SEV_ORDER = {"ok": 0, "na": 0, "info": 1, "caution": 2, "warn": 3, "crit": 4}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 입력 로딩
+# Input loading
 # ─────────────────────────────────────────────────────────────────────────────
 def open_bundle(path):
     if os.path.isdir(path):
@@ -140,7 +140,7 @@ def open_bundle(path):
         tmp = tempfile.mkdtemp(prefix="esdisk_")
         with tarfile.open(path) as t:
             for m in t.getmembers():
-                # 경로 탈출 방지: 절대경로·상위참조·심볼릭/하드링크는 건너뛴다
+                # Path traversal guard: skip absolute paths, parent references, and symlinks/hardlinks
                 if m.name.startswith("/") or ".." in m.name.split("/"):
                     continue
                 if m.issym() or m.islnk():
@@ -150,7 +150,7 @@ def open_bundle(path):
                 t.extract(m, tmp)
         subs = sorted(os.path.join(tmp, d) for d in os.listdir(tmp))
         subs = [d for d in subs if os.path.isdir(d)]
-        # 번들 루트는 meta 파일이 있는 디렉터리. 여러 개면 그것으로 고른다
+        # The bundle root is the directory containing the meta file. If there are several, pick by that
         for d in subs:
             if os.path.isfile(os.path.join(d, "meta")):
                 return d
@@ -197,7 +197,7 @@ def dig(d, *keys, default=None):
     return d
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 통계
+# Statistics
 # ─────────────────────────────────────────────────────────────────────────────
 def pctl(vals, p):
     v = sorted(x for x in vals if x is not None)
@@ -217,7 +217,7 @@ def vmax(vals):
 
 def fmt(x, nd=1, unit=""):
     if x is None:
-        return "–"
+        return "-"
     if isinstance(x, float) and abs(x) >= 1000:
         s = "{:,.0f}".format(x)
     else:
@@ -240,7 +240,7 @@ def grade(v, th):
     return "ok"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 정적 구성 파싱
+# Static configuration parsing
 # ─────────────────────────────────────────────────────────────────────────────
 class Topo(object):
     def __init__(self, sysfs_text):
@@ -277,7 +277,7 @@ class Topo(object):
             return self.dmname.get(src[len("/dev/mapper/"):])
         if src.startswith("/dev/"):
             k = src[5:]
-            if "/" in k:                       # /dev/vg/lv 형태
+            if "/" in k:                       # /dev/vg/lv form
                 k = self.dmname.get(k.replace("-", "--").replace("/", "-"))
             return k
         return None
@@ -298,22 +298,22 @@ class Topo(object):
         return self.parts[k][0] if k in self.parts else k
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 플랫폼 판별
-#   kind   : vmware | baremetal | vm (그 밖의 hypervisor·클라우드) | unknown
+# Platform detection
+#   kind   : vmware | baremetal | vm (other hypervisors and clouds) | unknown
 #   attach : virtual | local | san | nvmeof | cloud
-# 수집기는 근거만 모으고 여기서 판정한다. 확실한 근거가 없으면 bare-metal 로 단정하지 않는다.
+# The collector only gathers evidence; the decision is made here. Without clear evidence, do not conclude bare-metal.
 # ─────────────────────────────────────────────────────────────────────────────
 CONTAINER_IDS = ("docker", "podman", "lxc", "lxc-libvirt", "systemd-nspawn", "openvz", "rkt", "wsl", "proot", "pouch", "container-other")
 FC_DRV = ("qla2xxx", "lpfc", "bfa", "qedf", "bnx2fc", "fnic", "zfcp", "csiostor")
 ISCSI_DRV = ("iscsi_tcp", "be2iscsi", "bnx2i", "qedi", "cxgb3i", "cxgb4i", "ib_iser")
 RAID_DRV = ("megaraid_sas", "mpi3mr", "hpsa", "smartpqi", "aacraid", "arcmsr", "3w-9xxx", "3w-sas", "mpt2sas", "mpt3sas", "mptsas")
-# mpt*sas 는 IT(HBA) 모드면 디스크를 그대로 넘기므로 모델명으로 RAID 논리 디스크인지 한 번 더 본다
+# mpt*sas in IT (HBA) mode passes disks through as-is, so check the model name again to see if it is a RAID logical disk
 RAID_MODEL = re.compile(r'PERC|LOGICAL VOLUME|MR9\d|MegaRAID|ServeRAID|RAID|Virtual Disk|AVAGO|SmartArray|ThinkSystem R', re.I)
 SAN_VENDOR = re.compile(r'^(PURE|NETAPP|3PARdata|HITACHI|HP HSV|EMC|DGC|IBM\s+2145|IBM\s+2107|HUAWEI|Nimble|NEXSAN|FUJITSU|DataCore|COMPELNT|Dell EMC|XtremIO|INFINIDAT|LIO-ORG|TrueNAS)', re.I)
 VM_DISK_VENDOR = re.compile(r'^(VMware|QEMU|Msft|Virtual|Google|Amazon|0x1af4|RHEV|Xen|NUTANIX)', re.I)
-# 클라우드 볼륨(네트워크 블록)과 인스턴스 로컬 디스크를 모델명으로 구분한다
-# AWS: EBS·instance store 는 NVMe 모델명. Azure: 원격 디스크 "MSFT NVMe Accelerator v1", 로컬 "Microsoft NVMe Direct Disk v1/v2",
-# SCSI 는 Msft Virtual Disk. GCP: NVMe PD·Hyperdisk "nvme_card-pd", Local SSD "nvme_card" (다중 컨트롤러면 nvme_card0 ...)
+# Distinguish cloud volumes (network block) from instance-local disks by model name
+# AWS: EBS and instance store use NVMe model names. Azure: remote disk "MSFT NVMe Accelerator v1", local "Microsoft NVMe Direct Disk v1/v2",
+# SCSI is Msft Virtual Disk. GCP: NVMe PD/Hyperdisk "nvme_card-pd", Local SSD "nvme_card" (nvme_card0 ... with multiple controllers)
 CLOUD_BLOCK_MODEL = re.compile(r'Amazon Elastic Block Store|MSFT NVMe Accelerator|PersistentDisk|nvme_card-pd', re.I)
 CLOUD_LOCAL_MODEL = re.compile(r'Amazon EC2 NVMe Instance Storage|Microsoft NVMe Direct Disk|nvme_card\d*$|EphemeralDisk', re.I)
 
@@ -360,7 +360,7 @@ def detect_platform(virt, override="auto"):
         hv = dv; ev.append("systemd-detect-virt = {}".format(dv))
     elif dv == "none":
         ev.append("systemd-detect-virt = none")
-    if not hv:                       # detect-virt 가 없거나 컨테이너만 보고한 경우의 보조 근거
+    if not hv:                       # Secondary evidence when detect-virt is missing or only reports a container
         xp = (vendor + " " + prod).lower()
         if "vmware" in xp:
             hv = "vmware"
@@ -404,14 +404,14 @@ def detect_platform(virt, override="auto"):
     return {"kind": kind, "hv": hv, "container": container, "cloud": cloud, "evidence": ev, "forced": forced}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 하드웨어 RAID 컨트롤러 (storcli·perccli / ssacli / arcconf 출력, 커널 raid_class)
-# 결과는 공통 형태로 모은다.
+# Hardware RAID controllers (storcli/perccli / ssacli / arcconf output, kernel raid_class)
+# Results are collected into a common shape.
 #   ctrl: [{name, status, cache, battery}]
 #   vds : [{id, dev, level, state, ok, cache_cur, cache_init, wb, media, pds:[{id, state, med, ok}]}]
-#   pds_bad: [(설명, 심각도)]   bg: [진행 중 백그라운드 작업]
+#   pds_bad: [(description, severity)]   bg: [background tasks in progress]
 # ─────────────────────────────────────────────────────────────────────────────
 def _cmd_blocks(text):
-    """'#CMD ...' 로 구분된 도구 출력을 (명령, 본문) 목록으로"""
+    """Split tool output delimited by '#CMD ...' into a list of (command, body)"""
     out, cur, buf = [], None, []
     for line in text.splitlines():
         if line.startswith("#CMD "):
@@ -435,9 +435,9 @@ def _walk(o):
             for x in _walk(v):
                 yield x
 
-# storcli2·perccli2(MegaRAID 96xx, PERC 12 이후)는 명령 문법은 storcli 와 같지만 JSON 키 이름과 값 표기가
-# 공개 문서로 확정되지 않았다. 키·값을 storcli 표기로 맞춘 뒤 같은 파서로 읽는다.
-# 모르는 키는 그대로 두므로, 끝까지 못 읽으면 "해석 불가"로 알리고 원문을 남긴다
+# storcli2/perccli2 (MegaRAID 96xx, PERC 12 and later) use the same command syntax as storcli, but the JSON key names and value notation
+# are not confirmed by public docs. Normalize keys and values to storcli notation, then read them with the same parser.
+# Unknown keys are left as-is, so if parsing still fails, report "unparseable" and keep the raw output
 _SC_KEY = {
     "controllers": "Controllers", "responsedata": "Response Data", "basics": "Basics",
     "model": "Model", "productname": "Model", "controllermodel": "Model",
@@ -475,7 +475,7 @@ def _nk(k):
     return re.sub(r'[^a-z0-9]', '', str(k).lower())
 
 def _canon_storcli(o, ctx=None):
-    """storcli2 계열 JSON 을 storcli 표기로. ctx: 'vd' 또는 'pd' (상태 값 약어가 서로 다르다)"""
+    """Convert storcli2-family JSON to storcli notation. ctx: 'vd' or 'pd' (state value abbreviations differ between them)"""
     if isinstance(o, list):
         return [_canon_storcli(x, ctx) for x in o]
     if not isinstance(o, dict):
@@ -495,11 +495,11 @@ def _canon_storcli(o, ctx=None):
         if re.match(r'^/c\d+/v\d+$', ks):
             out[ks] = _canon_storcli(v, "vd"); continue
         ck = _SC_KEY.get(_nk(ks), ks)
-        # 목록 키로 바꾸는 것은 값이 목록일 때만 ("Virtual Drives": 2 같은 개수 필드와 구분)
+        # Rename to the list key only when the value is a list (to tell it apart from count fields like "Virtual Drives": 2)
         if ck in _SC_LIST and ck != ks and not isinstance(v, (list, dict)):
             ck = ks
         elif ck not in _SC_LIST and ck not in _SC_NEST and ck != ks and isinstance(v, (list, dict)):
-            ck = ks          # 값 하나여야 하는 키(State, Med 등)는 값이 목록·객체면 바꾸지 않는다
+            ck = ks          # For keys that must hold a single value (State, Med, etc.), do not rename if the value is a list or object
         sub = "vd" if ck == "VD LIST" else ("pd" if ck == "PD LIST" else ctx)
         cv = _canon_storcli(v, sub)
         if isinstance(cv, str):
@@ -514,7 +514,7 @@ def _canon_storcli(o, ctx=None):
                 cv = re.sub(r'(?i)always\s*write\s*-?\s*back', 'AWB', cv)
                 cv = re.sub(r'(?i)write\s*-?\s*back', 'WB', cv)
                 cv = re.sub(r'(?i)write\s*-?\s*through', 'WT', cv)
-        # 원래 이름(storcli 표기)이 별칭보다 우선
+        # The original name (storcli notation) takes precedence over aliases
         if ck not in out or (ck == ks and ck in aliased):
             out[ck] = cv
             if ck != ks:
@@ -532,7 +532,7 @@ def parse_storcli(text):
     for cmd, body in _cmd_blocks(text):
         i = body.find("{")
         try:
-            j = json.JSONDecoder().raw_decode(body[i:])[0] if i >= 0 else None   # 뒤에 붙은 텍스트는 무시
+            j = json.JSONDecoder().raw_decode(body[i:])[0] if i >= 0 else None   # Ignore trailing text
         except ValueError:
             j = None
         if not j:
@@ -568,12 +568,12 @@ def parse_storcli(text):
                     e = vd_map.setdefault(m.group(1), {})
                     e["dev"] = v.get("OS Drive Name")
                     e["cache_init"] = v.get("Write Cache(initial setting)")
-            # 백그라운드 작업: patrol read, consistency check
+            # Background tasks: patrol read, consistency check
             for d_ in _walk(rd_):
                 for k, v in d_.items():
                     if re.search(r'(PR|CC) Current State', str(k)) and "activ" in str(v).lower():
                         R["bg"].append("{} {}".format("patrol read" if k.startswith("PR") else "consistency check", v))
-            # 물리 디스크 상세: media error, predictive failure, SMART 경고
+            # Physical disk details: media error, predictive failure, SMART warning
             for k, v in rd_.items():
                 m = re.match(r'^Drive (/c\d+/e\d+/s\d+|/c\d+/s\d+) - Detailed Information$', k)
                 if m and isinstance(v, dict):
@@ -593,7 +593,7 @@ def parse_storcli(text):
         e["pds"] = [{"id": p_.get("EID:Slt"), "state": p_.get("State"), "med": p_.get("Med"),
                      "ok": p_.get("State") in ("Onln", "GHS", "DHS", "UGood", "JBOD")} for p_ in pds]
         cc = str(e.get("cache_cur") or "")
-        e["wb"] = None if not cc else ("WB" in cc)          # WB, AWB 모두 write-back. WT 는 write-through
+        e["wb"] = None if not cc else ("WB" in cc)          # WB and AWB are both write-back. WT is write-through
         e["ok"] = e.get("state") == "Optl"
         R["vds"].append(e)
     for p_ in R["pd_all"]:
@@ -671,7 +671,7 @@ def parse_ssacli(text):
         for p_ in ld["pds"]:
             if p_["state"] and p_["state"] != "OK":
                 R["pds_bad"].append((T("r.0027").format(p_["id"], p_["state"]), "warn"))
-    # 컨트롤러 캐시가 꺼졌으면 LD 의 Caching: Enabled 도 실제로는 write-back 이 아니다
+    # If the controller cache is off, the LD's Caching: Enabled is not actually write-back either
     for c in R["ctrl"]:
         if c.get("cache") and c["cache"] != "OK":
             for ld in R["vds"]:
@@ -732,7 +732,7 @@ def parse_arcconf(text):
     return R
 
 def load_hwraid(S, topo):
-    """번들에 있는 RAID 도구 출력을 모두 읽어 OS 장치 이름에 붙인다"""
+    """Read all RAID tool output in the bundle and attach it to OS device names"""
     res, absent = [], []
     for fname, fn in (("raid_storcli", parse_storcli), ("raid_ssacli", parse_ssacli), ("raid_arcconf", parse_arcconf)):
         t = rd(S, fname)
@@ -748,12 +748,12 @@ def load_hwraid(S, topo):
         except Exception:
             r = None
         if r is None or (not r.get("vds") and fname == "raid_storcli"):
-            # storcli2·perccli2 JSON 은 키 이름이 공개 문서로 확정되지 않았다. 해석을 못 하면 원문만 번들에 남긴다
+            # storcli2/perccli2 JSON key names are not confirmed by public docs. If parsing fails, only the raw output is kept in the bundle
             absent.append("#UNPARSED " + ("storcli2" if "#TOOL storcli2" in t else fname.replace("raid_", "")))
             continue
-        # OS 장치 이름이 없으면 SCSI 주소로 잇는다.
-        # megaraid_sas: channel 0·1 은 물리 디스크, 2 이상이 논리 디스크. VD 번호 = (channel-2)*128 + target
-        # aacraid: channel 0, target = LD 번호. mpi3mr 는 channel 이 고정되지 않아 OS Drive Name 으로만 잇는다
+        # If there is no OS device name, match by SCSI address.
+        # megaraid_sas: channels 0 and 1 are physical disks, 2 and above are logical disks. VD number = (channel-2)*128 + target
+        # aacraid: channel 0, target = LD number. mpi3mr has no fixed channel, so match only by OS Drive Name
         for v in r["vds"]:
             if v.get("dev"):
                 v["dev"] = v["dev"].replace("/dev/", "")
@@ -772,8 +772,8 @@ def load_hwraid(S, topo):
     return res, absent
 
 def flat_settings(cs):
-    """_cluster/settings 응답을 그룹별 "a.b.c": 값 형태로. flat_settings=true 응답과 중첩 응답을 모두 받는다.
-    (flat_settings=true 에서는 filter_path 가 점이 든 키 이름과 맞지 않아 빈 응답이 오므로 수집은 중첩으로 한다)"""
+    """Flatten a _cluster/settings response into "a.b.c": value per group. Accepts both flat_settings=true and nested responses.
+    (With flat_settings=true, filter_path does not match key names containing dots and returns an empty response, so collection uses nested)"""
     out = {}
     def walk(o, pre, dst):
         for k, v in (o or {}).items():
@@ -791,9 +791,9 @@ def flat_settings(cs):
 
 
 def wm_high(groups, total_bytes):
-    """실제로 적용되는 high watermark 사용률(%)과 표시 문구.
-    ES 8.5+ 는 비율을 직접 지정하지 않았으면 max_headroom(high 기본 150GB)도 함께 적용해, 큰 디스크에서는
-    여유 공간이 150GB 로 줄어드는 시점이 기준이 된다 (둘 중 늦게 오는 쪽)"""
+    """Effective high watermark usage (%) and display text.
+    On ES 8.5+, if no ratio was set explicitly, max_headroom (high default 150GB) also applies, so on large disks
+    the threshold is the point where free space drops to 150GB (whichever comes later)"""
     groups = groups or {}
     merged, explicit = {}, set()
     for grp in ("defaults", "persistent", "transient"):
@@ -828,10 +828,10 @@ def parse_bytes(v):
 
 
 def parse_ebs_stats(text):
-    """nvme amzn stats / ebsnvme stats 결과. 장치별 한도 초과 누적 시간(us).
-    출력 형식이 도구·버전마다 다를 수 있어 JSON(한 줄이든 여러 줄이든)과 텍스트를 모두 읽는다.
-    텍스트는 'EBS Volume Performance Exceeded (us)' 같은 제목 아래 'IOPS: n' 줄, 또는 한 줄에
-    'ebs_volume_performance_exceeded_iops : n' 처럼 이름과 값이 같이 오는 형식을 본다"""
+    """Results of nvme amzn stats / ebsnvme stats. Cumulative time over limit per device (us).
+    Output format may differ by tool and version, so read both JSON (single-line or multi-line) and text.
+    For text, look for 'IOPS: n' lines under a heading like 'EBS Volume Performance Exceeded (us)', or a format
+    where name and value appear on one line, like 'ebs_volume_performance_exceeded_iops : n'"""
     out, blocks, dev = {}, {}, None
     for l in (text or "").splitlines():
         if l.startswith("#DEV "):
@@ -879,14 +879,14 @@ def parse_ebs_stats(text):
                 if m2 and sect:
                     got[sect + ("_iops" if m2.group(1) == "iops" else "_tp")] = int(m2.group(2))
                 elif low and not m2 and not low.startswith(("read", "write")) and ":" not in low:
-                    sect = None       # 다른 제목이 나오면 구역이 끝난 것
+                    sect = None       # A different heading means the section has ended
         if got:
             out[dev] = got
     return out
 
 
 def classify_devices(phys, topo, sto, dmtable, hwraid=None, cloud=""):
-    """ES data 물리 디스크별 매체·연결 방식. bare-metal·SAN 기준값 선택에 쓴다."""
+    """Media and attachment type per ES data physical disk. Used to pick bare-metal/SAN thresholds."""
     out = {}
     raid_vd = {}
     for r in hwraid or []:
@@ -927,7 +927,7 @@ def classify_devices(phys, topo, sto, dmtable, hwraid=None, cloud=""):
                 info["raid"] = True
             elif RAID_MODEL.search(model) and not VM_DISK_VENDOR.search(vendor):
                 info["raid"] = True
-            if a.get("device/raid_level"):            # hpsa·smartpqi 는 sysfs 에 RAID 레벨을 내준다
+            if a.get("device/raid_level"):            # hpsa and smartpqi expose the RAID level in sysfs
                 info["raid"] = True
             info["media"] = "hdd" if info["rot"] == "1" else "ssd"
             info["sure"] = not info["raid"]
@@ -942,7 +942,7 @@ def classify_devices(phys, topo, sto, dmtable, hwraid=None, cloud=""):
                 info["why"] = T("r.0038").format(
                     v.get("level") or "", (v.get("media") or "?").upper(), len(v.get("pds") or []), tool)
         out[d] = info
-    # dm-multipath 로 묶인 장치는 SAN (로컬 디스크를 multipath 로 묶는 경우는 드물다)
+    # Devices grouped by dm-multipath are SAN (local disks are rarely put under multipath)
     mp_members = set()
     for line in (dmtable or "").splitlines():
         if " multipath " in line:
@@ -1008,7 +1008,7 @@ def yml_data_paths(text):
     return paths
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 샘플 파싱
+# Sample parsing
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_samples(text, es_pid):
     snaps, cur, sec = [], None, None
@@ -1084,10 +1084,10 @@ def disk_intervals(snaps, dev):
             continue
         x, y = a["disk"][dev], b["disk"][dev]
         dd = [yy - xx for xx, yy in zip(x, y)]
-        if any(v < 0 for i, v in enumerate(dd[:11]) if i != 8):   # 카운터 리셋/랩어라운드
+        if any(v < 0 for i, v in enumerate(dd[:11]) if i != 8):   # Counter reset/wraparound
             continue
         rio, rsec, rtk, wio, wsec, wtk, iotk, wtd = dd[0], dd[2], dd[3], dd[4], dd[6], dd[7], dd[9], dd[10]
-        # 커널 5.5+ 는 flush 요청 수·시간(필드 16·17)을 준다. fsync 가 장치 캐시를 비우는 비용이 여기 보인다
+        # Kernel 5.5+ provides flush request count and time (fields 16 and 17). This shows the cost of fsync flushing the device cache
         fio_, ftk_ = (dd[15], dd[16]) if len(dd) >= 17 and dd[15] >= 0 and dd[16] >= 0 else (None, None)
         rows.append({
             "t": b["t"], "dt": dt, "rio": rio, "wio": wio, "rtk": rtk, "wtk": wtk,
@@ -1103,7 +1103,7 @@ def disk_intervals(snaps, dev):
     return rows
 
 def aggregate(per_dev):
-    """여러 물리 디스크를 하나로 합산 (IOPS·처리량 합, 응답시간은 I/O 가중)"""
+    """Aggregate multiple physical disks into one (IOPS and throughput summed, response time I/O-weighted)"""
     by_t = {}
     for dev, rows in per_dev.items():
         for r in rows:
@@ -1183,7 +1183,7 @@ def net_deltas(snaps):
     return out
 
 # ─────────────────────────────────────────────────────────────────────────────
-# sar 이력 파싱 (버전별 헤더 이름 기반)
+# sar history parsing (based on per-version header names)
 # ─────────────────────────────────────────────────────────────────────────────
 TIME_RE = re.compile(r'^(\d{1,2}:\d{2}:\d{2})(\s?[AP]M)?$')
 
@@ -1223,10 +1223,10 @@ def parse_sar(text, wanted_devs):
     return days
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 클러스터 관점 분석 (es_cluster_probe.sh 결과)
+# Cluster-level analysis (es_cluster_probe.sh results)
 # ─────────────────────────────────────────────────────────────────────────────
 def analyze_cluster(cdir, add, th, kind="unknown"):
-    """노드별 디스크 지표를 비교해 '이 노드만'인지 '클러스터 전체'인지 가른다."""
+    """Compare per-node disk metrics to tell whether it is 'this node only' or 'cluster-wide'."""
     if not cdir or not os.path.isdir(cdir):
         return None
     j = lambda n: rjson(cdir, n)
@@ -1248,7 +1248,7 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
         busy = rops = wops = rmb = wmb = None
         if io_b:
             io_ok = True
-            if "io_time_in_millis" in io_b and "io_time_in_millis" in io_a:   # 없는 버전은 '미수집'으로
+            if "io_time_in_millis" in io_b and "io_time_in_millis" in io_a:   # Versions that are missing become 'not collected'
                 it = io_b["io_time_in_millis"] - io_a["io_time_in_millis"]
                 busy = min(100.0, 100.0 * it / (dt * 1000.0)) if it >= 0 else None
             rops = (io_b.get("read_operations", 0) - io_a.get("read_operations", 0)) / dt
@@ -1277,9 +1277,9 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
     rows.sort(key=lambda r: -(r["busy"] or 0))
     data_rows = [r for r in rows if "data" in (r["roles"] or "")] or rows
 
-    # ── 노드 간 쏠림 ─────────────────────────────────────────────────────
-    # data tier 가 다른 노드(hot vs warm vs cold)는 보관 용량·부하 특성이 원래 달라
-    # 섞어서 비교하면 오탐이 난다. 같은 tier 안에서만 비교한다.
+    # ── Imbalance across nodes ─────────────────────────────────────────────────────
+    # Nodes in different data tiers (hot vs warm vs cold) naturally differ in stored volume and load profile,
+    # so comparing them together causes false positives. Compare only within the same tier.
     def tier_of(r):
         for t in ("data_hot", "data_warm", "data_cold", "data_frozen", "data_content"):
             if t in (r["roles"] or ""):
@@ -1292,7 +1292,7 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
     def outlier(key, label, unit, floor, factor=2.0):
         for tname, group in sorted(tiers.items()):
             vals = [r[key] for r in group if r[key] is not None]
-            if len(vals) < 3:      # 같은 tier 노드가 3개 미만이면 중앙값이 의미 없음
+            if len(vals) < 3:      # With fewer than 3 nodes in the same tier, the median is meaningless
                 continue
             med = pctl(vals, 0.5)
             top = max(group, key=lambda r: r[key] if r[key] is not None else -1)
@@ -1307,7 +1307,7 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
     outlier("wmb", T("r.0049"), " MB/s", 30)
     outlier("store_gb", T("r.0050"), " GB", 100, factor=1.6)
 
-    # ── 용량·watermark ───────────────────────────────────────────────────
+    # ── Capacity/watermark ───────────────────────────────────────────────────
     settings = {}
     cs = flat_settings(j("cluster_settings.json") or {})
     for grp in ("defaults", "persistent", "transient"):
@@ -1325,7 +1325,7 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
             T("r.0054"),
             T("r.0055"))
 
-    # ── 클러스터발 디스크 부하 (측정 오염 요인) ────────────────────────
+    # ── Cluster-driven disk load (measurement contamination factors) ────────────────────────
     rec = j("cat_recovery.json") or []
     health = j("health.json") or {}
     snap = j("snapshot_status.json") or {}
@@ -1349,7 +1349,7 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
             T("r.0063"),
             "_cat/recovery, _cluster/health, _snapshot/_status")
 
-    # ── 전 노드 공통 신호 ────────────────────────────────────────────────
+    # ── Signals common to all nodes ────────────────────────────────────────────────
     thr_nodes = [r["name"] for r in data_rows if (r["throttle"] or 0) > 0]
     if len(thr_nodes) >= 2:
         add("warn", T("r.0041"), T("r.0042"), T("r.0064"),
@@ -1386,7 +1386,7 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
 
 
 def analyze_local_indices(S, cdir):
-    """이 노드에 있는 샤드를 인덱스별로 나눠 쓰기 부하 분포를 본다."""
+    """Split this node's shards by index to see the write load distribution."""
     a, b = rjson(S, "es_idx_start.json"), rjson(S, "es_idx_end.json")
     if not a or not b:
         return None
@@ -1394,8 +1394,8 @@ def analyze_local_indices(S, cdir):
     gb = list((b.get("nodes") or {}).values())
     if not ga or not gb:
         return None
-    # level=indices 응답은 nodes.<id>.indices.indices.<인덱스> 로 한 단계 더 들어간다 (ES NodeIndicesStats).
-    # 예전 수집기 번들은 filter_path 가 한 단계 모자라 빈 응답이었다
+    # A level=indices response goes one level deeper, to nodes.<id>.indices.indices.<index> (ES NodeIndicesStats).
+    # Bundles from older collectors had a filter_path one level short and returned an empty response
     def per_index(g):
         top = g.get("indices") or {}
         inner = top.get("indices")
@@ -1410,7 +1410,7 @@ def analyze_local_indices(S, cdir):
                  "recovery", "bulk", "shard_stats", "mappings", "dense_vector", "sparse_vector"}
     rows = []
     for name, y in ib.items():
-        if name in NODE_KEYS or not isinstance(y, dict):   # level=indices 응답이 아닐 때 방어
+        if name in NODE_KEYS or not isinstance(y, dict):   # Guard for responses that are not level=indices
             continue
         x = ia.get(name, {})
         dn = (dig(y, "indexing", "index_total") or 0) - (dig(x, "indexing", "index_total") or 0)
@@ -1430,13 +1430,13 @@ def analyze_local_indices(S, cdir):
     return rows
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 분석
+# Analysis
 # ─────────────────────────────────────────────────────────────────────────────
 class Finding(object):
     def __init__(self, sev, dim, owner, title, evidence, why, action, source):
         self.sev, self.dim, self.owner = sev, dim, owner
         self.title, self.evidence, self.why, self.action, self.source = title, evidence, why, action, source
-        # 언어와 무관한 식별자: 제목 문구의 카탈로그 키, 담당자 키 (테스트와 비교에 쓴다)
+        # Language-independent identifiers: catalog key of the title text and owner key (used by tests and comparisons)
         self.id = getattr(title, "key", None)
         self.owner_id = getattr(owner, "key", None)
 
@@ -1464,8 +1464,8 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
     F = []
     add = lambda *a: F.append(Finding(*a))
 
-    # ── ES data path → 디바이스 ─────────────────────────────────────────────
-    # -p 로 지정한 경로: 공백 포함 경로를 위해 한 줄에 하나씩 적힌 파일을 먼저 본다
+    # ── ES data path → device ─────────────────────────────────────────────
+    # Paths given with -p: check the one-per-line file first, to handle paths containing spaces
     cand = [l.strip() for l in rd(base, "user_paths").splitlines() if l.strip()]
     if not cand:
         cand = [p for p in meta.get("user_paths", "").split() if p]
@@ -1484,7 +1484,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         if p and p not in data_paths:
             data_paths.append(p)
 
-    # 수집기가 ES 프로세스의 mountinfo 에서 찾은 data 장치 (컨테이너 안 ES 도 정확). 있으면 이것을 우선한다
+    # Data device the collector found in the ES process's mountinfo (accurate even for ES in a container). Prefer it when present
     datadev = {}
     for l in rd(S, "datadev").splitlines():
         f_ = l.split("|")
@@ -1496,7 +1496,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         k = topo.kname(m["src"]) if m else None
         dd = datadev.get(p)
         if dd and dd["kname"] != k:
-            # 호스트 mount 목록에서 같은 장치를 찾아 옵션을 가져오고, 없으면 mountinfo 값으로 채운다
+            # Find the same device in the host mount list to get its options; if absent, fill in from mountinfo
             hm = next((x for x in mounts if topo.kname(x["src"]) == dd["kname"]), None)
             m = {"src": dd["src"], "mnt": dd["mnt"], "host_mnt": hm["mnt"] if hm else None,
                  "fs": dd["fs"], "opts": hm["opts"] if hm else "-"}
@@ -1510,7 +1510,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         dev_guess = True
         phys = sorted(d for d in topo.attr if not d.startswith("dm-") and not d.startswith("md"))
 
-    # ── 플랫폼과 판정 기준 ──────────────────────────────────────────────────
+    # ── Platform and thresholds ──────────────────────────────────────────────────
     plat = detect_platform(virt, platform_override or meta.get("platform", "auto"))
     kind = plat["kind"]
     sto = parse_storage(rd(S, "storage"))
@@ -1525,7 +1525,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
     else:
         attach = "cloud" if "cloud" in attaches else ("network" if "network" in attaches else "virtual")
     req = storage_override or meta.get("storage") or "auto"
-    # 0.9.x 수집기는 -s 를 안 줘도 storage=allflash 를 기록했다. 사용자 선택과 구분할 수 없으므로 auto 로 본다
+    # 0.9.x collectors recorded storage=allflash even without -s. This cannot be told apart from a user choice, so treat it as auto
     if str(meta.get("tool_version", "")).startswith("0.9") and req == "allflash" and not storage_override:
         req = "auto"
     storage_auto = req in ("", "auto")
@@ -1533,16 +1533,16 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
     if not storage_auto:
         storage = req
     elif kind == "vmware":
-        storage = "vmware"                  # vSAN 인지 SAN·NFS 데이터스토어인지 Guest 에서는 알 수 없다
+        storage = "vmware"                  # The guest cannot tell whether it is vSAN or a SAN/NFS datastore
     elif kind == "baremetal":
-        order = ["hdd", "ssd", "nvme"]      # 섞여 있으면 가장 느린 매체 기준 (빠른 매체 기준을 느린 디스크에 대면 전부 오탐)
+        order = ["hdd", "ssd", "nvme"]      # If mixed, use the slowest media's thresholds (applying fast-media thresholds to slow disks flags everything)
         media = [c["media"] for c in devcls.values() if c["media"]]
         storage = ("cloud" if attach == "cloud" else "network" if "network" in attaches
                    else next((m for m in order if m in media), "ssd"))
         if len(set(media)) > 1 and attach != "cloud":
             media_note = T("r.0083").format(STORAGE_LABEL[storage])
     else:
-        # 클라우드 인스턴스 로컬 NVMe 만 쓰면 장치 기준, 클라우드 볼륨이면 클라우드 기준, 그 밖은 VM 공통
+        # Cloud instance-local NVMe only: device thresholds; cloud volumes: cloud thresholds; anything else: common VM
         media = [c["media"] for c in devcls.values()]
         if devcls and all(c["attach"] == "local" and c["media"] == "nvme" and nvme_ctrl(d) for d, c in devcls.items()):
             storage = "nvme"
@@ -1553,15 +1553,15 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
     th = LAT_TH.get(storage, LAT_TH["allflash"])
     src_lat = (LAT_SRC["vsan"] if storage in ("allflash", "hybrid") else LAT_SRC["device"] if storage in ("nvme", "ssd", "hdd")
                else LAT_SRC["vmware"] if storage in ("vmware", "vmfs") else LAT_SRC["cloud"] if storage in ("cloud", "network") else LAT_SRC["vm"])
-    # VMware 데이터스토어 종류: vsan (-s allflash|hybrid) / ds (-s vmfs) / unknown (기본)
+    # VMware datastore type: vsan (-s allflash|hybrid) / ds (-s vmfs) / unknown (default)
     VMBK = "vsan" if storage in ("allflash", "hybrid") else ("ds" if storage == "vmfs" else "unknown")
     VMB = {"vsan": "vSAN", "ds": T("r.0084"), "unknown": T("r.0085")}[VMBK]
     def vs(vsan_txt, ds_txt, unknown_txt=None):
-        """VMware 데이터스토어 종류에 맞는 문구"""
+        """Text matching the VMware datastore type"""
         return {"vsan": vsan_txt, "ds": ds_txt}.get(VMBK, unknown_txt if unknown_txt is not None else vsan_txt)
     unsure = [d for d, c in devcls.items() if not c["sure"]]
     is_vmware = kind == "vmware"
-    # "OS 바깥"을 맡는 담당자와 자원 차원 이름
+    # Owner responsible for "outside the OS" and the name of the resource dimension
     if kind == "vmware":
         OUT, RES_DIM, WHERE_IN, WHERE_OUT = T("r.0072"), T("r.0086"), T("r.0087"), T("r.0088").format(VMB)
     elif kind == "baremetal" and attach == "san" and "network" in attaches:
@@ -1575,7 +1575,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
     else:
         OUT, RES_DIM, WHERE_IN, WHERE_OUT = T("r.0098"), T("r.0099"), T("r.0087"), T("r.0101")
 
-    # ── 샘플 ────────────────────────────────────────────────────────────────
+    # ── Samples ────────────────────────────────────────────────────────────────
     snaps = parse_samples(rd(base, "samples.raw"), es_pid)
     per_dev = {d: disk_intervals(snaps, d) for d in phys}
     per_log = {d: disk_intervals(snaps, d) for d in logical if d not in phys}
@@ -1602,10 +1602,10 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             "rmb_p95": pctl([r["rmb"] for r in rows], 0.95), "wmb_p95": pctl([r["wmb"] for r in rows], 0.95),
             "aqu_p95": pctl([r["aqu"] for r in rows], 0.95), "aqu_max": vmax([r["aqu"] for r in rows]),
             "util_p95": pctl([r["util"] for r in rows], 0.95),
-            # inflight: 장치에 넘겨졌으나 아직 끝나지 않은 I/O 수 (queue_depth와 직접 비교 가능)
+            # inflight: number of I/Os handed to the device but not yet completed (directly comparable to queue_depth)
             "inflight_p95": pctl([r.get("inflight") for r in rows], 0.95),
             "inflight_max": vmax([r.get("inflight") for r in rows]),
-            # I/O 모양: 요청 1건 평균 크기와 병합 비율 (작은 무작위 I/O 인지 큰 순차 I/O 인지)
+            # I/O shape: average size per request and merge ratio (small random I/O vs large sequential I/O)
             "r_kb": (sum(r.get("rsec", 0) for r in rows) * 0.5 / trio) if trio else None,
             "w_kb": (sum(r.get("wsec", 0) for r in rows) * 0.5 / twio) if twio else None,
             "r_merge_pct": (100.0 * sum(r.get("rmerge", 0) for r in rows) / (trio + sum(r.get("rmerge", 0) for r in rows))) if trio else None,
@@ -1620,14 +1620,14 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
     dev_stats = {d: dstats(r) for d, r in per_dev.items()}
     log_stats = {d: dstats(r) for d, r in per_log.items()}
 
-    # ── 부하 수준 ─────────────────────────────────────────────────────────
+    # ── Load level ─────────────────────────────────────────────────────────
     low_load = (A["iops_p95"] or 0) < LOW_LOAD_IOPS and (A["mb_p95"] or 0) < LOW_LOAD_MBPS
 
-    # ── 처리량이 일정한 상한에 막히는 패턴 ─────────────────────────────────
-    # 클라우드 볼륨·인스턴스 한도, VM 디스크 IOPS 한도, vSAN 정책 IOPS 한도, SAN QoS, cgroup io.max 는 모두
-    # "요청은 쌓이는데(대기 I/O 증가) IOPS 나 처리량은 같은 값에서 더 오르지 않는" 모양으로 보인다.
-    # 상한 근처(최대의 95% 이상)에 머문 구간이 30~90% 이고, 그 구간의 대기 I/O 가 나머지보다 2배 이상 많을 때만 본다.
-    # 일정한 부하가 계속 들어오는 경우(전 구간이 같은 값)는 한도가 아니라 부하가 일정한 것이므로 제외된다
+    # ── Pattern of throughput held at a fixed ceiling ─────────────────────────────────
+    # Cloud volume/instance limits, VM disk IOPS limits, vSAN policy IOPS limits, SAN QoS, and cgroup io.max all
+    # show up as "requests pile up (queued I/O rises) but IOPS or throughput stops rising at the same value".
+    # Flag only when 30 to 90% of intervals stay near the ceiling (95% of max or more) and queued I/O in those intervals is at least 2x the rest.
+    # A steady, constant load (the same value across all intervals) means the load is constant, not a limit, so it is excluded
     plateau = None
     busy_rows = [r for r in agg if (r["rio"] + r["wio"]) >= MIN_IOS_PER_INTERVAL]
     if len(busy_rows) >= 10:
@@ -1661,7 +1661,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 OUT, fmt(mx, 0 if not unit else 1, unit)),
             T("r.0117"))
 
-    # ── AWS EBS: 볼륨·인스턴스 한도를 넘긴 시간 (Nitro NVMe 로그 페이지, 누적 us) ─────────
+    # ── AWS EBS: time spent over volume/instance limits (Nitro NVMe log page, cumulative us) ─────────
     ebs0, ebs1 = parse_ebs_stats(rd(S, "ebs_stats_start")), parse_ebs_stats(rd(S, "ebs_stats_end"))
     win = (snaps[-1]["t"] - snaps[0]["t"]) if len(snaps) >= 2 else 0
     EBS, ebs_sevs = {}, []
@@ -1685,7 +1685,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                     T("r.0125").format(lab),
                     fix + ".", T("r.0126"))
 
-    # ═════════════ 1. 지연 ═════════════
+    # ═════════════ 1. Latency ═════════════
     r_sev, w_sev = grade(A["r_await_p95"], th), grade(A["w_await_p95"], th)
     lat_ev = T("r.0127").format(
         fmt(A["r_await_p95"], 2, "ms"), fmt(A["r_await_mean"], 2, "ms"),
@@ -1713,13 +1713,13 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 "Guest" if kind in ("vmware", "vm", "unknown") else "OS", OUT.replace(T("r.0140"), "").replace(T("r.0141"), "")),
             src_lat)
 
-    # 병목 위치: 큐 사용률과 응답시간의 조합
+    # Bottleneck location: combination of queue utilization and response time
     qd = [num(topo.attr.get(d, {}).get("device/queue_depth")) for d in phys]
     qd = [q for q in qd if q]
     qd_total = sum(qd) if qd else None
     qratio = (A["aqu_p95"] / qd_total) if (qd_total and A["aqu_p95"] is not None) else None
-    # inflight(장치에 넘겨져 처리 중인 I/O)는 queue_depth와 직접 비교 가능한 값이라 교차 확인에 쓴다.
-    # aqu-sz 는 블록 계층 큐(nr_requests)에서 대기 중인 요청까지 포함하므로 queue_depth 를 넘을 수 있다.
+    # inflight (I/O handed to the device and in progress) is directly comparable to queue_depth, so it is used as a cross-check.
+    # aqu-sz also includes requests waiting in the block layer queue (nr_requests), so it can exceed queue_depth.
     iratio = (A["inflight_p95"] / qd_total) if (qd_total and A["inflight_p95"] is not None) else None
     q_ev = T("r.0142").format(
         fmt(A["aqu_p95"], 1),
@@ -1738,7 +1738,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 T("r.0150"),
                 T("r.0151"), QSRC)
         elif qratio >= 0.4:
-            # 큐도 깊고 지연도 높다 → 한쪽으로 단정할 수 없는 구간
+            # Queue is deep and latency is high → intervals that cannot be attributed to either side
             add("warn" if lat_sev in ("warn", "crit") else "caution", T("r.0128"), T("r.0042"),
                 T("r.0152").format(qratio * 100),
                 q_ev,
@@ -1758,7 +1758,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                     T("r.0164"),
                     T("r.0165"))
                 + T("r.0166"), QSRC)
-    # 쓰기만 느림 → vSAN 쓰기 경로 힌트
+    # Only writes are slow → hint at the vSAN write path
     write_only = bool(A["w_await_p95"] and A["r_await_p95"] and A["valid_w"] >= 3 and A["valid_r"] >= 3
                       and A["w_await_p95"] >= th["caution"] and A["w_await_p95"] > 3 * A["r_await_p95"])
     if kind == "vmware" and write_only:
@@ -1774,17 +1774,17 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             vs(T("r.0177"), T("r.0178"),
                T("r.0179")))
 
-    # ── vSAN 이 아닌 플랫폼의 병목 위치 ─────────────────────────────────────
-    # 같은 원리(대기 I/O ÷ queue_depth)를 쓰되, "바깥"이 무엇인지와 담당자가 다르다.
-    #  bare-metal 로컬 : 큐가 차면 장치가 동시 처리 한계(포화), 큐가 비었는데 느리면 장치 자체 이상
-    #  bare-metal SAN  : 큐가 차면 HBA LUN 큐, 비었는데 느리면 어레이·패브릭
-    #  기타 VM·클라우드 : vSAN 과 같은 구도지만 백엔드를 특정하지 않는다
+    # ── Bottleneck location on non-vSAN platforms ─────────────────────────────────────
+    # Same principle (queued I/O ÷ queue_depth), but what "outside" means and who owns it differ.
+    #  bare-metal local : queue full means the device's concurrency limit (saturation); queue empty but slow means the device itself is faulty
+    #  bare-metal SAN  : queue full means the HBA LUN queue; empty but slow means the array/fabric
+    #  Other VM/cloud : same picture as vSAN, but the backend is not identified
     GSRC = (T("r.0180"))
     no_qd_dev = [d for d in phys if not topo.attr.get(d, {}).get("device/queue_depth")]
     if kind != "vmware" and SEV_ORDER.get(lat_sev, 0) >= SEV_ORDER["caution"]:
         hi_sev = "warn" if lat_sev in ("warn", "crit") else "caution"
         if qratio is None and no_qd_dev and meta.get("is_root") != "0":
-            # NVMe, virtio-blk 은 queue_depth 개념이 SCSI 와 달라 파일이 없다. 권한 문제가 아니다
+            # NVMe and virtio-blk have a queue_depth concept different from SCSI, so the file does not exist. It is not a permissions problem
             if kind == "baremetal" and "network" in attaches:
                 add(hi_sev, T("r.0128"), OUT, T("r.0181"),
                     q_ev + T("r.0182").format(", ".join(no_qd_dev)),
@@ -1867,10 +1867,10 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 T("r.0232").format(OUT),
                 T("r.0178"))
 
-    # ── 묶음 안에서 한 장치만 느린가 ────────────────────────────────────────
-    # 여러 디스크를 RAID 0·LVM stripe·md 로 묶으면 합산 지표에서는 한 디스크의 지연이 희석된다.
-    # 그런데 stripe 는 가장 느린 구성원 속도로 움직이므로 한 디스크만 느려도 전체가 느려진다.
-    # multipath 면 같은 LUN 의 경로끼리 비교하게 되어 "경로 하나만 느림"을 잡는다.
+    # ── Is only one device in the group slow ────────────────────────────────────────
+    # When several disks are combined with RAID 0, LVM stripe, or md, one disk's latency gets diluted in the aggregate metrics.
+    # But a stripe moves at the speed of its slowest member, so one slow disk slows down the whole thing.
+    # With multipath, paths of the same LUN are compared, catching "only one path is slow".
     def worst_p95(st):
         return max([x for x in (st.get("r_await_p95"), st.get("w_await_p95")) if x is not None] or [None])
     busy_devs = {d: st for d, st in dev_stats.items() if (st.get("valid_r", 0) + st.get("valid_w", 0)) >= 3}
@@ -1897,10 +1897,10 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                         T("r.0243"),
                         T("r.0244").format(OUT),
                         T("r.0241"))
-                # 합산 지표가 정상이어도 stripe 전체는 이 디스크 속도로 움직이므로 지연 차원에 반영한다
+                # Even if the aggregate metrics are normal, the whole stripe moves at this disk's speed, so reflect it in the latency dimension
                 lat_sev = sev_max(lat_sev, grade(v, th))
 
-    # ── 측정 환경 ───────────────────────────────────────────────────────────
+    # ── Measurement environment ───────────────────────────────────────────────────────────
     mapped = bool(path_map) and all(pm.get("via") == "mountinfo" for pm in path_map)
     if plat["container"] and mapped:
         add("info", T("r.0245"), T("r.0013"), T("r.0246"),
@@ -1914,7 +1914,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0252"),
             T("r.0253"),
             "systemd-detect-virt -c")
-    # 0.10.0 초기 수집기는 mount namespace 만 달라도(systemd PrivateTmp) 컨테이너로 기록했다. cgroup 으로 한 번 더 본다
+    # Early 0.10.0 collectors recorded a container even when only the mount namespace differed (systemd PrivateTmp). Check cgroup as well
     cg_es = rd(S, "es_cgroup")
     in_cont = meta.get("es_in_container") == "1" and not (
         cg_es and re.search(r'system\.slice/[^/\s]*\.service', cg_es) and not re.search(r'docker|kubepods|containerd|libpod|lxc|crio', cg_es))
@@ -1937,20 +1937,20 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0265"),
             T("r.0266"))
 
-    # ═════════════ 2. 포화 ═════════════
+    # ═════════════ 2. Saturation ═════════════
     psi_full = [r.get("psi_io_full") for r in sysr if r.get("psi_io_full") is not None]
     psi_some = [r.get("psi_io_some") for r in sysr if r.get("psi_io_some") is not None]
     iow = [r.get("iowait") for r in sysr if r.get("iowait") is not None]
     dst = [r.get("es_dstate") for r in sysr if r.get("es_dstate") is not None]
     blk = [r.get("blocked") for r in sysr if r.get("blocked") is not None]
-    sat_sevs = list(ebs_sevs)       # AWS 가 직접 보고한 한도 초과는 실측 포화로 본다
+    sat_sevs = list(ebs_sevs)       # Limit exceedances reported directly by AWS are treated as measured saturation
     if psi_full:
         pf95 = pctl(psi_full, 0.95)
         s = "warn" if pf95 >= 20 else "caution" if pf95 >= 5 else "ok"
         psi_ev = T("r.0267").format(fmt(pctl(psi_some, .95), 1, "%"), fmt(pf95, 1, "%"), fmt(vmax(psi_full), 1, "%"))
         psi_src = T("r.0268")
         if s != "ok" and SEV_ORDER.get(lat_sev, 0) <= SEV_ORDER["ok"]:
-            # 기다리는 시간은 많은데 한 건 한 건은 빠름 → 디스크가 느린 게 아니라 I/O 양이 많은 상태
+            # Lots of wait time but each I/O is fast → the disk is not slow; the I/O volume is high
             s = "caution" if s == "warn" else "info"
             sat_sevs.append(s)
             add(s, T("r.0108"), T("r.0042"), T("r.0269"),
@@ -1987,7 +1987,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         T("r.0290"), "Linux proc(5) /proc/stat")
     sat_sev = sev_max(*sat_sevs) if sat_sevs else "na"
 
-    # ═════════════ 3. 오류 (커널 로그) ═════════════
+    # ═════════════ 3. Errors (kernel log) ═════════════
     klog = rd(S, "klog_io").splitlines()
     STO = r'(scsi|sd [0-9]|pvscsi|mptscsih|mptbase|nvme|ata[0-9]|megaraid|mpt[23]sas|hpsa|smartpqi|aacraid|qla2xxx|lpfc)'
     cats = {
@@ -1998,8 +1998,8 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         T("r.0294"): STO + r'.*(timed out|timing out|timeout)',
         T("r.0295"): r'controller is down|AER:.*error|(megaraid|mpt[23]sas|hpsa|smartpqi|aacraid).*(FATAL|fault|firmware)|Controller cache pinned',
         T("r.0296"): r'md/raid.*(Disk failure|not operational)|multipath.*(Failing path|remaining active paths: 0)',
-        # RAID 컨트롤러가 커널 로그로 보내는 이벤트. 벤더 도구 없이도 배터리·논리 디스크·구성 디스크 이상을 볼 수 있다
-        # (megaraid_sas 는 기본 설정에서 CRITICAL 이상 이벤트를 커널 로그에 남긴다)
+        # Events the RAID controller sends to the kernel log. Battery, logical disk, and member disk problems are visible without vendor tools
+        # (megaraid_sas logs events of CRITICAL and above to the kernel log by default)
         T("r.0297"): r'megaraid_sas.*/0x[0-9a-f]+/(FATAL|CRIT|DEAD|WARN)|(megaraid|mpt[23]sas|hpsa|smartpqi|aacraid).*'
                              r'(battery|bbu|cachevault|degraded|offline|lockup|predictive|rebuild)',
         T("r.0298"): r'thin.*(out of data space|out-of-data-space|read-only mode)|snapshots: Invalidating',
@@ -2039,7 +2039,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             if kind == "vmware" else T("r.0321"),
             T("r.0276"), "journalctl -k / dmesg")
 
-    # ═════════════ 4. ES 영향 ═════════════
+    # ═════════════ 4. ES impact ═════════════
     es_sev = "na"
     es_rows = []
     if n0 and n1:
@@ -2071,7 +2071,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             (T("r.0334"), "{} / {}".format(fmt(wr_rej, 0), fmt(se_rej, 0)), T("r.0335")),
             (T("r.0336"), fmt(ip_rej, 0), ""),
         ]
-        # merge 스레드 풀 (9.1+, 8.19+): 대기 중인 merge 가 시작·끝 두 시점 모두 쌓여 있으면 디스크가 merge 를 못 따라가는 신호
+        # merge thread pool (9.1+, 8.19+): if queued merges have built up at both the start and end points, the disk is not keeping up with merges
         mq0, mq1 = dig(n0, "thread_pool", "merge", "queue"), dig(n1, "thread_pool", "merge", "queue")
         mthr = dig(n1, "thread_pool", "merge", "threads")
         if isinstance(mq0, (int, float)) and isinstance(mq1, (int, float)):
@@ -2101,7 +2101,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             add("caution", T("r.0339"), T("r.0042"), T("r.0353"), "search rejected {}".format(fmt(se_rej, 0)),
                 T("r.0354"), T("r.0355"),
                 "Elasticsearch thread pool")
-        # 클러스터 상태가 측정을 오염시키는지
+        # Whether cluster state is contaminating the measurement
         if health and ((health.get("relocating_shards") or 0) + (health.get("initializing_shards") or 0)) > 0:
             add("info", T("r.0339"), T("r.0013"), T("r.0356"),
                 "relocating {} · initializing {} · status {}".format(health.get("relocating_shards"), health.get("initializing_shards"), health.get("status")),
@@ -2112,7 +2112,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0361"),
             T("r.0362"), "-")
 
-    # vSAN OSA hybrid 는 VCF 9.0 에서 향후 중단 예정으로 공지됐다
+    # vSAN OSA hybrid was announced as planned for future discontinuation in VCF 9.0
     if storage == "hybrid":
         add("info", RES_DIM, T("r.0072"), T("r.0363"),
             T("r.0364"),
@@ -2120,7 +2120,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0366"),
             T("r.0367"))
 
-    # 벡터 검색의 direct IO: page cache 를 거치지 않고 디스크를 직접 읽는다 (9.1 tech preview)
+    # Direct IO for vector search: reads the disk directly, bypassing the page cache (9.1 tech preview)
     if re.search(r'-Dvector\.rescoring\.directio=true', rd(S, "es_cmdline")):
         add("info", T("r.0339"), T("r.0013"), T("r.0368"),
             T("r.0369"),
@@ -2128,7 +2128,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0371"),
             T("r.0372"))
 
-    # ═════════════ 5. 메모리·캐시 ═════════════
+    # ═════════════ 5. Memory/cache ═════════════
     mem_sevs = []
     swaps = [l for l in rd(S, "swaps").splitlines()[1:] if l.strip()]
     swap_on = bool(swaps)
@@ -2156,8 +2156,8 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         if m:
             heap = int(m.group(1)) * (1024 ** 3 if m.group(2) in "gG" else 1024 ** 2)
     heap_mb = heap / 1048576.0 if heap else None
-    # compressed oops 사용 여부는 ES 가 직접 알려 준다(true/false). 값이 없으면 30GB 를 경계로 본다
-    # (Elastic: 대부분 26GB 까지 안전, 일부 시스템은 30GB 까지)
+    # ES reports directly whether compressed oops is in use (true/false). If the value is missing, use 30GB as the boundary
+    # (Elastic: safe up to 26GB on most systems, up to 30GB on some)
     coops = str(dig(node_i, "jvm", "using_compressed_ordinary_object_pointers") or "").lower()
     heap_big = (coops == "false") if coops in ("true", "false") else bool(heap_mb and heap_mb > 30 * 1024)
     store_b = dig(n1 or {}, "indices", "store", "size_in_bytes")
@@ -2199,9 +2199,9 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             "Linux kernel Documentation/admin-guide/sysctl/vm.rst")
     mem_sev = sev_max(*mem_sevs) if mem_sevs else "ok"
 
-    # ═════════════ 6. 설정 ═════════════
+    # ═════════════ 6. Settings ═════════════
     cfg_sevs = []
-    # readahead 가 큰 원인은 대개 tuned profile 이나 udev 규칙이다. 둘 다 이미 수집하고 있으니 원인 후보로 붙인다.
+    # A large readahead usually comes from a tuned profile or udev rule. Both are already collected, so attach them as candidate causes.
     tuned_prof = rd(S, "tuned").strip().split(":")[-1].strip()
     udev_ra = "read_ahead" in rd(S, "udev_rules")
     tuned_hint = ""
@@ -2210,7 +2210,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
     if udev_ra:
         tuned_hint += T("r.0404")
 
-    # readahead: Elastic 공식 권고 128KiB
+    # readahead: Elastic's official recommendation is 128KiB
     ra_bad = []
     for d in sorted(set(phys + logical)):
         ra = num(topo.attr.get(topo.whole(d), {}).get("queue/read_ahead_kb"))
@@ -2225,7 +2225,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             + tuned_hint,
             T("r.0409"))
     # scheduler
-    # Red Hat 권고: 가상 게스트 mq-deadline/none, 고성능 SSD·NVMe none/kyber, 기존 HDD mq-deadline/bfq
+    # Red Hat recommendation: virtual guests mq-deadline/none, high-performance SSD/NVMe none/kyber, traditional HDD mq-deadline/bfq
     def sched_rec(d):
         if kind != "baremetal":
             return ("mq-deadline", "none"), T("r.0410")
@@ -2241,7 +2241,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         m = re.search(r'\[(\S+)\]', sch)
         cur = m.group(1) if m else sch.strip()
         ok_set, what = sched_rec(d)
-        # 판정은 확실히 불리한 경우만: 가상 디스크·SAN·SSD·NVMe 에 cfq/bfq. HDD 의 bfq 는 Red Hat 권고 범위
+        # Flag only clearly unfavorable cases: cfq/bfq on virtual disks, SAN, SSD, NVMe. bfq on HDD is within Red Hat's recommendation
         if cur in ("cfq", "bfq") and what != "HDD":
             sch_bad.append("{}={}".format(d, cur)); sch_kind.add(what)
     if sch_bad:
@@ -2278,7 +2278,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         add("info", T("r.0405"), T("r.0148"), "THP(Transparent HugePage) = always", thp,
             T("r.0432"),
             T("r.0433"), T("r.0434"))
-    # 파일시스템·마운트
+    # Filesystem/mount
     for pm in path_map:
         m = pm["mount"]
         if not m:
@@ -2303,7 +2303,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                     T("r.0446"))) if is_vmware else ""),
                 T("r.0447") + (T("r.0448") if is_vmware else ""),
                 "mount(8)" + (vs(T("r.0449"), T("r.0450"), T("r.0451")) if is_vmware else ""))
-    # 파티션 정렬
+    # Partition alignment
     for d in phys:
         for part, (parent, start) in topo.parts.items():
             if parent == d and start % 2048 != 0:
@@ -2311,9 +2311,9 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 add("caution", T("r.0405"), T("r.0148"), T("r.0452"), "{} start sector {}".format(part, start),
                     T("r.0453"),
                     T("r.0454"), T("r.0455"))
-    # SCSI timeout: vSAN failover 대비
-    # 180초 권고는 VMware(open-vm-tools) 기준. bare-metal 로컬 디스크는 커널 기본 30초가 정상이고,
-    # SAN 은 multipath 벤더 권고를 따르므로 여기서 판정하지 않는다
+    # SCSI timeout: for vSAN failover
+    # The 180-second recommendation is VMware's (open-vm-tools). For bare-metal local disks the kernel default of 30 seconds is normal,
+    # and SAN follows the multipath vendor's recommendation, so it is not evaluated here
     to_bad = ["{}={}s".format(d, topo.attr[d]["device/timeout"]) for d in phys
               if is_vmware and num(topo.attr.get(d, {}).get("device/timeout"), 999) < 60]
     if to_bad:
@@ -2324,7 +2324,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             vs(T("r.0458"), T("r.0459"), T("r.0460")) + T("r.0461"),
             T("r.0462"),
             T("r.0463"))
-    # cgroup I/O 제한
+    # cgroup I/O limits
     cg = rd(S, "es_cgroup_io").strip()
     if cg and "max" in cg and re.search(r'(rbps|wbps|riops|wiops)=\d', cg):
         cfg_sevs.append("warn")
@@ -2346,7 +2346,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         cfg_sevs.append("warn")
         add("warn", T("r.0405"), T("r.0148"), T("r.0471"), "{} / {}".format(int(fdc), nofile),
             T("r.0472"), T("r.0473"), "/proc/<pid>/fd")
-    # 디스크 용량 · watermark
+    # Disk capacity / watermark
     for line in rd(S, "df").splitlines()[1:]:
         p = line.split()
         if len(p) >= 6 and any(pm["mount"] and p[5] in (pm["mount"]["mnt"], pm["mount"].get("host_mnt")) for pm in path_map):
@@ -2362,7 +2362,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 cfg_sevs.append("caution")
                 add("caution", T("r.0405"), T("r.own_es"), T("r.0477"), "{} {}% (high {})".format(p[5], int(use), hi),
                     T("r.0478"), T("r.0479"), T("r.0055"))
-    # OS와 data가 같은 장치/컨트롤러
+    # OS and data on the same device/controller
     root = mount_for("/", mounts)
     root_phys = topo.physical(topo.kname(root["src"])) if root else []
     share_dev = sorted(set(root_phys) & set(phys))
@@ -2397,7 +2397,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                     "{} ← {}".format(dmn, ", ".join(topo.slaves[d])),
                     T("r.0494"),
                     T("r.0495"), "LVM lvcreate(8)")
-    # iostats 비활성. 이러면 측정 자체가 무의미
+    # iostats disabled. The measurement itself is meaningless in that case
     for d in phys:
         if topo.attr.get(d, {}).get("queue/iostats") == "0":
             cfg_sevs.append("warn")
@@ -2405,7 +2405,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 "/sys/block/{}/queue/iostats = 0".format(d),
                 T("r.0497"),
                 T("r.0498"), "Linux block layer sysfs")
-    # writeback throttling: 커널이 쓰기를 의도적으로 억제
+    # writeback throttling: the kernel deliberately holds back writes
     wbt = [(d, num(topo.attr.get(d, {}).get("queue/wbt_lat_usec"))) for d in phys]
     wbt_on = [(d, v) for d, v in wbt if v and v > 0]
     if wbt_on and SEV_ORDER.get(w_sev, 0) >= SEV_ORDER["caution"]:
@@ -2415,7 +2415,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0500"),
             T("r.0501"),
             "Linux block layer writeback throttling (wbt)")
-    # 스토리지 인터럽트가 특정 vCPU에 몰리는지
+    # Whether storage interrupts are concentrated on a specific vCPU
     i0, i1 = rd(S, "interrupts_start"), rd(S, "interrupts_end")
     if i0 and i1:
         def irq_map(t):
@@ -2449,7 +2449,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                     T("r.0507") if kind == "baremetal" else
                     T("r.0508").format(OUT)),
                     "/proc/interrupts")
-    # mmap 여유 (ES는 segment를 mmap으로 연다)
+    # mmap headroom (ES opens segments with mmap)
     mapc = num(rd(S, "es_mapcount").strip())
     if mapc and mmc:
         use = 100.0 * mapc / mmc
@@ -2460,7 +2460,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 T("r.0511"),
                 T("r.0512"),
                 T("r.0431"))
-    # ES 로그에 남은 디스크 관련 메시지
+    # Disk-related messages in the ES logs
     eslog = [l for l in rd(S, "es_log").splitlines() if l.strip() and not l.startswith("#FILE")]
     if eslog:
         pats = [(T("r.0513"), r'now throttling indexing'), (T("r.0514"), r'disk watermark|flood stage'),
@@ -2477,11 +2477,11 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 T("r.0521"),
                 T("r.0522"))
 
-    # ── 디스크와 직결되는 인덱스 설정 (명시적으로 바꾼 인덱스만 응답에 들어온다) ──
+    # ── Index settings tied directly to disk (only indices with explicitly changed values appear in the response) ──
     idx_set = rjson(S, "es_idx_settings.json") or {}
     def idx_vals(key):
-        """key 를 명시적으로 설정한 인덱스를 {인덱스: 값} 으로.
-        수집은 중첩 응답(settings.index.translog.durability)이고, 예전 번들은 flat 키("index.translog.durability")다"""
+        """Return indices that explicitly set key as {index: value}.
+        Collection uses the nested response (settings.index.translog.durability); older bundles use the flat key ("index.translog.durability")"""
         out = {}
         for name, blk in idx_set.items():
             st = (blk or {}).get("settings") or {}
@@ -2490,7 +2490,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 out[name] = str(v)
         return out
 
-    # translog durability: 디스크 지연이 인덱싱 지연으로 이어지는 경로를 설명하는 핵심 설정
+    # translog durability: the key setting explaining how disk latency turns into indexing latency
     dur_async = {k: v for k, v in idx_vals("index.translog.durability").items() if str(v).lower() == "async"}
     if dur_async:
         add("info", T("r.0051"), T("r.0013"), T("r.0523"),
@@ -2505,11 +2505,11 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0532"),
             T("r.0533"))
 
-    # merge scheduler: Elastic은 spinning platter 에 max_thread_count=1 을 권고
-    # VMware 가상 디스크는 백엔드가 all-flash 여도 rotational=1 로 보고하는 경우가 많아 vSAN 에서는
-    # rotational 값만으로 판정하지 않고 -s hybrid 선언을 기준으로 삼는다.
-    # bare-metal 로컬 디스크는 rotational 을 믿을 수 있으므로 매체 판정(hdd)을 그대로 쓴다.
-    # RAID 논리 디스크는 컨트롤러가 rotational 을 제대로 넘기지 않는 경우가 있어 추정으로 표시한다.
+    # merge scheduler: Elastic recommends max_thread_count=1 for spinning platters
+    # VMware virtual disks often report rotational=1 even when the backend is all-flash, so on vSAN
+    # we do not decide from rotational alone and use the -s hybrid declaration instead.
+    # rotational can be trusted on bare-metal local disks, so the media classification (hdd) is used as-is.
+    # RAID controllers sometimes do not pass rotational through correctly for logical disks, so it is marked as an estimate.
     mtc = idx_vals("index.merge.scheduler.max_thread_count")
     rot = [d for d in phys if topo.attr.get(d, {}).get("queue/rotational") == "1"]
     spinning = storage in ("hybrid", "hdd")
@@ -2547,7 +2547,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0553"),
             T("r.0554"))
 
-    # ── 장치 계층 전체(파티션·LVM·md·dm)를 따라 내려가며 쓰는 도우미 ────────────
+    # ── Helper that walks down the whole device stack (partition, LVM, md, dm) ────────────
     def chain(k, depth=0):
         if not k or depth > 8:
             return []
@@ -2563,7 +2563,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         k_ = topo.kname(m_["src"]) if m_ else None
         return set(topo.physical(k_)) if k_ else set()
 
-    # flush: fsync 가 장치 캐시를 비우라고 보내는 요청. 이게 느리면 translog fsync 가 곧바로 느려진다
+    # flush: the request fsync sends to empty the device cache. If this is slow, translog fsync slows down directly
     if A.get("flush_ms") is not None and (A.get("flush_ps") or 0) >= 1:
         fms = A["flush_ms"]
         if fms >= th["caution"]:
@@ -2575,7 +2575,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 (T("r.0558")).format(OUT),
                 T("r.0559"))
 
-    # ES 가 아닌 프로세스의 디스크 사용 (옆집 부하)
+    # Disk usage by non-ES processes (noisy neighbors)
     def procio(txt):
         io, comm = {}, {}
         for l in txt.splitlines():
@@ -2624,7 +2624,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                     T("r.0566"),
                     T("r.0567"), "df -i")
 
-    # 마운트 옵션: 데이터 안전·성능에 직접 닿는 것
+    # Mount options that directly affect data safety and performance
     for pm in path_map:
         m_ = pm["mount"]
         if not m_:
@@ -2693,7 +2693,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0592"),
             T("r.0593"), "lvmcache(7)")
 
-    # 같은 디스크 공유: swap, snapshot 저장소(path.repo), ES 로그(path.logs)
+    # Shared disk: swap, snapshot repository (path.repo), ES logs (path.logs)
     phys_set = set(phys)
     swap_hit = []
     for line in rd(S, "swaps").splitlines()[1:]:
@@ -2735,7 +2735,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0602"),
             T("r.0603"), "Elasticsearch path settings")
 
-    # 장치 상태와 오류 카운터 (SCSI), NVMe 컨트롤러 상태, PCIe AER
+    # Device state and error counters (SCSI), NVMe controller state, PCIe AER
     DEVERR = {}
     for d in phys:
         a_ = topo.attr.get(d, {})
@@ -2779,7 +2779,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 T("r.0623"),
                 T("r.0624"), "Linux md(4) mismatch_cnt")
 
-    # 커널 로그의 RAID 컨트롤러 이벤트 (벤더 도구 없이 보는 배터리·논리 디스크·구성 디스크 이상)
+    # RAID controller events in the kernel log (battery, logical disk, and member disk problems seen without vendor tools)
     raid_ev = [l for l in klog if re.search(cats[T("r.0297")], l, re.I)]
     if raid_ev:
         s_ = "warn" if any(re.search(r'fail|degrad|offline|FATAL|DEAD|replace|predictive|pinned', l, re.I) for l in raid_ev) else "caution"
@@ -2792,7 +2792,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
 
     cfg_sev = sev_max(*cfg_sevs) if cfg_sevs else "ok"
 
-    # ═════════════ 7. 플랫폼 자원 (VMware 자원 / 가상화 자원 / 하드웨어) ═════════════
+    # ═════════════ 7. Platform resources (VMware resources / virtualization resources / hardware) ═════════════
     vm_sevs = []
     drivers = sorted(set(topo.hostdrv.get(topo.scsihost.get(d), "?") for d in phys if topo.scsihost.get(d)))
     if any(dr.startswith("nvme") for dr in phys):
@@ -2840,12 +2840,12 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             vm_sevs.append("caution")
             add("caution", T("r.0086"), T("r.0072"), T("r.0652"), "{} MHz".format(cpulim),
                 T("r.0653") + vs(T("r.0654"), "", T("r.0654")) + T("r.0655"), T("r.0656"), T("r.0651"))
-    # ── 하드웨어 (bare-metal): 장치 자체의 상태 ─────────────────────────────
+    # ── Hardware (bare-metal): health of the device itself ─────────────────────────────
     HW = {"nvme": [], "md": [], "smart": [], "fc": [], "governor": None, "raid": []}
     if kind == "baremetal":
-        # NVMe 온도: hwmon temp1_max 는 컨트롤러에 현재 설정된 과열 임계값(기본값은 경고 온도 WCTEMP),
-        # temp1_crit 는 위험 온도(CCTEMP).
-        # 경고 온도를 넘으면 컨트롤러가 스스로 성능을 낮추는(thermal throttling) 구간에 들어간다
+        # NVMe temperature: hwmon temp1_max is the overheat threshold currently set on the controller (default is the warning temperature WCTEMP),
+        # temp1_crit is the critical temperature (CCTEMP).
+        # Above the warning temperature the controller enters a range where it lowers its own performance (thermal throttling)
         data_ctrls = sorted(set(nvme_ctrl(d) for d in phys if nvme_ctrl(d)))
         for c in data_ctrls:
             nv = sto["nvme"].get(c, {})
@@ -2882,7 +2882,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                     T("r.0670"),
                     T("r.0671").format(c),
                     "Linux PCI sysfs (current_link_speed, max_link_speed)")
-        # 소프트웨어 RAID
+        # Software RAID
         md_text = rd(S, "mdstat")
         data_md = set(d for d in logical if d.startswith("md"))
         cur_md = None
@@ -2931,7 +2931,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 + (T("r.0681") if s_ == "info" else ""),
                 T("r.0682"),
                 T("r.0683"))
-        # FC 포트 상태
+        # FC port state
         HW["fc"] = sto["fc"]
         down = [f_ for f_ in sto["fc"] if f_["state"] and f_["state"].lower() not in ("online",)]
         if down and attach == "san":
@@ -2941,7 +2941,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 T("r.0685"),
                 T("r.0686"),
                 "/sys/class/fc_host/*/port_state")
-        # 하드웨어 RAID 컨트롤러 (storcli·perccli / ssacli / arcconf 조회 결과)
+        # Hardware RAID controllers (storcli/perccli / ssacli / arcconf query results)
         data_devs = set(phys)
         for r in hwraid:
             HW["raid"].append(r)
@@ -3017,7 +3017,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                     T("r.0720"), " · ".join(r["bg"][:6]),
                     T("r.0721"),
                     T("r.0722"), T("r.0690").format(r["tool"]))
-        for rdv in topo.raiddev:               # 커널 raid_class (mpt*sas IR 볼륨 등)
+        for rdv in topo.raiddev:               # Kernel raid_class (mpt*sas IR volumes, etc.)
             st = (rdv.get("state") or "").lower()
             if st and st not in ("active", "optimal", "ok", "unknown"):
                 vm_sevs.append("warn")
@@ -3050,7 +3050,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 T("r.0739").format(STORAGE_LABEL[storage]),
                 T("r.0740"),
                 T("r.0741"))
-    # SMART (--smart 로 수집한 경우). 플랫폼과 무관하게 읽지만 가상 디스크에서는 대개 의미가 없다
+    # SMART (when collected with --smart). Read regardless of platform, but usually meaningless on virtual disks
     smart_txt = rd(S, "smart")
     if "#SMARTCTL_ABSENT" in smart_txt and kind == "baremetal" and attach == "local" and \
             not all(devcls.get(d, {}).get("raid") for d in phys):
@@ -3110,7 +3110,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0757").format(OUT), "Linux /proc/stat steal")
     vm_sev = sev_max(*vm_sevs) if vm_sevs else ("ok" if (is_vmware or kind == "baremetal") else "na")
 
-    # ═════════════ 8. 네트워크 (보조) ═════════════
+    # ═════════════ 8. Network (supplementary) ═════════════
     net_sev = "ok"
     netinfo = [l.split("|") for l in rd(S, "net").splitlines() if l.startswith("IF|")]
     for p in netinfo:
@@ -3138,7 +3138,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             T("r.0775"),
             T("r.0776"), T("r.0777"))
 
-    # ═════════════ 9. 과거 이력 (sar) ═════════════
+    # ═════════════ 9. History (sar) ═════════════
     want = set(phys) | set(logical) | set(topo.attr.get(d, {}).get("dm/name", "") for d in logical)
     sar_days = parse_sar(rd(S, "sar_d"), want)
     hist = []
@@ -3155,7 +3155,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 T("r.0781").format(
                     "·" + VMB if is_vmware else (T("r.0782") if kind == "baremetal" else "")), T("r.0783"))
 
-    # ═════════════ Best practice 대조표 (통과 항목 포함 전체) ═════════════
+    # ═════════════ Best practice checklist (all items, including passed) ═════════════
     BP = []
     def bp(cat, item, rec, cur, st, src):
         BP.append((cat, item, rec, cur, st, src))
@@ -3351,7 +3351,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                "crit" if use >= lp else ("caution" if use >= lp - 10 else "ok"), T("r.0786"))
 
 
-    # Guest 큐 기준 이론 상한 (Little's law: 동시 처리 수 ÷ 1건 처리 시간). 백엔드가 먼저 막히므로 낙관적 상한
+    # Theoretical ceiling from the guest queue (Little's law: concurrency ÷ time per I/O). The backend saturates first, so this is an optimistic ceiling
     q_ceiling = None
     tio = sum(r["rio"] + r["wio"] for r in agg); ttk = sum(r["rtk"] + r["wtk"] for r in agg)
     if qd_total and tio >= 200 and ttk > 0:
@@ -3366,7 +3366,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
     me_name = dig(node_i, "name")
     if CL and CL["data_rows"]:
         dr = CL["data_rows"]
-        # (교차 1) 샤드 쏠림 ↔ 이 노드의 디스크 부하
+        # (Cross-check 1) Shard imbalance ↔ disk load on this node
         alloc = rjson(cluster_dir, "cat_allocation.json") if cluster_dir else None
         if isinstance(alloc, list) and len(alloc) >= 3:
             sh = [(r.get("node"), num(r.get("shards"), 0)) for r in alloc if r.get("node") and r.get("node") != "UNASSIGNED"]
@@ -3382,7 +3382,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                     T("r.0911")
                     if loaded else T("r.0912"),
                     T("r.0913"), T("r.0914"))
-        # (교차 2) 같은 데이터스토어 동시 저하
+        # (Cross-check 2) Simultaneous degradation on the same datastore
         busy = [(r["name"], r["busy"]) for r in dr if r["busy"] is not None]
         if len(busy) >= 3:
             high = [n_ for n_, v in busy if v >= 70]
@@ -3415,7 +3415,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                         T("r.0934"),
                         T("r.0935").format(OUT),
                         T("r.0927"))
-    # (교차 3) 쓰기가 특정 인덱스에 집중
+    # (Cross-check 3) Writes concentrated on specific indices
     if IDX:
         tot = sum(r["docs"] for r in IDX) or 1
         top = IDX[0]
@@ -3441,12 +3441,12 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         (T("r.0128"), lat_sev), (T("r.0108"), sat_sev), (T("r.0305"), err_sev), (T("r.0339"), es_sev),
         (T("r.0373"), mem_sev), (T("r.0405"), cfg_sev), (RES_DIM, vm_sev), (T("r.0944"), net_sev), (T("r.0041"), cl_sev),
     ]
-    disk_rt = sev_max(lat_sev, sat_sev, err_sev)          # 디스크 자체의 측정 결과
+    disk_rt = sev_max(lat_sev, sat_sev, err_sev)          # Measurement results for the disk itself
     runtime = sev_max(disk_rt, es_sev)
     latent = sev_max(mem_sev, cfg_sev, vm_sev)
     n_act = sum(1 for f in F if SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["caution"])
-    # "디스크는 정상" 이라고 말하려면 실제로 재서 정상이어야 한다.
-    # lat_sev=="na" 는 I/O가 적어 못 잰 경우이므로 정상 판정 근거가 될 수 없다.
+    # To say "the disk is fine", it must actually have been measured and found normal.
+    # lat_sev=="na" means there was too little I/O to measure, so it cannot back a normal verdict.
     disk_clean = lat_sev == "ok" and not low_load
     if disk_clean:
         for f in F:
@@ -3469,7 +3469,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                    T("r.0955"))
 
     if CL and CL["data_rows"]:
-        # 비교는 같은 data tier 안에서만. hot 노드를 warm/cold 노드와 섞으면 중앙값이 왜곡된다
+        # Compare only within the same data tier. Mixing hot nodes with warm/cold nodes skews the median
         my_row = next((r for r in CL["data_rows"] if r["name"] == me_name), None)
         def _tier(r):
             for t in ("data_hot", "data_warm", "data_cold", "data_frozen", "data_content"):
@@ -3493,21 +3493,21 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                            verdict[2] + T("r.0959").format(rel, me, med))
 
 
-    # 우선 조치: ① 병목 위치(누가 움직일지 결정) → ② 실제로 손댈 수 있는 항목을 심각도순
+    # Priority actions: ① bottleneck location (decides who acts) → ② actionable items by severity
     top = [f for f in F if f.title.startswith(T("r.0960")) and SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["caution"]][:1]
-    # 클러스터 교차 판정은 "누가 움직여야 하는가"를 바꾸므로 개별 설정 항목보다 앞에 둔다
+    # Cluster cross-checks change "who needs to act", so they go before individual setting items
     top += [f for f in F if f.dim == T("r.0041") and SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["warn"] and f not in top][:2 - len(top)]
     act_owner = (OUT, T("r.0148"), T("r.own_es"))
     top += sorted([f for f in F if f.owner in act_owner and SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["caution"] and f not in top],
                   key=lambda f: -SEV_ORDER.get(f.sev, 0))[:3 - len(top)]
 
-    # 수집 오버헤드
+    # Collection overhead
     ov = rd(base, "self_overhead").split()
     def tsec(x):
         m = re.match(r'(\d+)m([\d.]+)s', x)
         return int(m.group(1)) * 60 + float(m.group(2)) if m else 0.0
     cpu_s = sum(tsec(x) for x in ov)
-    # 이 진단이 서버에 실제로 준 부하. 리포트에 그대로 고지한다
+    # The load this diagnosis actually put on the server. Disclosed as-is in the report
     eslog_b = num(meta.get("read_eslog_bytes"), 0) or 0
     sar_b = num(meta.get("read_sar_bytes"), 0) or 0
     out_kb = num(meta.get("output_kb"), 0) or 0
@@ -3616,7 +3616,7 @@ def storage_basis(R):
     lab = {"allflash": "All-Flash vSAN", "hybrid": "Hybrid vSAN"}.get(st, STORAGE_LABEL.get(st, st))
     how = T("r.1050") if R.get("storage_auto") else T("r.1051")
     if R.get("platform") == "vmware" and R.get("storage_auto"):
-        # 데이터스토어가 vSAN 인지 SAN·NFS 인지, vSAN 이면 All-Flash 인지 Hybrid 인지 Guest 에서는 알 수 없다
+        # The guest cannot tell whether the datastore is vSAN or SAN/NFS, or, if vSAN, whether it is All-Flash or Hybrid
         how = (T("r.1052"))
     if R.get("platform") == "baremetal" and R.get("attach") == "san" and R.get("storage_auto"):
         how = T("r.1053")
@@ -3666,7 +3666,7 @@ def render(R, out_path):
         T("r.1060") if R["dev_guess"] else "",
         " · " + E(R["media_note"]) if R.get("media_note") else ""))
 
-    # 우선 조치
+    # Priority actions
     if R.get("top"):
         h.append(T("r.1061"))
         for f in R["top"]:
@@ -3692,7 +3692,7 @@ def render(R, out_path):
         shape += T("r.1070").format(fmt(A["flush_ps"], 1), fmt(A.get("flush_ms"), 2, "ms"))
     h.append(T("r.1071").format(E(shape)))
 
-    # 차트
+    # Charts
     h.append(T("r.1072").format(
         {"vmware": T("r.1073"), "baremetal": T("r.1074") if R.get("attach") == "san" else T("r.1075")}.get(kind, T("r.1073"))))
     charts = [
@@ -3710,7 +3710,7 @@ def render(R, out_path):
         h.append('<div class="chart" id="{}"><div class="t">{}</div><div class="lg">{}</div><svg preserveAspectRatio="none"></svg><div class="ro"></div></div>'.format(
             cid, E(title), " · ".join('<span style="color:{}">━</span> {}'.format(s["c"], E(s["n"])) for s in _s)))
 
-    # 조치 항목
+    # Action items
     h.append(T("r.1086"))
     F = sorted(R["findings"], key=lambda f: -SEV_ORDER.get(f.sev, 0))
     for owner in OWNER_ORDER:
@@ -3724,7 +3724,7 @@ def render(R, out_path):
                          op, COLOR[f.sev], COLOR[f.sev], SEV_LABEL[f.sev], E(f.title), E(f.dim), E(f.evidence), E(f.why), E(f.action), E(f.source)))
         h.append('</div>')
 
-    # Best practice 대조표
+    # Best practice checklist
     if R.get("BP"):
         nbad = sum(1 for b in R["BP"] if SEV_ORDER.get(b[4], 0) >= SEV_ORDER["caution"])
         h.append(T("r.1089").format(len(R["BP"]), nbad))
@@ -3736,7 +3736,7 @@ def render(R, out_path):
             cat_prev = cat
         h.append('</table></div>')
 
-    # ES 지표
+    # ES metrics
     if R["es_rows"]:
         h.append(T("r.1091"))
         h.append(T("r.1092"))
@@ -3744,7 +3744,7 @@ def render(R, out_path):
             h.append('<tr><td>{}</td><td class="n">{}</td><td class="note">{}</td></tr>'.format(E(a), E(b), E(c)))
         h.append('</table>')
 
-    # 한계 추정 (부하 테스트 없이 계산할 수 있는 큐 기준 이론 상한)
+    # Limit estimate (theoretical queue-based ceiling computable without a load test)
     h.append(T("r.1093").format(
                  T("r.1094") if kind == "baremetal" else T("r.0410"),
                  {"vmware": T("r.1095") if R.get("vmbk") == "vsan" else T("r.1096"), "baremetal": T("r.1097")}.get(kind, T("r.1098"))))
@@ -3755,7 +3755,7 @@ def render(R, out_path):
     else:
         h.append(T("r.1100"))
 
-    # 클러스터 관점
+    # Cluster view
     CL = R.get("CL")
     if CL:
         h.append(T("r.1101"))
@@ -3778,7 +3778,7 @@ def render(R, out_path):
         if CL["acts"]:
             h.append(T("r.1106").format(E(" · ".join(CL["acts"]))))
 
-    # 이 노드의 인덱스별 쓰기 분포
+    # Write distribution per index on this node
     IDX = R.get("IDX")
     if IDX:
         h.append(T("r.1107"))
@@ -3795,7 +3795,7 @@ def render(R, out_path):
         if len(IDX) > 12:
             h.append(T("r.1109").format(len(IDX)))
 
-    # 디스크를 쓴 프로세스
+    # Processes that used the disk
     PROC = R.get("PROC") or []
     if PROC:
         h.append(T("r.1110"))
@@ -3806,7 +3806,7 @@ def render(R, out_path):
                 E(x["pid"]), fmt(x["r_mb"], 1, " MB"), fmt(x["w_mb"], 1, " MB")))
         h.append('</table>')
 
-    # 디바이스 상세
+    # Device details
     h.append(T("r.1112"))
     h.append(T("r.1113"))
     for pm in R["path_map"]:
@@ -3858,7 +3858,7 @@ def render(R, out_path):
             h.append(T("r.1119"))
     h.append(T("r.1120"))
 
-    # 이력
+    # History
     if R["hist"]:
         h.append(T("r.1121"))
         h.append(T("r.1122"))
@@ -3867,7 +3867,7 @@ def render(R, out_path):
                 E(day), grade(p95, th), fmt(p95, 1, "ms"), grade(mxv, th), fmt(mxv, 1, "ms"), E(when), fmt(ut, 0, "%")))
         h.append('</table>')
 
-    # 측정 범위와 한계
+    # Measurement scope and limitations
     ov = R["overhead"]
     h.append(T("r.1123"))
     h.append(T("r.1124"))
@@ -3980,7 +3980,7 @@ def render(R, out_path):
     elif kind == "baremetal":
         blind = BLIND_BAREMETAL
         if (R.get("HW") or {}).get("raid"):
-            # 컨트롤러 도구로 캐시·RAID 레벨·구성 디스크 상태를 읽었으면 "볼 수 없는 것"에서 뺀다
+            # If cache, RAID level, and member disk state were read from controller tools, remove them from "what cannot be seen"
             blind = [b for b in blind if not b[0].startswith("RAID")]
     else:
         blind = BLIND_VM
@@ -3988,7 +3988,7 @@ def render(R, out_path):
         h.append('<tr>' + "".join('<td>{}</td>'.format(E(c)) for c in r) + '</tr>')
     h.append('</table>')
 
-    # 부록
+    # Appendix
     h.append(T("r.1276"))
     sc = R["sysctl"]
     h.append(T("r.1277"))
@@ -4053,7 +4053,7 @@ def render_cluster_only(cdir, out_path):
 
 
 
-# 차트 스크립트. 화면 문구 두 개만 카탈로그에서 넣는다
+# Chart script. Only two UI strings come from the catalog
 JS_SRC = '\nfunction chart(id, series, ths, unit){\n  const el=document.getElementById(id); if(!el) return;\n  const svg=el.querySelector(\'svg\'), ro=el.querySelector(\'.ro\');\n  const W=1000,H=190,L=46,R=10,T=10,B=24;\n  const xs=DATA.t; if(!xs.length){ro.textContent=\'__NODATA__\';return;}\n  let mx=0; series.forEach(s=>DATA[s.k].forEach(v=>{if(v!=null&&v>mx)mx=v}));\n  ths.forEach(t=>{if(t.v>mx*0.6&&t.v<mx*2)mx=Math.max(mx,t.v)}); mx=mx*1.1||1;\n  const x=i=>L+(W-L-R)*(xs.length>1?i/(xs.length-1):0), y=v=>T+(H-T-B)*(1-v/mx);\n  let g=\'\';\n  for(let k=0;k<=4;k++){const v=mx*k/4;g+=`<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="#eceef2"/>`+\n    `<text x="${L-6}" y="${y(v)+4}" font-size="11" fill="#8b93a1" text-anchor="end">${v<10?v.toFixed(1):Math.round(v)}</text>`;}\n  ths.forEach(t=>{if(t.v<=mx){g+=`<line x1="${L}" x2="${W-R}" y1="${y(t.v)}" y2="${y(t.v)}" stroke="${t.c}" stroke-dasharray="5 4" stroke-width="1.2"/>`+\n    `<text x="${W-R-4}" y="${y(t.v)-4}" font-size="11" fill="${t.c}" text-anchor="end">${t.l}</text>`;}});\n  const n=xs.length, step=Math.max(1,Math.round(n/6));\n  for(let i=0;i<n;i+=step){g+=`<text x="${x(i)}" y="${H-6}" font-size="11" fill="#8b93a1" text-anchor="middle">${Math.round(xs[i])}s</text>`;}\n  series.forEach(s=>{let d=\'\',pen=false;DATA[s.k].forEach((v,i)=>{if(v==null){pen=false;return;}d+=(pen?\'L\':\'M\')+x(i).toFixed(1)+\',\'+y(v).toFixed(1);pen=true;});\n    g+=`<path d="${d}" fill="none" stroke="${s.c}" stroke-width="1.8"/>`;});\n  g+=`<line id="${id}_c" x1="0" x2="0" y1="${T}" y2="${H-B}" stroke="#9aa3b2" visibility="hidden"/>`;\n  svg.setAttribute(\'viewBox\',`0 0 ${W} ${H}`); svg.innerHTML=g;\n  const cur=document.getElementById(id+\'_c\');\n  svg.addEventListener(\'mousemove\',e=>{const r=svg.getBoundingClientRect();const px=(e.clientX-r.left)/r.width*W;\n    let i=Math.round((px-L)/(W-L-R)*(n-1));i=Math.max(0,Math.min(n-1,i));cur.setAttribute(\'x1\',x(i));cur.setAttribute(\'x2\',x(i));cur.setAttribute(\'visibility\',\'visible\');\n    ro.textContent=`${Math.round(xs[i])}__SEC__ · `+series.map(s=>`${s.n} ${DATA[s.k][i]==null?\'-\':DATA[s.k][i].toFixed(2)}${unit}`).join(\' · \');});\n  svg.addEventListener(\'mouseleave\',()=>{cur.setAttribute(\'visibility\',\'hidden\');ro.textContent=\'\';});\n}\n'
 
 
@@ -4129,8 +4129,8 @@ def _init_texts():
 set_lang(os.environ.get("ESDP_LANG", "ko"))
 
 def out_paths(out, default_dir, default_name, langs):
-    """-o 가 있으면 그 이름에, 없으면 기본 이름에 언어를 붙인다 (report.html -> report.ko.html, report.en.html).
-    한 언어만 만들 때 -o 를 주면 그 이름 그대로 쓴다"""
+    """If -o is given, append the language to that name; otherwise to the default name (report.html -> report.ko.html, report.en.html).
+    When building only one language, -o is used as-is"""
     if out and len(langs) == 1:
         return {langs[0]: out}
     base = out or os.path.join(default_dir, default_name)

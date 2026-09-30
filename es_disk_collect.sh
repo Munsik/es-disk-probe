@@ -1,54 +1,55 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_disk_collect.sh  (v0.10.0)
-# Elasticsearch 노드 Disk I/O 진단: 데이터 수집기 (READ-ONLY)
+# es_disk_collect.sh  (v0.11.0)
+# Elasticsearch node Disk I/O diagnostics: data collector (READ-ONLY)
 #
-#  - 시스템 설정을 바꾸지 않습니다. /proc, /sys 읽기와 ES 조회 API(GET) 호출만 합니다.
-#  - 파일을 쓰는 곳은 결과 디렉터리 하나뿐이고(ES data 와 다른 디스크를 자동 선택), 무엇도 지우지 않습니다.
-#  - 디스크에 부하를 거는 테스트는 하지 않습니다. 운영 중 실제 부하를 그대로 측정합니다.
-#  - 외부 패키지 불필요 (bash, awk, coreutils). iostat/sysstat 없어도 동작합니다.
-#  - 샘플링 1회당 프로세스 fork는 awk 1개뿐입니다. 자기 자신은 nice 19 / ionice idle.
-#  - drop_caches, fio, dd, sync 같은 부하·캐시 파괴 동작은 하지 않습니다.
+#  - Does not change system settings. Only reads /proc and /sys and calls ES read APIs (GET).
+#  - Writes files only to one output directory (auto-picked on a disk other than ES data), and deletes nothing.
+#  - Runs no tests that put load on the disk. Measures the real production load as is.
+#  - No external packages needed (bash, awk, coreutils). Works without iostat/sysstat.
+#  - Only one process fork (awk) per sample. Runs itself at nice 19 / ionice idle.
+#  - Does nothing that adds load or destroys caches, such as drop_caches, fio, dd, sync.
 #
-# 사용법:
-#   sudo ./es_disk_collect.sh [옵션]
-#     -d SEC        측정 시간 (기본 300초. 피크 시간대에 실행 권장)
-#     -i SEC        샘플 간격 (기본 5초, 최소 1초)
-#     -p PATH       ES data 경로 (여러 번 지정 가능, 미지정 시 자동 탐지)
-#     -o DIR        결과 저장 위치 (기본 /tmp. ES data 와 같은 디스크면 다른 디스크로 자동 변경)
-#     -s TYPE       스토리지 유형 (기본 auto: 플랫폼과 장치를 보고 자동 판정)
-#                   VMware: allflash | hybrid (vSAN), vmfs (SAN·NFS 데이터스토어)
-#                   bare-metal·SAN: nvme | ssd | hdd (RAID 컨트롤러 뒤라 매체를 못 읽을 때 지정)
-#     --platform P  플랫폼 강제 지정: auto | vmware | baremetal | vm (기본 auto)
-#     --es-url URL  ES 주소 (기본 자동: ES 프로세스가 열어 둔 포트를 http → https 순서로 시도)
-#     --es-user U   ES 사용자 (비밀번호는 환경변수 ES_PASSWORD)
-#                   둘 다 안 주고 ES 가 인증을 요구하면 터미널에서 물어봅니다
-#                   API Key 사용 시 환경변수 ES_API_KEY (base64 인코딩 값)
-#     --no-es       ES API 조회 생략 (OS 레벨만 수집)
-#     --no-cluster  클러스터 전체 조회 생략 (이 노드만)
-#     --no-render   HTML 생성 생략 (수집 번들만 만들기)
-#     --light       디스크를 읽는 부가 수집을 모두 생략 (ES 로그·커널 로그·sar·mmap 목록)
-#                   → 디스크 읽기량이 1MB 미만이 됩니다. 판정 근거는 줄어듭니다
-#     --no-eslog    ES 서버 로그 읽기만 생략 (부가 수집 중 읽기량이 가장 큰 항목)
-#     --no-index-stats  인덱스 수에 비례해 커지는 ES 조회 생략 (샤드가 많으면 자동 생략)
+# Usage:
+#   sudo ./es_disk_collect.sh [options]
+#     -d SEC        Measurement duration (default 300s. Run during peak hours)
+#     -i SEC        Sample interval (default 5s, min 1s)
+#     -p PATH       ES data path (repeatable, auto-detected if omitted)
+#     -o DIR        Output location (default /tmp. Moved to another disk if on the same disk as ES data)
+#     -s TYPE       Storage type (default auto: decided from platform and devices)
+#                   VMware: allflash | hybrid (vSAN), vmfs (SAN/NFS datastore)
+#                   bare-metal/SAN: nvme | ssd | hdd (set when media is unreadable behind a RAID controller)
+#     --platform P  Force platform: auto | vmware | baremetal | vm (default auto)
+#     --es-url URL  ES address (default auto: tries ports the ES process listens on, http then https)
+#     --es-user U   ES user (password in env var ES_PASSWORD)
+#                   If neither is given and ES requires auth, prompts on the terminal
+#                   For API Key, env var ES_API_KEY (base64-encoded value)
+#     --no-es       Skip ES API queries (OS level only)
+#     --no-cluster  Skip cluster-wide queries (this node only)
+#     --no-render   Skip HTML generation (bundle only)
+#     --light       Skip all extra collection that reads the disk (ES logs, kernel logs, sar, mmap list)
+#                   → Disk reads drop below 1MB. Less evidence for the verdict
+#     --no-eslog    Skip only ES server log reading (largest reader among extra collection)
+#     --no-index-stats  Skip ES queries that grow with index count (auto-skipped with many shards)
 #                   (_nodes/_local/stats?level=indices, _ilm/explain)
-#     --no-hw       하드웨어 상태 조회를 끔 (bare-metal 에서 자동으로 하는 SMART, RAID 컨트롤러 조회)
-#                   조회는 모두 읽기 전용이고 모니터링 에이전트가 주기적으로 하는 것과 같은 명령입니다
-#     --smart       VM 에서도 SMART 를 읽음 (보통은 필요 없음. 가상 디스크의 SMART 는 의미가 없음)
+#     --no-hw       Disable hardware status queries (SMART and RAID controller queries run automatically on bare-metal)
+#                   All queries are read-only, the same commands monitoring agents run periodically
+#     --smart       Read SMART on VMs too (usually unneeded. SMART on a virtual disk is meaningless)
+#     --lang L      Screen language: ko | en (default from the locale). Summary and HTML are saved in both
 #
-# 끝나면:
-#   - 화면에 셸 요약 판정을 바로 보여 주고 summary.txt 로 남깁니다 (bash + awk 만 사용. Python 불필요)
-#   - Python 3.6+ 가 있으면 HTML 리포트(es_disk_report.html)도 만듭니다
-#   - 번들(tar.gz)을 PC 로 가져가 es_disk_render.py 로 HTML 을 다시 만들 수 있습니다
+# When done:
+#   - Shows the shell summary verdict on screen right away and saves it as summary.ko.txt and summary.en.txt (bash + awk only. No Python needed)
+#   - If Python 3.6+ is present, also builds the HTML report in both languages (es_disk_report.ko.html, es_disk_report.en.html)
+#   - Copy the bundle (tar.gz) to a PC to rebuild the HTML with es_disk_render.py
 #
-# 부하 (실측, 300초/5초 간격 기준):
-#   CPU 약 1.2초 (측정 시간 대비 CPU 1개의 0.4%), 메모리 12MB 미만,
-#   디스크 읽기 최대 약 13MB (--light 사용 시 1MB 미만), 쓰기 1MB 미만.
-#   자세한 내역은 README "이 도구가 서버에 주는 부하" 참고.
+# Overhead (measured, 300s at 5s interval):
+#   CPU about 1.2s (0.4% of one CPU over the run), memory under 12MB,
+#   disk reads up to about 13MB (under 1MB with --light), writes under 1MB.
+#   See README "Load this tool puts on the server" for details.
 #
-# 예:
-#   sudo ./es_disk_collect.sh            # 대부분 이것으로 충분 (플랫폼·주소·경로·기준 자동)
-#   sudo ./es_disk_collect.sh -d 600     # 피크 시간대에 10분
+# Examples:
+#   sudo ./es_disk_collect.sh            # enough in most cases (platform, address, paths, thresholds auto)
+#   sudo ./es_disk_collect.sh -d 600     # 10 min during peak hours
 # =============================================================================
 set -u
 umask 077
@@ -71,7 +72,7 @@ _catload() {  # $1=file $2=key prefix
     _M[$k]="$v"
   done < "$1"
 }
-t() {  # t key [values...]  → {1}, {2} ... 자리에 값
+t() {  # t key [values...]  → values go into {1}, {2} ...
   local s="${_M[$1]:-$1}" i=1 a
   shift
   for a in "$@"; do s="${s//\{$i\}/$a}"; i=$((i + 1)); done
@@ -80,7 +81,7 @@ t() {  # t key [values...]  → {1}, {2} ... 자리에 값
 _catload "$HERE/i18n/$LNG.txt" c.; _catload "$HERE/i18n/ko.txt" c.
 export LC_ALL=C
 
-VERSION="0.10.0"
+VERSION="0.11.0"
 DUR=300; INT=5; OUT_BASE="/tmp"; OUT_GIVEN=0; STORAGE="auto"; PLATFORM="auto"; SMART=0; HW=1
 ES_URL=""; ES_USER=""; NO_ES=0; NO_RENDER=0; NO_CLUSTER=0
 NO_ESLOG=0; NO_KLOG=0; NO_SAR=0; NO_MAPS=0; NO_IDXSTATS=0
@@ -116,20 +117,20 @@ ES_PASSWORD="${ES_PASSWORD:-}"; ES_API_KEY="${ES_API_KEY:-}"
 [[ "$DUR" =~ ^[0-9]+$ && "$DUR" -ge $((INT*3)) ]] || { t c.bad_d; echo; exit 1; }
 case "$STORAGE" in auto|allflash|hybrid|vmfs|nvme|ssd|hdd) ;; *) t c.bad_s; echo; exit 1 ;; esac
 case "$PLATFORM" in auto|vmware|baremetal|vm) ;; *) t c.bad_platform; echo; exit 1 ;; esac
-ES_URL="${ES_URL%/}"        # 뒤 슬래시 제거. 붙어 있으면 //_cluster/health 로 요청이 나감
+ES_URL="${ES_URL%/}"        # strip trailing slash. Otherwise requests go to //_cluster/health
 
 msg() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
-# ── 자기 자신의 우선순위를 최저로 (ES와 경합 방지) ─────────────────────────
+# ── Lower own priority to the minimum (avoid contending with ES) ─────────────────────────
 renice -n 19 -p $$ >/dev/null 2>&1 || true
 command -v ionice >/dev/null 2>&1 && ionice -c 3 -p $$ >/dev/null 2>&1 || true
 
 IS_ROOT=0; [[ $EUID -eq 0 ]] && IS_ROOT=1
 [[ $IS_ROOT -eq 0 ]] && msg "$(t c.notroot)"
 
-# ── ES 프로세스와 data 경로를 먼저 찾는다 ─────────────────────────────────
-# 결과 저장 위치를 고르고 ES 주소를 찾는 데 쓴다. 사용자가 경로·주소를 몰라도 되게 하려는 것
-# pgrep -f 는 패턴 문자열을 포함한 다른 명령(tail, 셸 등)도 잡으므로 java 프로세스만 고른다
+# ── Find the ES process and data paths first ─────────────────────────────────
+# Used to pick the output location and find the ES address, so the user need not know paths or addresses
+# pgrep -f also matches other commands containing the pattern (tail, shells, etc.), so pick only java processes
 ES_PID=""
 for p in $(pgrep -f 'org\.elasticsearch\.bootstrap\.Elasticsearch' 2>/dev/null); do
   [[ "$p" == "$$" ]] && continue
@@ -142,9 +143,9 @@ N_ES=$(for p in $(pgrep -x java 2>/dev/null); do grep -qa 'org.elasticsearch.boo
 ES_CMDLINE=""; [[ -n "$ES_PID" ]] && ES_CMDLINE=$(tr '\0' ' ' < /proc/$ES_PID/cmdline 2>/dev/null)
 CONF_DIR=$(printf '%s' "$ES_CMDLINE" | grep -oE 'es\.path\.conf=[^ ]+' | head -1 | cut -d= -f2)
 CONF_DIR=${CONF_DIR:-${ES_PATH_CONF:-/etc/elasticsearch}}
-# ES 가 컨테이너(ECK, Docker) 안에 있으면 경로는 컨테이너 기준이다. 호스트에서는 /proc/<pid>/root 를 거쳐 읽는다.
-# mount namespace 만 다른 경우(systemd 의 PrivateTmp 등, RHEL 의 elasticsearch.service 가 그렇다)는 컨테이너가 아니다.
-# 루트 디렉터리 자체(장치·inode)가 다를 때만 컨테이너로 본다
+# If ES is in a container (ECK, Docker), paths are container-relative. From the host, read them via /proc/<pid>/root.
+# A different mount namespace alone (systemd PrivateTmp etc., as with RHEL elasticsearch.service) is not a container.
+# Treat it as a container only when the root directory itself (device, inode) differs
 ES_ROOT=""
 if [[ -n "$ES_PID" && -r /proc/$ES_PID/root/ ]] && \
    [[ "$(stat -L -c '%d:%i' /proc/$ES_PID/root/ 2>/dev/null)" != "$(stat -L -c '%d:%i' / 2>/dev/null)" ]]; then
@@ -152,7 +153,7 @@ if [[ -n "$ES_PID" && -r /proc/$ES_PID/root/ ]] && \
   msg "$(t c.container "$ES_PID")"
 fi
 
-# elasticsearch.yml 의 path.data. 한 줄(path.data: /a, [/a, /b])과 중첩(path:\n  data: ...), 목록(- /a) 표기를 모두 읽는다
+# path.data in elasticsearch.yml. Reads single-line (path.data: /a, [/a, /b]), nested (path:\n  data: ...) and list (- /a) forms
 yml_data_paths() {
   [[ -r "$1" ]] || return 0
   awk '
@@ -171,15 +172,15 @@ for p in ${USER_PATHS[@]+"${USER_PATHS[@]}"}; do DATA_PATHS+=("$p"); done
 while read -r p; do [[ -n "$p" ]] && DATA_PATHS+=("$p"); done < <(
   printf '%s' "$ES_CMDLINE" | grep -oE 'path\.data=[^ ]+' | cut -d= -f2 | tr ',' '\n'
   yml_data_paths "$ES_ROOT$CONF_DIR/elasticsearch.yml")
-# 기본 경로: 패키지 설치는 /var/lib/elasticsearch, 공식 컨테이너 이미지(ECK 포함)는 /usr/share/elasticsearch/data
+# Default paths: /var/lib/elasticsearch for package installs, /usr/share/elasticsearch/data for official container images (incl. ECK)
 if [[ ${#DATA_PATHS[@]} -eq 0 ]]; then
   for dflt in /var/lib/elasticsearch /usr/share/elasticsearch/data; do
     [[ -d "$ES_ROOT$dflt" ]] && { DATA_PATHS+=("$dflt"); break; }
   done
 fi
 
-# 결과 저장 위치: -o 를 안 줬으면 ES data 와 다른 파일시스템이면서 여유가 50MB 이상인 곳을 고른다.
-# 측정 대상 디스크에 결과를 쓰면 그만큼 측정값이 오염되기 때문이다
+# Output location: without -o, pick a filesystem other than ES data with at least 50MB free.
+# Writing results to the disk under test pollutes the measurements by that much
 same_fs_as_data() {
   local d dev; dev=$(stat -c %d "$1" 2>/dev/null) || return 1
   for d in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do
@@ -201,7 +202,7 @@ HOST=$(hostname 2>/dev/null || echo unknown)
 TS=$(date +%Y%m%d_%H%M%S)
 OUT="$OUT_BASE/esdisk_${HOST}_${TS}"
 S="$OUT/static"
-# 출력 위치 여유 공간 (50MB 미만이면 중단. 서비스 디스크를 채우지 않으려고). 디렉터리를 만들기 전에 본다
+# Free space at output location (abort under 50MB, to avoid filling a service disk). Checked before creating the directory
 AVAIL_KB=$(df -Pk "$OUT_BASE" 2>/dev/null | awk 'NR==2{print $4}')
 [[ "${AVAIL_KB:-0}" -lt 51200 ]] && { t c.nospace "$OUT_BASE"; echo; exit 1; }
 mkdir -p "$S" || { t c.mkdir_fail "$OUT"; echo; exit 1; }
@@ -219,13 +220,13 @@ is_root=$IS_ROOT
 user_paths=${USER_PATHS[*]:-}
 EOF
 read -r UP0 _ < /proc/uptime; echo "start_uptime=$UP0" >> "$OUT/meta"
-# -p 로 준 경로는 공백이 들어갈 수 있으므로 한 줄에 하나씩 따로 저장 (meta 는 호환용)
+# Paths from -p may contain spaces, so store one per line separately (meta is for compatibility)
 : > "$OUT/user_paths"
 for p in ${USER_PATHS[@]+"${USER_PATHS[@]}"}; do printf '%s\n' "$p" >> "$OUT/user_paths"; done
-# 수집기가 찾은 data 경로 후보 (ES 가 내려가 있어도 분석기가 장치를 특정할 수 있게)
+# data path candidates found by the collector (so the analyzer can identify the device even if ES is down)
 for p in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do printf '%s\n' "$p"; done > "$S/data_paths"
-# data 경로가 실제로 올라가 있는 블록 장치. ES 프로세스(없으면 이 셸)의 mountinfo 에서 major:minor 를 읽어
-# /sys/dev/block 으로 장치 이름을 찾는다. 컨테이너처럼 경로가 호스트와 달라도 장치는 정확히 잡힌다
+# Block device the data path actually lives on. Reads major:minor from the mountinfo of the ES process (or this shell if none)
+# and resolves the device name via /sys/dev/block. The device is found correctly even when paths differ from the host, as in containers
 MI="/proc/${ES_PID:-self}/mountinfo"; [[ -r "$MI" ]] || MI=/proc/self/mountinfo
 for p in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do
   awk -v p="$p" '
@@ -242,12 +243,12 @@ done > "$S/datadev" 2>/dev/null
 
 msg "$(t c.start "$OUT" "$DUR" "$INT")"
 
-# ── 헬퍼 ──────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 save()  { local f="$1"; shift; "$@" > "$S/$f" 2>&1 || true; }
 catf()  { [[ -r "$1" ]] && cat "$1" 2>/dev/null; }
 
 # =============================================================================
-# 1. 정적 스냅샷 (설정·구성)
+# 1. Static snapshot (settings, configuration)
 # =============================================================================
 msg "$(t c.step1)"
 save uname      uname -a
@@ -263,7 +264,7 @@ save swaps      cat /proc/swaps
 save cmdline    cat /proc/cmdline
 save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
 
-# sysfs: 블록 디바이스 전체 (loop/ram/sr 제외)
+# sysfs: all block devices (excluding loop/ram/sr)
 {
   for d in /sys/block/*; do
     n=${d##*/}
@@ -283,15 +284,15 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
     real=$(readlink -f "$d/device" 2>/dev/null || true)
     host=$(echo "$real" | grep -oE '/host[0-9]+/' | head -1 | tr -d '/')
     [[ -n "$host" ]] && printf 'SCSIHOST|%s|%s\n' "$n" "$host"
-    # SCSI 주소 H:C:T:L (RAID 컨트롤러의 논리 디스크 번호와 OS 장치를 잇는 보조 근거)
+    # SCSI address H:C:T:L (secondary evidence linking a RAID controller logical disk number to an OS device)
     hctl=${real##*/}; [[ "$hctl" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+$ ]] && printf 'HCTL|%s|%s\n' "$n" "$hctl"
-    # SCSI 디스크 캐시 모드(커널이 장치에서 받은 값)와 FUA 지원
+    # SCSI disk cache mode (value the kernel got from the device) and FUA support
     for sd in "$d"/device/scsi_disk/*; do
       [[ -d "$sd" ]] || continue
       printf 'ATTR|%s|cache_type|%s\n' "$n" "$(catf "$sd/cache_type")"
       printf 'ATTR|%s|FUA|%s\n' "$n" "$(catf "$sd/FUA")"
     done
-    # 장치가 매달린 PCIe 장치(HBA·RAID 컨트롤러·NVMe)의 AER 오류 카운터 (커널 4.17+)
+    # AER error counters of the PCIe device the disk hangs off (HBA, RAID controller, NVMe) (kernel 4.17+)
     pci=$(echo "$real" | grep -oE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]' | tail -1)
     if [[ -n "$pci" && -r "/sys/bus/pci/devices/$pci/aer_dev_fatal" ]]; then
       printf 'AER|%s|%s|cor=%s|nonfatal=%s|fatal=%s\n' "$n" "$pci" \
@@ -299,19 +300,19 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
         "$(awk '/TOTAL_ERR_NONFATAL/{print $2}' "/sys/bus/pci/devices/$pci/aer_dev_nonfatal" 2>/dev/null)" \
         "$(awk '/TOTAL_ERR_FATAL/{print $2}' "/sys/bus/pci/devices/$pci/aer_dev_fatal" 2>/dev/null)"
     fi
-    # 파티션
+    # Partitions
     for p in "$d"/"$n"*; do
       [[ -r "$p/start" ]] && printf 'PART|%s|%s|%s\n' "${p##*/}" "$n" "$(cat "$p/start")"
     done
   done
   for h in /sys/class/scsi_host/host*; do
     [[ -r "$h/proc_name" ]] && printf 'HOSTDRV|%s|%s\n' "${h##*/}" "$(cat "$h/proc_name")"
-    # RAID 컨트롤러 드라이버가 sysfs 로 내주는 상태 (megaraid: 펌웨어 크래시, hpsa·smartpqi: 펌웨어 버전)
+    # Status exposed in sysfs by RAID controller drivers (megaraid: firmware crash, hpsa/smartpqi: firmware version)
     for f in fw_crash_state fw_version firmware_revision; do
       [[ -r "$h/$f" ]] && printf 'HOSTATTR|%s|%s|%s\n' "${h##*/}" "$f" "$(tr -d '\n' < "$h/$f" 2>/dev/null)"
     done
   done
-  # 커널 raid_class (mpt2sas·mpt3sas IR 볼륨 등): 레벨, 상태, resync 진행
+  # Kernel raid_class (mpt2sas/mpt3sas IR volumes etc.): level, state, resync progress
   for r in /sys/class/raid_devices/*; do
     [[ -d "$r" ]] || continue
     printf 'RAIDDEV|%s|level=%s|state=%s|resync=%s|dev=%s\n' "${r##*/}" "$(catf "$r/level")" "$(catf "$r/state")" \
@@ -319,7 +320,7 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
   done
 } > "$S/sysfs" 2>/dev/null
 
-# sysctl / 커널 메모리 설정
+# sysctl / kernel memory settings
 {
   for k in vm.swappiness vm.max_map_count vm.dirty_ratio vm.dirty_background_ratio \
            vm.dirty_bytes vm.dirty_background_bytes vm.dirty_expire_centisecs \
@@ -332,9 +333,9 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
   [[ -r /proc/pressure/io ]] && echo "psi=available" || echo "psi=unavailable"
 } > "$S/sysctl"
 
-# 플랫폼 판별 원자료 / VMware
-# 판정은 분석기가 한다. 여기서는 판단 근거가 되는 값만 모은다 (번들을 PC 에서 다시 렌더링해도 같은 결과가 나오게)
-# systemd-detect-virt 는 가상화가 없으면 "none" 을 찍고 1 로 끝난다. 명령이 없을 때만 unknown
+# Platform detection raw data / VMware
+# The analyzer makes the verdict. Here we only collect the values it is based on (so re-rendering the bundle on a PC gives the same result)
+# systemd-detect-virt prints "none" and exits 1 when there is no virtualization. unknown only when the command is missing
 {
   if command -v systemd-detect-virt >/dev/null 2>&1; then
     echo "detect_virt=$(systemd-detect-virt 2>/dev/null)"
@@ -349,12 +350,12 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
   echo "bios_vendor=$(catf /sys/class/dmi/id/bios_vendor)"
   echo "chassis_asset_tag=$(catf /sys/class/dmi/id/chassis_asset_tag)"
   echo "sys_hypervisor=$(catf /sys/hypervisor/type)"
-  # CPUID hypervisor 비트. 가상 머신이면 1. detect-virt 가 없는 오래된 배포판의 보조 근거
+  # CPUID hypervisor bit. 1 on a virtual machine. Secondary evidence on old distros without detect-virt
   echo "cpu_hypervisor_flag=$(grep -m1 -cE '^flags.*[[:space:]]hypervisor([[:space:]]|$)' /proc/cpuinfo 2>/dev/null)"
-  # 컨테이너 안에서 실행 중인지 (detect-virt 가 없을 때의 보조 근거)
+  # Whether running inside a container (secondary evidence when detect-virt is missing)
   [[ -f /.dockerenv ]] && echo "dockerenv=1"
   [[ -n "${KUBERNETES_SERVICE_HOST:-}" ]] && echo "kubernetes=1"
-  # CPU 주파수 정책. bare-metal 에서 powersave 면 I/O 완료 처리까지 늦어진다 (VM 에는 보통 없음)
+  # CPU frequency governor. powersave on bare-metal also delays I/O completion handling (usually absent on VMs)
   echo "cpu_governor=$(catf /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
   echo "cpu_scaling_driver=$(catf /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver)"
   if command -v vmware-toolbox-cmd >/dev/null 2>&1; then
@@ -370,10 +371,10 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
   done
 } > "$S/virt" 2>/dev/null
 
-# 스토리지 연결 방식과 장치 상태 (bare-metal·SAN 판정용). 전부 sysfs/proc 읽기
+# Storage attachment and device state (for bare-metal/SAN verdicts). All sysfs/proc reads
 {
-  # NVMe 컨트롤러: 모델, 펌웨어, 연결 방식(pcie 가 아니면 NVMe-oF, 즉 원격), 온도, PCIe 링크
-  # hwmon 온도를 읽으면 커널이 장치에 SMART log 를 한 번 요청한다. 읽기 전용이고 실행당 1회
+  # NVMe controller: model, firmware, transport (not pcie means NVMe-oF, i.e. remote), temperature, PCIe link
+  # Reading the hwmon temperature makes the kernel request the SMART log from the device once. Read-only, once per run
   for c in /sys/class/nvme/nvme*; do
     [[ -d "$c" ]] || continue
     n=${c##*/}
@@ -391,22 +392,22 @@ save lsblk      lsblk -o NAME,KNAME,TYPE,SIZE,RA,ROTA,SCHED,MOUNTPOINT,FSTYPE
       [[ -r "$c/device/${f%%:*}" ]] && printf 'NVME|%s|%s|%s\n' "$n" "${f##*:}" "$(cat "$c/device/${f%%:*}" 2>/dev/null)"
     done
   done
-  # FC HBA 포트 (SAN 판정)
+  # FC HBA ports (SAN verdict)
   for h in /sys/class/fc_host/host*; do
     [[ -d "$h" ]] || continue
     printf 'FCHOST|%s|port_state=%s|speed=%s\n' "${h##*/}" "$(catf "$h/port_state")" "$(catf "$h/speed")"
   done
-  # iSCSI 세션 수
+  # iSCSI session count
   n_is=$(ls -d /sys/class/iscsi_session/session* 2>/dev/null | wc -l)
   echo "ISCSI|sessions|$n_is"
 } > "$S/storage" 2>/dev/null
-# 소프트웨어 RAID 상태 (resync·degraded). 메모리에서 만들어지는 값
+# Software RAID state (resync, degraded). Values generated in memory
 [[ -r /proc/mdstat ]] && cat /proc/mdstat > "$S/mdstat" 2>/dev/null
 
-# ── 하드웨어 상태 (bare-metal 에서 자동, --no-hw 로 끔) ─────────────────────
-# 가상 머신의 디스크는 가상 장치라 SMART·RAID 정보가 의미가 없어 건너뛴다.
-# 아래 명령은 모두 조회(show) 전용이다. 설정을 바꾸거나 self-test·재구성을 시작하는 명령은 쓰지 않는다.
-# smartd, 모니터링 에이전트(Prometheus storcli exporter 등)가 주기적으로 실행하는 것과 같은 수준이다.
+# ── Hardware status (automatic on bare-metal, off with --no-hw) ─────────────────────
+# Virtual machine disks are virtual devices, so SMART/RAID info is meaningless and skipped.
+# All commands below are query (show) only. No command changes settings or starts a self-test or rebuild.
+# Same level as what smartd and monitoring agents (Prometheus storcli exporter etc.) run periodically.
 IS_BARE=0
 case "$PLATFORM" in
   baremetal) IS_BARE=1 ;;
@@ -427,9 +428,9 @@ find_tool() {
   done
   return 1
 }
-# 벤더 도구는 실행 디렉터리에 로그 파일을 남기는 것이 있다(storcli.log, UcliEvt.log).
-# 서버의 다른 곳에 남지 않도록 결과 디렉터리 안(hw_tool_logs)에서 실행하고, 지우지 않고 번들에 함께 넣는다
-hw_run() {  # $1=출력 파일, 나머지=명령
+# Some vendor tools leave log files in the working directory (storcli.log, UcliEvt.log).
+# Run them inside the output directory (hw_tool_logs) so nothing is left elsewhere on the server, and include them in the bundle without deleting
+hw_run() {  # $1=output file, rest=command
   local out="$1"; shift
   mkdir -p "$OUT/hw_tool_logs"
   { echo "#CMD $*"; (cd "$OUT/hw_tool_logs" && timeout 30 "$@" 2>&1 | head -c 4194304); echo; } >> "$out"
@@ -449,8 +450,8 @@ if [[ $HW -eq 1 && $IS_BARE -eq 1 ]]; then
       echo "#TOOL_ABSENT storcli/perccli" > "$S/raid_storcli"
     fi
   fi
-  # Broadcom MegaRAID 96xx·Dell PERC 12 이후(mpi3mr 드라이버)는 storcli2·perccli2 로 관리한다.
-  # 명령 문법은 같고(/call, /vall, show ... J), 드라이브는 /eall/sall 대신 컨트롤러별로 조회한다
+  # Broadcom MegaRAID 96xx and Dell PERC 12 and later (mpi3mr driver) are managed with storcli2/perccli2.
+  # Command syntax is the same (/call, /vall, show ... J), but drives are queried per controller instead of /eall/sall
   if [[ "$DRVS" == *" mpi3mr "* ]]; then
     T=$(find_tool storcli2 perccli2 /opt/MegaRAID/storcli2/storcli2 /opt/MegaRAID/perccli2/perccli2)
     if [[ -n "$T" ]]; then
@@ -466,7 +467,7 @@ if [[ $HW -eq 1 && $IS_BARE -eq 1 ]]; then
       echo "#TOOL storcli2" >> "$S/raid_storcli"
       RAID_TOOLS+="storcli2 "
     elif grep -qiE 'PERC|MR9[0-9]|MegaRAID|RAID' /sys/block/sd*/device/model 2>/dev/null; then
-      # mpi3mr 는 HBA 에도 쓰이므로 RAID 논리 디스크가 보일 때만 도구가 없다고 알린다
+      # mpi3mr is also used for HBAs, so report a missing tool only when RAID logical disks are visible
       echo "#TOOL_ABSENT storcli2/perccli2" >> "$S/raid_storcli"
     fi
   fi
@@ -488,8 +489,8 @@ if [[ $HW -eq 1 && $IS_BARE -eq 1 ]]; then
 fi
 echo "raid_tools=$RAID_TOOLS" >> "$OUT/meta"
 
-# SMART: RAID 컨트롤러 뒤 논리 디스크는 컨트롤러 도구가 구성 디스크 상태를 알려 주므로 건너뛴다.
-# -n standby: 절전 중인 HDD 는 깨우지 않는다. 장치 하나에 15초 상한
+# SMART: skip logical disks behind a RAID controller, since the controller tool reports member disk status.
+# -n standby: do not wake HDDs in standby. 15s cap per device
 SMART_N=0
 if [[ $SMART -eq 1 ]]; then
   if command -v smartctl >/dev/null 2>&1; then
@@ -514,12 +515,12 @@ echo "hw=$HW" >> "$OUT/meta"
 save tuned  tuned-adm active
 save fstrim sh -c "systemctl is-enabled fstrim.timer 2>&1; systemctl is-active fstrim.timer 2>&1"
 cp /proc/interrupts "$S/interrupts_start" 2>/dev/null
-# 프로세스별 디스크 I/O 누적값 (측정 시작). 끝에서 한 번 더 읽어 차이로 "ES 말고 누가 디스크를 쓰는지"를 본다.
-# /proc/<pid>/io 는 메모리에서 만들어지는 값이고, 사라진 프로세스는 grep 이 조용히 건너뛴다
+# Per-process cumulative disk I/O (start of measurement). Read again at the end to see from the delta "who besides ES uses the disk".
+# /proc/<pid>/io is generated in memory, and grep silently skips processes that have exited
 procio() { grep -HE '^(read_bytes|write_bytes):' /proc/[0-9]*/io 2>/dev/null; grep -H . /proc/[0-9]*/comm 2>/dev/null; }
 procio > "$S/procio_start"
-# AWS EBS(Nitro): 볼륨·인스턴스 성능 한도를 넘긴 시간(us)을 NVMe 로그 페이지로 준다. 조회 전용.
-# nvme-cli(amzn 플러그인) 또는 amazon-ec2-utils 의 ebsnvme 가 있을 때만 읽는다. 없으면 건너뛴다
+# AWS EBS (Nitro): exposes time (us) over volume/instance performance limits via an NVMe log page. Query only.
+# Read only when nvme-cli (amzn plugin) or ebsnvme from amazon-ec2-utils is present. Skipped otherwise
 EBSNV=""
 if grep -qs 'Amazon Elastic Block Store' /sys/block/nvme*n*/device/model 2>/dev/null; then
   if command -v nvme >/dev/null 2>&1 && nvme amzn help >/dev/null 2>&1; then EBSNV="nvme"
@@ -537,26 +538,26 @@ ebsstats() {
 }
 ebsstats > "$S/ebs_stats_start"
 save dmsetup_table dmsetup table
-# thin pool 사용률, snapshot 채움 정도 (device-mapper 상태 조회, 읽기 전용)
+# thin pool usage, snapshot fill level (device-mapper status query, read-only)
 save dmsetup_status dmsetup status
 save udev_rules sh -c "grep -rhsE 'scheduler|read_ahead|queue/|timeout' /etc/udev/rules.d/ /usr/lib/udev/rules.d/ /lib/udev/rules.d/ 2>/dev/null | grep -v '^#' | head -100"
 
-# 커널 로그: I/O 오류, SCSI 리셋, hung task (최근 7일, 가능한 범위)
-# -n 으로 상한을 둔다: 장애가 반복되는 노드는 커널 메시지가 수십만 줄이 될 수 있고,
-# 그만큼 journal 파일을 읽으면 그 자체가 디스크 부하가 된다. 최근 것부터 보므로 상한으로 충분.
+# Kernel log: I/O errors, SCSI resets, hung tasks (last 7 days, as far as available)
+# Capped with -n: on a node with recurring faults, kernel messages can reach hundreds of thousands of lines,
+# and reading that much journal is itself disk load. Newest first, so the cap is enough.
 KLOG_MAX_LINES=${KLOG_MAX_LINES:-20000}
 KPAT='I/O error|blk_update_request|Buffer I/O error|critical medium error|Medium Error|rejecting I/O|hung_task|blocked for more than [0-9]+ seconds|remount.*read-only|XFS \(.*\).*(error|shutdown|[Cc]orruption)|EXT4-fs (error|warning)|Sense Key|(scsi|sd [0-9]|pvscsi|mptscsih|mptbase|nvme|ata[0-9]|megaraid|mpt3sas|mpt2sas|hpsa|smartpqi|aacraid|qla2xxx|lpfc).*(\<abort|\<reset\>|timed out|timing out|timeout|failed|FATAL|fault)|controller is down|AER:.*(error|Error)|md/raid.*(Disk failure|not operational)|multipath.*(Failing path|remaining active paths: 0)|megaraid_sas.*/0x[0-9a-fA-F]+/(FATAL|CRIT|DEAD|WARN)|(megaraid|mpt3sas|hpsa|smartpqi|aacraid).*([Bb]attery|BBU|CacheVault|degraded|[Dd]egraded|offline|lockup|[Pp]redictive|[Rr]ebuild)|thin.*(out of data space|switching pool to|read-only mode)|device-mapper: snapshots: Invalidating'
 if [[ $NO_KLOG -eq 0 ]]; then
   {
     command -v journalctl >/dev/null 2>&1 && journalctl -k --since "7 days ago" -n "$KLOG_MAX_LINES" -o short-iso --no-pager 2>/dev/null
   } | grep -Ei "$KPAT" | grep -viE 'nmi|audit|usb|BogoMIPS|preset' | tail -300 > "$S/klog_io" 2>/dev/null
-  # journal 이 없거나 결과가 비면 dmesg (메모리 ring buffer라 디스크를 읽지 않음)
+  # If there is no journal or the result is empty, use dmesg (memory ring buffer, no disk reads)
   [[ -s "$S/klog_io" ]] || { dmesg -T 2>/dev/null | grep -Ei "$KPAT" | grep -viE 'nmi|audit|usb|BogoMIPS|preset' | tail -300 > "$S/klog_io"; }
 else
   : > "$S/klog_io"
 fi
 
-# 네트워크 (ES transport, 참고용)
+# Network (ES transport, for reference)
 {
   for i in /sys/class/net/*; do
     n=${i##*/}; [[ "$n" == "lo" ]] && continue
@@ -568,9 +569,9 @@ fi
   done
 } > "$S/net" 2>/dev/null
 
-# sar 이력: sysstat이 이미 기록해 둔 과거 데이터를 읽는다 (새로 수집하지 않음)
-# sa 파일을 한 번만 읽는다. 이전에는 -d 와 -u 로 같은 파일을 두 번 읽었는데
-# sar_u 는 리포트에서 쓰이지 않아 읽는 만큼이 그대로 낭비였다.
+# sar history: reads past data sysstat has already recorded (no new collection)
+# Read the sa file only once. Previously the same file was read twice with -d and -u,
+# but sar_u is unused in the report, so that read was pure waste.
 SAR_BYTES=0
 if [[ $NO_SAR -eq 0 ]] && command -v sar >/dev/null 2>&1; then
   SAR_FILES=$(find /var/log/sa /var/log/sysstat -maxdepth 1 -type f -name 'sa[0-9]*' -mtime -8 2>/dev/null | sort)
@@ -582,7 +583,7 @@ if [[ $NO_SAR -eq 0 ]] && command -v sar >/dev/null 2>&1; then
 fi
 echo "read_sar_bytes=$SAR_BYTES" >> "$OUT/meta"
 
-# ── ES 프로세스 (앞에서 찾은 값을 기록) ───────────────────────────────────
+# ── ES process (record values found earlier) ───────────────────────────────────
 echo "es_instances=$N_ES" >> "$OUT/meta"
 echo "es_pid=$ES_PID" >> "$OUT/meta"
 if [[ -n "$ES_PID" && -d /proc/$ES_PID ]]; then
@@ -591,7 +592,7 @@ if [[ -n "$ES_PID" && -d /proc/$ES_PID ]]; then
   catf /proc/$ES_PID/status  > "$S/es_status"
   catf /proc/$ES_PID/cgroup  > "$S/es_cgroup"
   ls /proc/$ES_PID/fd 2>/dev/null | wc -l > "$S/es_fdcount"
-  # cgroup I/O 제한 (v2: io.max, v1: blkio.throttle)
+  # cgroup I/O limits (v2: io.max, v1: blkio.throttle)
   {
     cg=$(awk -F: '$1=="0"{print $3}' /proc/$ES_PID/cgroup 2>/dev/null)
     [[ -n "$cg" && -r "/sys/fs/cgroup$cg/io.max" ]] && sed 's/^/io.max: /' "/sys/fs/cgroup$cg/io.max"
@@ -599,28 +600,28 @@ if [[ -n "$ES_PID" && -d /proc/$ES_PID ]]; then
       [[ -s "$f" ]] && sed "s|^|${f##*/}: |" "$f"
     done
   } > "$S/es_cgroup_io" 2>/dev/null
-  # elasticsearch.yml: 필요한 키만 추출 (비밀정보 제외)
+  # elasticsearch.yml: extract only the needed keys (no secrets)
   if [[ -r "$CONF_DIR/elasticsearch.yml" ]]; then
     grep -vE '^\s*#' "$CONF_DIR/elasticsearch.yml" | grep -viE 'password|secret|token|key' \
       | grep -E '^\s*(path|data|bootstrap|node\.roles|node\.attr|index\.store|cluster\.routing|- )' > "$S/es_yml" 2>/dev/null
   fi
 fi
 
-# ── ES 로그: 디스크와 직접 연결되는 메시지만 추출 ────────────────────────
+# ── ES logs: extract only messages directly tied to the disk ────────────────────────
 ES_LOG_DIR=$(grep -oE 'es\.path\.logs=[^ ]+' "$S/es_cmdline" 2>/dev/null | head -1 | cut -d= -f2)
 ES_LOG_DIR=${ES_LOG_DIR:-/var/log/elasticsearch}
 ESLOGPAT='now throttling indexing|stopped throttling|disk watermark|flood stage|failed to flush|Too many open files|failed to write|translog.*(error|corrupt|recover)|overhead, spent|\[gc\]\[|shard failed|failed to recover|Data too large|timed out after'
-# 로그 읽기는 이 도구의 디스크 부하 중 가장 큰 항목이다. 읽은 만큼 page cache 가 밀려나고,
-# ES 노드에서는 밀려난 자리가 segment 캐시라 ES 가 그만큼 디스크를 더 읽게 된다.
-# 그래서 상한을 둔다: 최신 로그에 예산을 집중하고(기본 8MB), 직전 로그 2개는 2MB 씩만 본다.
-# 최종 출력은 어차피 tail -100 이므로 대부분의 경우 이 범위에서 충분하다.
-# 더 과거까지 봐야 하면 ESLOG_TAIL_MB 를 올린다 (그만큼 부하도 커진다).
+# Log reading is the largest disk load this tool generates. What it reads pushes out page cache,
+# and on an ES node the evicted space is segment cache, so ES then reads that much more from disk.
+# So it is capped: most of the budget goes to the newest log (default 8MB), and the two previous logs get 2MB each.
+# The final output is tail -100 anyway, so this range is enough in most cases.
+# To look further back, raise ESLOG_TAIL_MB (load grows accordingly).
 ESLOG_TAIL_MB=${ESLOG_TAIL_MB:-8}
 ESLOG_OLD_MB=${ESLOG_OLD_MB:-2}
 ESLOG_MAX_FILES=${ESLOG_MAX_FILES:-3}
 ESLOG_BYTES=0
 if [[ $NO_ESLOG -eq 0 && -d "$ES_LOG_DIR" ]]; then
-  # 최신 수정 시각 순으로 정렬해 앞쪽(최신)에 큰 예산을 준다. gc/deprecation/audit/slowlog 제외
+  # Sort by newest mtime and give the larger budget to the front (newest). Excludes gc/deprecation/audit/slowlog
   i=0
   while read -r lf; do
     [[ -n "$lf" ]] || continue
@@ -637,32 +638,32 @@ if [[ $NO_ESLOG -eq 0 && -d "$ES_LOG_DIR" ]]; then
 fi
 echo "read_eslog_bytes=$ESLOG_BYTES" >> "$OUT/meta"
 
-# ── ES 프로세스의 mmap 사용량 (max_map_count 대비 여유 확인) ───────────────
-# ES 프로세스의 매핑 목록을 1회 읽는다. 읽는 동안 대상 프로세스의 mmap_lock 을 read 모드로
-# 잡으므로 ES 의 mmap/munmap(segment 열기·닫기)과만 짧게 경합한다. 실측: 매핑 4만 개에 약 17ms.
-# 매핑이 매우 많은 노드에서 이조차 피하고 싶으면 --light 또는 NO_MAPS 로 생략한다.
+# ── mmap usage of the ES process (check headroom against max_map_count) ───────────────
+# Reads the ES process mapping list once. While reading it holds the target process mmap_lock in read mode,
+# so it only briefly contends with ES mmap/munmap (segment open/close). Measured: about 17ms for 40k mappings.
+# To avoid even this on nodes with very many mappings, skip it with --light or NO_MAPS.
 if [[ $NO_MAPS -eq 0 && -n "$ES_PID" && -r /proc/$ES_PID/maps ]]; then
   MAPS_T0=$(date +%s%N)
   wc -l < /proc/$ES_PID/maps > "$S/es_mapcount" 2>/dev/null
   echo "maps_read_ms=$(( ($(date +%s%N) - MAPS_T0) / 1000000 ))" >> "$OUT/meta"
 fi
 
-# ── ES API (조회 전용, 로컬 노드만) ────────────────────────────────────────
-cfgesc() { local v=${1//\\/\\\\}; printf '%s' "${v//\"/\\\"}"; }   # curl -K 값 이스케이프 (\ 와 ")
+# ── ES API (query only, local node only) ────────────────────────────────────────
+cfgesc() { local v=${1//\\/\\\\}; printf '%s' "${v//\"/\\\"}"; }   # escape curl -K values (\ and ")
 ES_CALLS="$OUT/es_calls"; : > "$ES_CALLS"
-es_get() {  # $1=path $2=outfile  → http code 출력
+es_get() {  # $1=path $2=outfile  → prints http code
   local cfg="" code=""
   [[ -n "$ES_API_KEY" ]] && cfg="header = \"Authorization: ApiKey $(cfgesc "$ES_API_KEY")\""
   [[ -z "$ES_API_KEY" && -n "$ES_USER" ]] && cfg="user = \"$(cfgesc "${ES_USER}:${ES_PASSWORD}")\""
   code=$(printf '%s\n' "$cfg" | curl -s -k --max-time 10 --connect-timeout 3 -K - \
       -o "$2" -w '%{http_code}' "${ES_URL}/$1" 2>/dev/null || true)
-  # ES 조회 비용을 리포트에 고지하기 위해 호출 수와 응답 크기를 기록 (서브셸이라 파일에 누적)
+  # Record call count and response size to report ES query cost (subshell, so accumulated in a file)
   printf '%s\t%s\t%s\n' "$code" "$(stat -c %s "$2" 2>/dev/null || echo 0)" "${1%%\?*}" >> "$ES_CALLS"
   printf '%s' "$code"
 }
-# ES 가 실제로 열고 있는 포트를 ES 프로세스의 소켓에서 찾는다.
-# network.host 를 특정 IP 로 묶어 localhost 로는 안 붙는 경우, http.port 를 바꾼 경우에도 주소를 몰라도 되게.
-# /proc/<pid>/net/tcp 는 ES 프로세스의 network namespace 기준이라 컨테이너 안 ES 도 맞게 읽힌다
+# Find the ports ES actually listens on from the ES process sockets.
+# So the address need not be known even when network.host is bound to a specific IP (localhost fails) or http.port is changed.
+# /proc/<pid>/net/tcp is in the ES process network namespace, so ES in a container is read correctly too
 es_listen_addrs() {
   local pid=$1 inodes
   [[ -n "$pid" && -d /proc/$pid/fd ]] || return 0
@@ -698,8 +699,8 @@ if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
     [[ "$c" == "200" || "$c" == "401" ]] && msg "$(t c.es_found "$ES_URL")"
   fi
   [[ -n "$c" ]] || c=$(es_get "" "$S/es_root.json")
-  # 인증이 필요한데 계정을 안 줬으면, 터미널에서 실행 중일 때 직접 물어본다.
-  # 비밀번호가 셸 history 나 프로세스 목록에 남지 않는다
+  # If auth is required and no account was given, ask directly when running on a terminal.
+  # The password is not left in shell history or the process list
   if [[ "$c" == "401" && -z "$ES_USER" && -z "$ES_API_KEY" && -t 0 && -r /dev/tty ]]; then
     msg "$(t c.auth_ask)"
     read -r -p "  $(t c.user): " ES_USER < /dev/tty
@@ -722,15 +723,15 @@ if [[ $NO_ES -eq 0 ]] && command -v curl >/dev/null 2>&1; then
   fi
 fi
 NODE_STATS_PATH="_nodes/_local/stats/indices,fs,thread_pool,jvm,indexing_pressure?filter_path=nodes.*.timestamp,nodes.*.name,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.store,nodes.*.indices.segments,nodes.*.indices.translog,nodes.*.fs,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.thread_pool.merge,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.jvm.gc,nodes.*.indexing_pressure,nodes.*.indices.shard_stats"
-# 디스크와 직결되는 인덱스 설정. include_defaults 를 쓰지 않으므로 "명시적으로 바꾼 인덱스"만 응답에 들어온다
+# Index settings tied directly to the disk. Without include_defaults, only "explicitly changed indices" appear in the response
 IDX_SETTINGS_PATH="_all/_settings?filter_path=**.index.translog.durability,**.index.translog.sync_interval,**.index.translog.flush_threshold_size,**.index.merge.scheduler.max_thread_count,**.index.store.type,**.index.store.preload,**.index.refresh_interval"
 IDX_STATS_PATH="_nodes/_local/stats/indices?level=indices&filter_path=nodes.*.indices.indices.*.indexing.index_total,nodes.*.indices.indices.*.indexing.index_time_in_millis,nodes.*.indices.indices.*.merges.total_time_in_millis,nodes.*.indices.indices.*.merges.total_size_in_bytes,nodes.*.indices.indices.*.refresh.total,nodes.*.indices.indices.*.store.size_in_bytes,nodes.*.indices.indices.*.segments.count,nodes.*.indices.indices.*.search.query_total"
 CLUSTER_STATS_PATH="_nodes/stats/fs,indices,thread_pool,jvm,os?filter_path=nodes.*.name,nodes.*.roles,nodes.*.host,nodes.*.timestamp,nodes.*.fs.total,nodes.*.fs.io_stats,nodes.*.indices.store,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.segments.count,nodes.*.indices.translog,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.thread_pool.flush,nodes.*.thread_pool.merge,nodes.*.jvm.mem.heap_used_percent,nodes.*.os.cpu.percent"
 
 if [[ $ES_OK -eq 1 ]]; then
   es_get "$NODE_STATS_PATH" "$S/es_stats_start.json" >/dev/null
-  # 인덱스 수에 비례해 커지는 조회(인덱스별 통계, _all/_settings, _ilm/explain)는 규모가 크면 알아서 뺀다.
-  # 사용자가 클러스터 규모를 보고 --no-index-stats 를 판단하지 않아도 되게. 기준은 실무 기준
+  # Queries that grow with index count (per-index stats, _all/_settings, _ilm/explain) are dropped automatically at large scale,
+  # so the user need not judge cluster size to decide on --no-index-stats. Thresholds are practical ones
   if [[ $NO_IDXSTATS -eq 0 ]]; then
     NODE_SHARDS=$(grep -oE '"total_count": *[0-9]+' "$S/es_stats_start.json" 2>/dev/null | head -1 | tr -dc '0-9')
     CL_SHARDS=$(grep -oE '"active_shards": *[0-9]+' "$S/es_health.json" 2>/dev/null | head -1 | tr -dc '0-9')
@@ -741,7 +742,7 @@ if [[ $ES_OK -eq 1 ]]; then
   fi
   [[ $NO_IDXSTATS -eq 0 ]] && es_get "$IDX_STATS_PATH" "$S/es_idx_start.json" >/dev/null
   [[ $NO_IDXSTATS -eq 0 ]] && es_get "$IDX_SETTINGS_PATH" "$S/es_idx_settings.json" >/dev/null
-  # ── 클러스터 전체: 로컬 측정과 같은 창으로 1차 스냅샷 ────────────────
+  # ── Whole cluster: first snapshot in the same window as local measurement ────────────────
   if [[ $NO_CLUSTER -eq 0 ]]; then
     C="$S/cluster"; mkdir -p "$C"
     CC=$(es_get "$CLUSTER_STATS_PATH" "$C/node_stats_1.json")
@@ -757,7 +758,7 @@ if [[ $ES_OK -eq 1 ]]; then
 fi
 
 # =============================================================================
-# 2. 샘플링 루프: 한 번에 awk 1회 (fork 1개)
+# 2. Sampling loop: one awk run per iteration (1 fork)
 # =============================================================================
 msg "$(t c.step2 "$DUR")"
 STOP=0; trap 'STOP=1' INT TERM
@@ -810,7 +811,7 @@ read -r UP1 _ < /proc/uptime; echo "end_uptime=$UP1" >> "$OUT/meta"
 echo "end_wall=$(date '+%Y-%m-%d %H:%M:%S %z')" >> "$OUT/meta"
 
 # =============================================================================
-# 3. 종료 스냅샷
+# 3. Final snapshot
 # =============================================================================
 msg "$(t c.step3)"
 if [[ $ES_OK -eq 1 ]]; then
@@ -827,12 +828,12 @@ cp /proc/interrupts "$S/interrupts_end" 2>/dev/null
 procio > "$S/procio_end"
 ebsstats > "$S/ebs_stats_end"
 
-# ── 수집기 자체 자원 사용량 ────────────────────────────────────────────────
-# bash 내장 times: 자신 / 자식 프로세스의 user·sys CPU 누적
+# ── Collector own resource usage ────────────────────────────────────────────────
+# bash builtin times: cumulative user/sys CPU of self / child processes
 times > "$OUT/self_overhead" 2>/dev/null
-# 최대 RSS (자식 포함). ru_maxrss 를 셸에서 볼 방법이 없어 /usr/bin/time 이 있으면만 기록
+# Max RSS (incl. children). The shell cannot see ru_maxrss, so recorded only if /usr/bin/time exists
 du -sk "$OUT" | awk '{print "output_kb="$1}' >> "$OUT/meta"
-# ES 조회 비용
+# ES query cost
 awk -F'\t' '{n++; b+=$2} END{printf "es_api_calls=%d\nes_api_bytes=%d\n", n+0, b+0}' "$ES_CALLS" >> "$OUT/meta" 2>/dev/null
 {
   echo "light_mode=$(( NO_ESLOG & NO_KLOG & NO_SAR & NO_MAPS ))"
@@ -841,8 +842,8 @@ awk -F'\t' '{n++; b+=$2} END{printf "es_api_calls=%d\nes_api_bytes=%d\n", n+0, b
                    [[ $NO_IDXSTATS -eq 1 ]] && printf 'index-stats%s ' "$(grep -q '^index_stats_auto_skip=1' "$OUT/meta" && echo '(auto)')" )"
 } >> "$OUT/meta"
 
-# 결과를 ES data 와 같은 파일시스템에 쓰고 있으면 경고.
-# 측정 대상 디스크에 쓰기를 더하는 셈이고 그만큼 측정값이 오염된다
+# Warn if results are being written to the same filesystem as ES data.
+# That adds writes to the disk under test and pollutes the measurements accordingly
 OUT_DEV=$(df -Pk "$OUT_BASE" 2>/dev/null | awk 'NR==2{print $1}')
 for dp in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do
   [[ -d "$dp" ]] || continue
@@ -855,11 +856,11 @@ for dp in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do
 done
 
 # =============================================================================
-# 4. 번들 + HTML
+# 4. Bundle + HTML
 # =============================================================================
 msg "$(t c.step4)"
-# 셸(awk)만으로 만드는 요약 판정. Python 이 없는 서버에서도 결과를 바로 본다.
-# 화면에는 고른 언어로 보여 주고, 번들에는 두 언어(summary.ko.txt, summary.en.txt)를 모두 남긴다
+# Summary verdict built with shell (awk) only. Results are visible right away even on servers without Python.
+# Shown on screen in the chosen language; the bundle keeps both languages (summary.ko.txt, summary.en.txt)
 echo >&2
 if [[ -f "$HERE/es_disk_summary.sh" ]]; then
   bash "$HERE/es_disk_summary.sh" "$OUT" --lang "$LNG" >&2 || true
@@ -868,7 +869,7 @@ if [[ -f "$HERE/es_disk_summary.sh" ]]; then
   done
 fi
 echo >&2
-# HTML 은 번들을 묶기 전에 두 언어로 만든다 (es_disk_report.ko.html, es_disk_report.en.html)
+# HTML is built in both languages before packing the bundle (es_disk_report.ko.html, es_disk_report.en.html)
 PY=""
 for c in python3 /usr/libexec/platform-python python; do
   command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info>=(3,6) else 1)' 2>/dev/null && { PY="$c"; break; }

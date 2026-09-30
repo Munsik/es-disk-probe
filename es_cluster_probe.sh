@@ -1,32 +1,33 @@
 #!/usr/bin/env bash
 # =============================================================================
-# es_cluster_probe.sh  (v0.10.0)
-# Elasticsearch 클러스터를 "디스크 관점"에서 조회합니다. (READ-ONLY)
+# es_cluster_probe.sh  (v0.11.0)
+# Queries an Elasticsearch cluster "from the disk point of view". (READ-ONLY)
 #
-#  - ES 조회 API(GET)만 호출합니다. 설정 변경, 인덱스 쓰기 없음.
-#  - 노드에 SSH 하지 않습니다. ES에 접속 가능한 어디서든(노트북 포함) 실행 가능.
-#  - 두 시점을 찍어 차분을 냅니다 → 노드별 디스크 사용량을 비교할 수 있습니다.
-#  - 필요한 권한: cluster monitor (monitoring_user 수준). 관리자 계정 불필요.
+#  - Calls only ES read APIs (GET). No settings changes, no index writes.
+#  - No SSH to nodes. Runs from anywhere that can reach ES (laptops included).
+#  - Takes two snapshots and computes the delta → disk usage can be compared across nodes.
+#  - Required privilege: cluster monitor (monitoring_user level). No admin account needed.
 #
-# 사용:
+# Usage:
 #   ES_PASSWORD='***' ./es_cluster_probe.sh --es-url https://es:9200 --es-user elastic
 #   ES_API_KEY='...'  ./es_cluster_probe.sh --es-url https://es:9200 -g 120
 #
-#   --es-url URL  ES 주소 (기본: localhost:9200 을 http, https 순서로 시도)
-#   --es-user U   ES 사용자. 비밀번호는 환경변수 ES_PASSWORD, API Key 는 ES_API_KEY
-#                 둘 다 없고 ES 가 인증을 요구하면 터미널에서 물어봅니다
-#   -g SEC        두 스냅샷 사이 간격 (기본 60초, 길수록 안정적. 최소 10)
-#   -o DIR        결과 위치 (기본 /tmp)
-#   --deep        인덱스별 용량까지 수집 (인덱스가 많으면 응답이 커짐)
-#   --insecure    자체 서명 인증서 허용 (기본값)
-#   --strict-tls  인증서를 검증합니다. --cacert 와 함께 쓰거나 CA가 OS 신뢰 저장소에 있을 때
-#   --cacert F    CA 인증서 파일 지정 (지정하면 --strict-tls 자동 적용)
+#   --es-url URL  ES address (default: tries localhost:9200 with http, then https)
+#   --es-user U   ES user. Password in env var ES_PASSWORD, API Key in ES_API_KEY
+#                 If neither is set and ES requires auth, prompts on the terminal
+#   -g SEC        Interval between the two snapshots (default 60s, longer is more stable. Min 10)
+#   -o DIR        Output location (default /tmp)
+#   --deep        Also collect per-index size (response grows with many indices)
+#   --insecure    Allow self-signed certificates (default)
+#   --strict-tls  Verify certificates. Use with --cacert, or when the CA is in the OS trust store
+#   --cacert F    CA certificate file (implies --strict-tls)
+#   --lang L      Screen language: ko | en (default from the locale). HTML is built in both
 #
-# ⚠ 기본 동작은 curl -k (인증서 검증 생략)입니다. 사내 보안 정책상 검증이 필요하면
-#   --strict-tls 또는 --cacert 를 쓰세요.
+# ⚠ Default is curl -k (no certificate verification). If internal security policy requires verification,
+#   use --strict-tls or --cacert.
 #
-# 결과: <출력>/escluster_<ts>/ 와 그 안의 es_cluster_report.html (python3 가 있으면 자동 생성)
-#       노드 번들과 합쳐 보려면:  es_disk_render.py <노드번들> --cluster <이 디렉터리>
+# Output: <output>/escluster_<ts>/ and es_cluster_report.ko.html / .en.html inside it (auto-built if python3 is present)
+#       To view together with a node bundle:  es_disk_render.py <node bundle> --cluster <this directory>
 # =============================================================================
 set -u
 umask 077
@@ -49,7 +50,7 @@ _catload() {  # $1=file $2=key prefix
     _M[$k]="$v"
   done < "$1"
 }
-t() {  # t key [values...]  → {1}, {2} ... 자리에 값
+t() {  # t key [values...]  → values go into {1}, {2} ...
   local s="${_M[$1]:-$1}" i=1 a
   shift
   for a in "$@"; do s="${s//\{$i\}/$a}"; i=$((i + 1)); done
@@ -84,11 +85,11 @@ command -v curl >/dev/null 2>&1 || { t p.nocurl; echo; exit 1; }
 TLS=(-k); [[ $STRICT -eq 1 ]] && TLS=()
 [[ -n "$CACERT" ]] && TLS+=(--cacert "$CACERT")
 
-# 결과 디렉터리는 ES 접속이 확인된 뒤에 만든다 (실패하면 아무것도 남기지 않고, 지울 것도 없게)
+# Create the output directory only after ES connectivity is confirmed (on failure nothing is left behind and nothing needs deleting)
 TS=$(date +%Y%m%d_%H%M%S); OUT="$OUT_BASE/escluster_$TS"
 msg() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
-cfgesc() { local v=${1//\\/\\\\}; printf '%s' "${v//\"/\\\"}"; }   # curl -K 값 이스케이프 (\ 와 ")
+cfgesc() { local v=${1//\\/\\\\}; printf '%s' "${v//\"/\\\"}"; }   # escape curl -K values (\ and ")
 es_get() {  # $1=path $2=outfile
   local cfg=""
   [[ -n "$ES_API_KEY" ]] && cfg="header = \"Authorization: ApiKey $(cfgesc "$ES_API_KEY")\""
@@ -124,13 +125,13 @@ mkdir -p "$OUT" || exit 1
 es_get "" "$OUT/root.json" >/dev/null
 echo "es_url=$ES_URL"$'\n'"gap=$GAP"$'\n'"start_wall=$(date '+%Y-%m-%d %H:%M:%S %z')" > "$OUT/meta"
 
-# 노드별 디스크·인덱싱 지표 (두 시점의 차분용)
+# Per-node disk and indexing metrics (for the delta between two points)
 NODE_STATS="_nodes/stats/fs,indices,thread_pool,jvm,os?filter_path=nodes.*.name,nodes.*.roles,nodes.*.host,nodes.*.timestamp,nodes.*.fs.total,nodes.*.fs.io_stats,nodes.*.indices.store,nodes.*.indices.indexing,nodes.*.indices.search,nodes.*.indices.merges,nodes.*.indices.refresh,nodes.*.indices.flush,nodes.*.indices.segments.count,nodes.*.indices.translog,nodes.*.thread_pool.write,nodes.*.thread_pool.search,nodes.*.thread_pool.flush,nodes.*.thread_pool.merge,nodes.*.jvm.mem.heap_used_percent,nodes.*.os.cpu.percent"
 
 msg "$(t p.snap1)"
 es_get "$NODE_STATS" "$OUT/node_stats_1.json" >/dev/null
 
-# 변하지 않는 정보는 대기 시간 동안 수집
+# Collect static information during the wait
 msg "$(t p.config "$GAP")"
 es_get "_cat/nodes?format=json&h=name,node.role,master,disk.used_percent,disk.avail,disk.total,heap.percent,ram.percent,cpu,load_1m,version" "$OUT/cat_nodes.json" >/dev/null
 es_get "_cat/allocation?format=json&bytes=b&h=node,shards,disk.indices,disk.used,disk.avail,disk.total,disk.percent" "$OUT/cat_allocation.json" >/dev/null
@@ -140,7 +141,7 @@ es_get "_cat/pending_tasks?format=json" "$OUT/pending_tasks.json" >/dev/null
 es_get "_snapshot/_status" "$OUT/snapshot_status.json" >/dev/null
 es_get "_cluster/settings?include_defaults=true&filter_path=**.disk.watermark*,**.disk.threshold*,**.indices.recovery*,**.node_concurrent*,**.cluster_concurrent_rebalance*,**.allocation.awareness*,**.max_shards_per_node*" "$OUT/cluster_settings.json" >/dev/null
 es_get "_nodes?filter_path=nodes.*.name,nodes.*.roles,nodes.*.attributes,nodes.*.settings.path,nodes.*.process.mlockall,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.os.available_processors,nodes.*.os.name,nodes.*.host,nodes.*.ip" "$OUT/nodes_info.json" >/dev/null
-# ILM phase: 인덱스별 분포 리포트에서 hot/warm 구분에 사용. read_ilm 권한이 없으면 건너뜀
+# ILM phase: used to split hot/warm in the per-index distribution report. Skipped without read_ilm privilege
 es_get "_all/_ilm/explain?only_managed=true&filter_path=indices.*.phase,indices.*.policy,indices.*.action" "$OUT/ilm_explain.json" >/dev/null
 [[ $DEEP -eq 1 ]] && es_get "_cat/indices?format=json&bytes=b&h=index,health,pri,rep,docs.count,store.size,pri.store.size&s=store.size:desc" "$OUT/cat_indices.json" >/dev/null
 
@@ -153,7 +154,7 @@ PY=""
 for c in python3 /usr/libexec/platform-python; do
   command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info>=(3,6) else 1)' 2>/dev/null && { PY="$c"; break; }
 done
-# HTML 은 번들을 묶기 전에 두 언어로 만든다 (es_cluster_report.ko.html, es_cluster_report.en.html)
+# HTML is built in both languages before packing the bundle (es_cluster_report.ko.html, es_cluster_report.en.html)
 if [[ -n "$PY" && -f "$HERE/es_disk_render.py" ]]; then
   "$PY" "$HERE/es_disk_render.py" --cluster-only "$OUT" --lang both -o "$OUT/es_cluster_report.html" >/dev/null && \
     msg "$(t p.html "$OUT/es_cluster_report.$LNG.html")"

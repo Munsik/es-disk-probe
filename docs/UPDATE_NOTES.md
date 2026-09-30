@@ -1,124 +1,125 @@
-# 업데이트 필요 사항
+# Update notes
 
-마지막 대조: 2026-09-29
-대조 기준: Elasticsearch 9.5.4, VMware Cloud Foundation·vSphere 9.1, RHEL 10, Linux kernel master 문서
+Last checked: 2026-09-29
+Checked against: Elasticsearch 9.5.4, VMware Cloud Foundation and vSphere 9.1, RHEL 10, Linux kernel master docs
+Report text lives in `i18n/ko.txt` and `i18n/en.txt`. When a criterion changes, update both catalogs (`tests/i18n_check.py` checks they stay in sync).
 
-이 문서는 두 가지를 정리합니다.
-하나는 업데이트 항목(반영 완료와 남은 것)이고, 다른 하나는 새 버전이 나올 때 다시 확인해야 할 기준값과 그 출처입니다.
-이미 반영한 변경은 `CHANGELOG.md` 0.10.0 의 "최신 공식 문서 대조" 항목에 있습니다.
+This document covers two things.
+First, update items (done and still open). Second, the thresholds to recheck when a new version ships, with their sources.
+Changes already made are listed in `CHANGELOG.md` 0.10.0 under "Checked against latest official docs".
 
 ---
 
-## 1. 남은 업데이트 항목
+## 1. Open update items
 
-실제 장비 출력 없이 할 수 있는 것은 모두 반영했습니다. 반영 방식은 "예상 형식 여러 개로 만든 입력을 돌려, 형식이 조금 달라도 같은 결론이 나오는지" 확인하는 것입니다.
-이 방식은 파서가 깨지지 않고, 못 읽으면 못 읽었다고 알리는지까지 보장합니다. 실제 키 이름이 맞는지는 보장하지 않습니다.
+Everything that could be done without real device output is done. The method: feed inputs built in several expected formats and check that the same conclusion comes out even when the format differs a little.
+This proves the parsers do not break, and that they say so when they cannot read something. It does not prove the real key names are correct.
 
-### 반영 완료 (2026-09-29)
+### Done (2026-09-29)
 
-| 항목 | 반영 내용 | 검증 |
+| Item | Change | Verification |
 |---|---|---|
-| storcli2·perccli2 JSON | 키 이름(공백, snake_case, 목록 옆 개수 필드)과 값 표기(Optimal·OPTIMAL, Write Back·WB 등)를 storcli 표기로 맞춰 읽음. 셸 요약도 같음 | 변형 3종 + 해석 불가 1종 |
-| AWS `nvme amzn stats` | JSON 한 줄·여러 줄, ebsnvme 텍스트, "이름 : 값" 표, 단위 붙은 텍스트 | 4종 모두 같은 값으로 읽히는지 Python·셸 각각 검사 |
-| merge 스레드 풀 | 시작·끝 두 시점 모두 대기가 쌓여 있으면 참고 판정 | 시나리오 1종 |
-| ES 벡터 direct IO | `-Dvector.rescoring.directio=true` 노드는 읽기가 page cache 를 거치지 않는다고 안내 | 시나리오 1종 |
-| vSAN OSA hybrid 중단 예정 | `-s hybrid` 로 분석하면 VCF 9.0 공지 안내 | 시나리오 1종 |
-| 구축 전 점검 (벤치) | 만들었다가 제거. 진단 도구는 쓰기·삭제·부하를 만들지 않는다는 원칙에 따라 `es_disk_bench.sh` 삭제. 운영 서버의 실제 부하가 있을 때 벤치 유무가 판정을 바꾸지 않는 것을 32개 번들로 확인 | 해당 없음 |
+| storcli2 and perccli2 JSON | Reads key names (spaces, snake_case, count fields next to lists) and value spellings (Optimal/OPTIMAL, Write Back/WB, etc.) and maps them to storcli notation. The shell summary does the same | 3 variants + 1 unparseable |
+| AWS `nvme amzn stats` | Single-line and multi-line JSON, ebsnvme text, "name : value" table, text with units | Python and shell each check that all 4 read as the same values |
+| merge thread pool | Info finding when the queue is backed up at both the start and end points | 1 scenario |
+| ES vector direct IO | For nodes with `-Dvector.rescoring.directio=true`, the report notes that reads bypass the page cache | 1 scenario |
+| vSAN OSA hybrid planned deprecation | Analyzing with `-s hybrid` shows the VCF 9.0 notice | 1 scenario |
+| Pre-deployment check (bench) | Built, then removed. `es_disk_bench.sh` was deleted under the rule that the diagnostic tool never writes, deletes, or creates load. Checked on 32 bundles that under real production load, running a bench or not does not change the verdict | N/A |
 
-### 실제 장비나 문서가 있어야 끝나는 것
+### Needs real devices or docs to finish
 
-| # | 항목 | 지금 상태 | 끝내려면 |
+| # | Item | Current state | To finish |
 |---|---|---|---|
-| 1 | storcli2·perccli2 실제 키 이름 | 변형 대응으로 대부분 읽겠지만 확정은 아님. 못 읽으면 원문 보존 후 알림 | MegaRAID 96xx 또는 PERC 12 의 `show all J` 출력 1건 |
-| 2 | storcli·ssacli·arcconf 실제 출력 | 공개 레이블로 만든 합성 출력으로만 검증 | 각 도구 실제 출력 (정상 1건, 이상 1건) |
-| 3 | nvme-cli `amzn stats` 실제 텍스트 | 가능한 형식 4종 대응 | EC2 에서 출력 1건 |
-| 4 | HPE Gen11·Gen12 도구 매핑 | SR 은 ssacli, MR 은 storcli 로 봄 | HPE 문서 또는 서버의 `proc_name` |
-| 5 | Lenovo·Supermicro RAID | Broadcom 기반이라 storcli 로 봄 | 벤더 문서 |
-| 6 | Microchip arcconf + smartpqi | SmartRAID 3100·3200 은 arcconf 로 봄 | Microchip 사용자 가이드 |
-| 7 | GCP Hyperdisk 모델명 | `nvme_card-pd` 로 봄 | C3·H3 인스턴스의 모델명 |
-| 8 | Azure·GCP 한도 초과 지표 | VM 안에서 볼 지표가 없어 모양 판정만 | 게스트 도구나 문서가 나오면 반영 |
-| 9 | vSAN ESA 전용 지연 기준 | flash 기준(5ms) 사용 | Broadcom 이 ESA 기준을 내면 교체 |
-| 10 | ES `on_disk_rescore` (9.3 preview) | 매핑 옵션이라 수집하지 않음 | 벡터 노드 진단이 필요해지면 매핑 조회 추가 |
+| 1 | storcli2 and perccli2 real key names | Variant handling should read most of it, but not confirmed. If parsing fails, raw output is kept and the report says so | 1 `show all J` output from MegaRAID 96xx or PERC 12 |
+| 2 | storcli, ssacli, arcconf real output | Verified only with synthetic output built from public labels | Real output from each tool (1 healthy, 1 faulty) |
+| 3 | nvme-cli `amzn stats` real text | Handles 4 possible formats | 1 output from EC2 |
+| 4 | HPE Gen11 and Gen12 tool mapping | Assumes ssacli for SR, storcli for MR | HPE docs or the server's `proc_name` |
+| 5 | Lenovo and Supermicro RAID | Assumes storcli since they are Broadcom based | Vendor docs |
+| 6 | Microchip arcconf + smartpqi | Assumes arcconf for SmartRAID 3100 and 3200 | Microchip user guide |
+| 7 | GCP Hyperdisk model name | Assumes `nvme_card-pd` | Model name from a C3 or H3 instance |
+| 8 | Azure and GCP limit-exceeded metrics | No metric visible inside the VM, so only a pattern-based verdict | Add when guest tools or docs appear |
+| 9 | vSAN ESA specific latency threshold | Uses the flash threshold (5ms) | Replace when Broadcom publishes ESA thresholds |
+| 10 | ES `on_disk_rescore` (9.3 preview) | Mapping option, so not collected | Add a mapping query when vector node diagnostics are needed |
 
 ---|---|---|---|---|
-| 1 | storcli2·perccli2 JSON 해석 | 조회는 하지만 키 이름이 공개 문서로 확정되지 않았습니다. 해석을 못 하면 원문을 번들에 남기고 리포트에 알립니다 | MegaRAID 96xx 또는 Dell PERC 12(H965i 등) 장비에서 받은 `storcli2 /call show all J`, `/call/vall show all J`, `/c0/eall/sall show all J` 출력 | `es_disk_render.py` parse_storcli, `es_disk_summary.sh` raid 블록, `tests/make_bundle.py` |
-| 2 | 실제 장비 출력으로 RAID 파서 검증 | storcli·ssacli·arcconf 파서는 공개 레이블로 만든 합성 출력으로만 검증했습니다 | 각 도구의 실제 출력 (정상 1건, 캐시·배터리 이상 1건이면 충분) | 같은 위치, 테스트 시나리오 교체 |
-| 3 | AWS `nvme amzn stats` 출력 형식 | JSON(`-o json`)과 ebsnvme 사람이 읽는 형식을 모두 읽게 만들었습니다. nvme-cli 텍스트 형식은 실물을 보지 못했습니다 | EBS 를 쓰는 EC2 에서 `nvme amzn stats /dev/nvme1n1` 과 `-o json` 출력 | `parse_ebs_stats`, 셸 요약의 ebs 블록 |
-| 4 | HPE Gen11·Gen12 도구 매핑 | SR 컨트롤러는 ssacli, MR 컨트롤러는 storcli 로 봅니다. MR Gen11 의 드라이버(megaraid_sas 또는 mpi3mr)와 Gen12 도구는 확인하지 못했습니다 | HPE QuickSpecs 또는 실제 서버의 `/sys/class/scsi_host/*/proc_name` | 수집기 RAID 블록 |
-| 5 | Lenovo·Supermicro RAID | Broadcom 기반이라 storcli 로 동작한다고 보고 있지만 확인하지 않았습니다 | 벤더 문서 또는 실제 장비 | README RAID 도구 표 |
-| 6 | Microchip arcconf 와 smartpqi 조합 | SmartRAID 3100·3200 은 smartpqi 드라이버와 arcconf 를 쓴다고 보고 있지만 1차 문서로 확인하지 못했습니다 | Microchip 사용자 가이드 | 수집기 arcconf 조건 |
-| 7 | GCP Hyperdisk 모델명 | NVMe 로 붙는 PD 는 `nvme_card-pd` 입니다. Hyperdisk 도 같은 이름인지 확인하지 못했습니다 | C3·H3 인스턴스의 `/sys/block/nvme*/device/model` | `CLOUD_BLOCK_MODEL` |
-| 8 | Azure·GCP 한도 초과 지표 | VM 안에서 볼 수 있는 한도 초과 지표를 찾지 못했습니다. 지금은 "한도에 걸린 모양" 추정 판정만 합니다 | 새 게스트 도구나 문서가 나오면 반영 | 한도 판정 블록 |
-| 9 | vSAN ESA 전용 지연 기준 | Broadcom 이 ESA 수치를 따로 내지 않아 flash 기준(5ms)을 씁니다. 문서는 "ESA 는 성능 한계가 훨씬 높다"고만 합니다 | Broadcom 이 ESA 기준을 내면 교체 | `LAT_TH`, `LAT_SRC` |
-| 10 | vSAN OSA hybrid 지원 종료 | VCF 9.0 공지에서 "향후 릴리스에서 중단" 예정입니다. 중단되면 `-s hybrid` 안내를 레거시로 표시합니다 | VCF 릴리스 노트 | README, 리포트 문구 |
-| 11 | ES 벡터 direct IO | 9.1 의 `vector.rescoring.directio`, 9.3 의 `on_disk_rescore` 는 page cache 를 거치지 않고 디스크를 직접 읽습니다. 벡터 검색 노드에서는 캐시 적중 없이 읽기가 늘 수 있어 해석이 달라집니다. 아직 판정에 넣지 않았습니다 | 대상 노드의 JVM 옵션과 매핑 정보 수집 방식 결정 | 수집기 ES 조회, 리포트 참고 항목 |
-| 12 | merge 스레드 풀 판정 | `thread_pool.merge` 는 수집만 하고 판정에는 쓰지 않습니다 | 시작·끝 두 시점 값으로 적체를 판단할 기준 정하기 | `es_disk_render.py` ES 영향 판정 |
+| 1 | storcli2 and perccli2 JSON parsing | Queried, but key names are not confirmed by public docs. If parsing fails, the raw output stays in the bundle and the report flags it | `storcli2 /call show all J`, `/call/vall show all J`, `/c0/eall/sall show all J` output from a MegaRAID 96xx or Dell PERC 12 (H965i etc.) device | `es_disk_render.py` parse_storcli, `es_disk_summary.sh` raid block, `tests/make_bundle.py` |
+| 2 | Verify RAID parsers with real device output | storcli, ssacli, arcconf parsers were verified only with synthetic output built from public labels | Real output from each tool (1 healthy and 1 with a cache or battery fault is enough) | Same locations, replace test scenarios |
+| 3 | AWS `nvme amzn stats` output format | Reads both JSON (`-o json`) and the ebsnvme human-readable format. The nvme-cli text format has not been seen on a real system | `nvme amzn stats /dev/nvme1n1` and `-o json` output from an EC2 instance using EBS | `parse_ebs_stats`, ebs block in the shell summary |
+| 4 | HPE Gen11 and Gen12 tool mapping | Assumes ssacli for SR controllers and storcli for MR controllers. The MR Gen11 driver (megaraid_sas or mpi3mr) and the Gen12 tool are not confirmed | HPE QuickSpecs or `/sys/class/scsi_host/*/proc_name` on a real server | Collector RAID block |
+| 5 | Lenovo and Supermicro RAID | Assumed to work with storcli since they are Broadcom based, but not confirmed | Vendor docs or a real device | README.md RAID tool table |
+| 6 | Microchip arcconf with smartpqi | SmartRAID 3100 and 3200 are assumed to use the smartpqi driver and arcconf, but not confirmed in primary docs | Microchip user guide | Collector arcconf condition |
+| 7 | GCP Hyperdisk model name | PD attached as NVMe is `nvme_card-pd`. Not confirmed whether Hyperdisk uses the same name | `/sys/block/nvme*/device/model` on a C3 or H3 instance | `CLOUD_BLOCK_MODEL` |
+| 8 | Azure and GCP limit-exceeded metrics | No limit-exceeded metric found that is visible inside the VM. For now only an estimated "looks like it hit the limit" verdict | Add when new guest tools or docs appear | Limit verdict block |
+| 9 | vSAN ESA specific latency threshold | Broadcom does not publish separate ESA numbers, so the flash threshold (5ms) is used. The docs only say "ESA has much higher performance limits" | Replace when Broadcom publishes ESA thresholds | `LAT_TH`, `LAT_SRC` |
+| 10 | vSAN OSA hybrid end of support | The VCF 9.0 notice says it will be "discontinued in a future release". Once discontinued, mark the `-s hybrid` notice as legacy | VCF release notes | README.md, report text |
+| 11 | ES vector direct IO | 9.1 `vector.rescoring.directio` and 9.3 `on_disk_rescore` read disk directly and bypass the page cache. On vector search nodes, reads can rise with no cache hits, which changes how results are read. Not in the verdict yet | Decide how to collect JVM options and mapping info from target nodes | Collector ES queries, report Info items |
+| 12 | merge thread pool verdict | `thread_pool.merge` is collected but not used in the verdict | Define a threshold for backlog using the start and end values | `es_disk_render.py` Elasticsearch impact verdict |
 
 ---
 
-## 2. 새 버전이 나올 때 다시 확인할 기준값
+## 2. Thresholds to recheck on new versions
 
-아래는 버전에 따라 바뀐 적이 있거나 바뀔 수 있는 항목입니다.
-Elasticsearch 마이너 버전, vSphere·VCF 업데이트, RHEL 메이저 버전이 나올 때 이 표를 따라 한 번씩 확인합니다.
+These items have changed across versions or may change.
+When a new Elasticsearch minor version, vSphere or VCF update, or RHEL major version ships, go through these tables once.
 
 ### Elasticsearch
 
-| 기준 | 지금 값 | 바뀐 이력 | 확인할 곳 |
+| Criterion | Current value | Change history | Where to check |
 |---|---|---|---|
-| vm.max_map_count | 최소 262144, 권장 1048576 | 권장값 상향 8.16 | Bootstrap checks, `vm-max-map-count` 문서 |
-| disk watermark | 85/90/95%, max_headroom 200/150/100GB | headroom 추가 8.5 | Cluster-level shard allocation and routing settings |
-| merge 디스크 watermark | `indices.merge.disk.watermark.high` 95%, 여유 100GB | 새 설정 | Merge settings |
-| merge 스레드 기본값 | 프로세서 수의 절반 | 최대 4 제한 삭제 9.4, JVM 프로세서 수 기준 9.4.7·9.5.1 | Merge settings, `MergeSchedulerConfig` 소스 |
-| merge 스레드 풀 | `thread_pool.merge` | 추가 9.1, 8.19 | Thread pools |
-| JVM heap | 자동 설정 권장, compressed oops 한도(대부분 26GB, 일부 30GB) | | JVM settings |
-| 복구 속도 | 40mb, 전용 cold·frozen 은 메모리에 따라 최대 250mb | | Index recovery settings |
-| 다중 data path | 7.13부터 deprecated, 9.5 까지 유지 | | Path settings |
-| readahead | 128KiB | 9.2부터 파일 종류별 read advice 사용(벡터는 RANDOM) | Tune for search speed, `FsDirectoryFactory` 소스 |
-| 스로틀 로그 문구 | `now throttling indexing` | 메시지 뒤 형식 변경 9.1, 8.19 | `InternalEngine` 소스 |
-| 상시 감시 필드 | `linux.iostat.*` | `system.diskio.iostat.*` 제거 8.0 | Linux integration 패키지 |
+| vm.max_map_count | Minimum 262144, recommended 1048576 | Recommended value raised in 8.16 | Bootstrap checks, `vm-max-map-count` docs |
+| disk watermark | 85/90/95%, max_headroom 200/150/100GB | headroom added in 8.5 | Cluster-level shard allocation and routing settings |
+| merge disk watermark | `indices.merge.disk.watermark.high` 95%, 100GB free | New setting | Merge settings |
+| merge thread default | Half the processor count | Max-4 cap removed in 9.4, based on JVM processor count in 9.4.7 and 9.5.1 | Merge settings, `MergeSchedulerConfig` source |
+| merge thread pool | `thread_pool.merge` | Added in 9.1, 8.19 | Thread pools |
+| JVM heap | Auto sizing recommended, compressed oops limit (26GB in most cases, 30GB on some) | | JVM settings |
+| Recovery speed | 40mb, dedicated cold and frozen nodes up to 250mb depending on memory | | Index recovery settings |
+| Multiple data paths | Deprecated since 7.13, still present through 9.5 | | Path settings |
+| readahead | 128KiB | Per-file-type read advice since 9.2 (RANDOM for vectors) | Tune for search speed, `FsDirectoryFactory` source |
+| Throttle log text | `now throttling indexing` | Format after the message changed in 9.1, 8.19 | `InternalEngine` source |
+| Continuous monitoring fields | `linux.iostat.*` | `system.diskio.iostat.*` removed in 8.0 | Linux integration package |
 
 ### VMware (Broadcom)
 
-| 기준 | 지금 값 | 확인할 곳 |
+| Criterion | Current value | Where to check |
 |---|---|---|
-| vSAN 지연 | flash 5ms, hybrid 20ms 미만 정상 (vSAN 7·8 대상) | Broadcom KB 389082 |
-| 장치 지연 | NVMe 0.5ms, SSD 1ms 이하, HDD 10~20ms. 경보 NVMe 1ms, SSD 3ms, HDD 25ms, 30ms 초과는 critical | Broadcom KB 424485 |
-| esxtop | DAVG·KAVG·GAVG 10ms 지속이면 문제 | Broadcom KB 344099 |
-| PVSCSI 큐 | 기본 64/254, 상향 시 cmd_per_lun 254, ring_pages 32 | Broadcom KB 343323 (구 2053145) |
-| NIC | VMXNET3 | Broadcom KB 321259 (구 1001805) |
-| 컨트롤러 | PVSCSI, 디스크가 여럿이면 최대 4개로 분산, ESA 는 vNVMe | Broadcom KB 313507, 392848, Troubleshooting vSAN Performance |
-| 전반 | | Performance Best Practices for VMware vSphere (현재 9.1판) |
+| vSAN latency | Healthy below flash 5ms, hybrid 20ms (vSAN 7 and 8) | Broadcom KB 389082 |
+| Device latency | NVMe 0.5ms, SSD 1ms or less, HDD 10-20ms. Alarm at NVMe 1ms, SSD 3ms, HDD 25ms. Above 30ms is critical | Broadcom KB 424485 |
+| esxtop | DAVG, KAVG, GAVG sustained at 10ms means a problem | Broadcom KB 344099 |
+| PVSCSI queue | Default 64/254. When raised, cmd_per_lun 254, ring_pages 32 | Broadcom KB 343323 (formerly 2053145) |
+| NIC | VMXNET3 | Broadcom KB 321259 (formerly 1001805) |
+| Controller | PVSCSI. With several disks, spread across up to 4. ESA uses vNVMe | Broadcom KB 313507, 392848, Troubleshooting vSAN Performance |
+| General | | Performance Best Practices for VMware vSphere (currently the 9.1 edition) |
 
-Broadcom 은 KB 번호를 옮긴 적이 있습니다. 인용한 KB 가 열리지 않으면 제목으로 다시 찾습니다.
+Broadcom has moved KB numbers before. If a cited KB does not open, search for it by title.
 
-### Linux·RHEL
+### Linux and RHEL
 
-| 기준 | 지금 값 | 확인할 곳 |
+| Criterion | Current value | Where to check |
 |---|---|---|
-| diskstats 필드 | 1~11 기본, 12~15 discard(4.19+), 16~17 flush(5.5+) | kernel `Documentation/admin-guide/iostats.rst` |
-| 스케줄러 권고 | HDD mq-deadline·bfq, 고성능 SSD none·kyber, VM mq-deadline(다중 큐 HBA 는 none) | RHEL "Setting the disk scheduler" |
-| TuneD | 물리 서버 throughput-performance, VM virtual-guest | RHEL "Optimizing system performance with TuneD" |
-| PSI | RHEL 8·9·10 기본 비활성, `psi=1` | Red Hat 문서, kernel `PSI_DEFAULT_DISABLED` |
-| systemd-detect-virt | vm-other, container-other 포함 | systemd `src/basic/virt.c` |
-| NVMe 상태·온도 | state 문자열, temp1_max = 현재 과열 임계값 | kernel `drivers/nvme/host/sysfs.c`, `hwmon.c` |
+| diskstats fields | 1-11 base, 12-15 discard (4.19+), 16-17 flush (5.5+) | kernel `Documentation/admin-guide/iostats.rst` |
+| Scheduler recommendation | HDD mq-deadline or bfq, high-performance SSD none or kyber, VM mq-deadline (none for multi-queue HBA) | RHEL "Setting the disk scheduler" |
+| TuneD | Physical servers throughput-performance, VMs virtual-guest | RHEL "Optimizing system performance with TuneD" |
+| PSI | Disabled by default on RHEL 8, 9, 10. `psi=1` | Red Hat docs, kernel `PSI_DEFAULT_DISABLED` |
+| systemd-detect-virt | Includes vm-other, container-other | systemd `src/basic/virt.c` |
+| NVMe state and temperature | state string, temp1_max = current over-temperature threshold | kernel `drivers/nvme/host/sysfs.c`, `hwmon.c` |
 
-### RAID·클라우드
+### RAID and cloud
 
-| 기준 | 지금 값 | 확인할 곳 |
+| Criterion | Current value | Where to check |
 |---|---|---|
-| Broadcom 새 세대 | MegaRAID 96xx 는 storcli2, 드라이버 mpi3mr | Broadcom StorCLI2 User Guide |
-| Dell | PERC 11 perccli, PERC 12·13 perccli2(mpi3mr) | Dell PERC CLI Reference Guide |
-| megaraid_sas SCSI 주소 | channel 0·1 물리 디스크, 2 이상 논리 디스크 | kernel `megaraid_sas.h` |
-| AWS | EBS·instance store 모델명, `nvme amzn stats` 필드 | AWS EBS detailed performance statistics |
-| Azure | MSFT NVMe Accelerator v1, Microsoft NVMe Direct Disk v1·v2, SCSI 는 Msft Virtual Disk | Azure `azure-vm-utils` disk identification |
-| GCP | nvme_card-pd, nvme_card(N) | GoogleCloudPlatform `guest-configs` udev 규칙 |
+| New Broadcom generation | MegaRAID 96xx uses storcli2, driver mpi3mr | Broadcom StorCLI2 User Guide |
+| Dell | PERC 11 perccli, PERC 12 and 13 perccli2 (mpi3mr) | Dell PERC CLI Reference Guide |
+| megaraid_sas SCSI address | channel 0 and 1 physical disks, 2 and above logical drives | kernel `megaraid_sas.h` |
+| AWS | EBS and instance store model names, `nvme amzn stats` fields | AWS EBS detailed performance statistics |
+| Azure | MSFT NVMe Accelerator v1, Microsoft NVMe Direct Disk v1 and v2, SCSI is Msft Virtual Disk | Azure `azure-vm-utils` disk identification |
+| GCP | nvme_card-pd, nvme_card(N) | GoogleCloudPlatform `guest-configs` udev rules |
 
 ---
 
-## 3. 업데이트 절차
+## 3. Update procedure
 
-1. 위 표의 출처를 열어 값이 바뀌었는지 봅니다.
-2. 바뀐 값은 코드(`es_disk_render.py` 판정과 출처 문구, `es_disk_summary.sh` 같은 판정), `README.md` 기준값 출처 표, `GUARDLINE.md` 를 함께 고칩니다.
-3. 새 동작에는 `tests/make_bundle.py` 에 시나리오를 추가하고 `tests/expectations.py` 에 기대 판정을 적습니다.
-4. `python3 tests/run_tests.py` 로 확인합니다. 셸 요약과 HTML 판정이 다르면 실패로 나옵니다.
-5. `CHANGELOG.md` 에 무엇을 왜 바꿨는지 적고, 이 문서의 "마지막 대조" 날짜와 표를 갱신합니다.
+1. Open the sources in the tables above and check whether any value changed.
+2. Fix changed values together in the code (`es_disk_render.py` verdicts and source text, the same verdicts in `es_disk_summary.sh`), the threshold source table in `README.md` and `README.ko.md`, and `GUARDLINE.md` and `GUARDLINE.ko.md`.
+3. For new behavior, add a scenario to `tests/make_bundle.py` and write the expected verdict in `tests/expectations.py`.
+4. Run `python3 tests/run_tests.py`. It fails if the shell summary and the HTML verdict differ.
+5. Record what changed and why in `CHANGELOG.md`, then update the "Last checked" date and the tables in this document.

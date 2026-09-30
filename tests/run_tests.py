@@ -52,7 +52,10 @@ def main():
         for name, b in bundles.items():
             res = R.analyze(b)
             R.render(res, os.path.join(work, "{}.{}.html".format(name, lang)))
+            html = open(os.path.join(work, "{}.{}.html".format(name, lang)), encoding="utf-8").read()
             text = shell(b, lang)
+            if any(d in html + text for d in i18n_check.DASHES) or (lang == "en" and i18n_check.HANGUL.search(html + text)):
+                print("FAIL {} [{}]: em/en dash or Hangul in output".format(name, lang)); sys.exit(1)
             out[lang][name] = {
                 "platform": res.get("platform"), "verdict_class": res["verdict"][0], "verdict": res["verdict"][1],
                 "findings": [{"sev": f.sev, "id": f.id, "owner_id": f.owner_id, "title": str(f.title)} for f in res["findings"]],
@@ -117,6 +120,20 @@ def main():
         if not R.analyze_local_indices(d_, None):
             fails.append("per-index stats not parsed ({} shape)".format(shape))
 
+    # cluster-only report (es_cluster_probe.sh bundle): same findings in both languages, skewed node found
+    cdir = make_bundle.build_cluster(os.path.join(work, "cluster"))
+    cl = {}
+    for lang in LANGS:
+        R.set_lang(lang)
+        F = []
+        R.analyze_cluster(cdir, lambda *a: F.append(R.Finding(*a)), R.LAT_TH["allflash"])
+        cl[lang] = sorted((f.sev, f.id) for f in F)
+        R.render_cluster_only(cdir, os.path.join(work, "cluster.{}.html".format(lang)))
+        if not any(f.id == "r.0043" and "es-hot-02" in str(f.title) for f in F):
+            fails.append("cluster [{}]: skewed node es-hot-02 not reported".format(lang))
+    if cl["ko"] != cl["en"]:
+        fails.append("cluster: ko and en findings differ")
+
     # i18n catalogs and writing rules on user docs
     ko, _ = i18n_check.load(os.path.join(ROOT, "i18n", "ko.txt"))
     en, _ = i18n_check.load(os.path.join(ROOT, "i18n", "en.txt"))
@@ -129,7 +146,10 @@ def main():
         low = text.lower()
         if any(d in text for d in i18n_check.DASHES):
             fails.append("{}: em/en dash".format(doc))
-        banned = i18n_check.BANNED_KO if (".ko." in doc or doc.endswith("UPDATE_NOTES.md")) else i18n_check.BANNED_EN
+        korean = ".ko." in doc
+        banned = i18n_check.BANNED_KO if korean else i18n_check.BANNED_EN
+        if not korean and i18n_check.HANGUL.search(text.replace("한국어", "")):
+            fails.append("{}: Hangul in an English doc".format(doc))
         for w in banned:
             if w in low:
                 fails.append("{}: avoid '{}'".format(doc, w))
