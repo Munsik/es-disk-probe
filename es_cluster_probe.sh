@@ -56,7 +56,8 @@ command -v curl >/dev/null 2>&1 || { echo "curl이 필요합니다"; exit 1; }
 TLS=(-k); [[ $STRICT -eq 1 ]] && TLS=()
 [[ -n "$CACERT" ]] && TLS+=(--cacert "$CACERT")
 
-TS=$(date +%Y%m%d_%H%M%S); OUT="$OUT_BASE/escluster_$TS"; mkdir -p "$OUT" || exit 1
+# 결과 디렉터리는 ES 접속이 확인된 뒤에 만든다 (실패하면 아무것도 남기지 않고, 지울 것도 없게)
+TS=$(date +%Y%m%d_%H%M%S); OUT="$OUT_BASE/escluster_$TS"
 msg() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 
 cfgesc() { local v=${1//\\/\\\\}; printf '%s' "${v//\"/\\\"}"; }   # curl -K 값 이스케이프 (\ 와 ")
@@ -70,17 +71,17 @@ es_get() {  # $1=path $2=outfile
 
 if [[ -z "$ES_URL" ]]; then
   for ES_URL in http://localhost:9200 https://localhost:9200; do
-    CODE=$(es_get "" "$OUT/root.json")
+    CODE=$(es_get "" /dev/null)
     [[ "$CODE" == "200" || "$CODE" == "401" ]] && break
   done
 else
-  CODE=$(es_get "" "$OUT/root.json")
+  CODE=$(es_get "" /dev/null)
 fi
 if [[ "$CODE" == "401" && -z "$ES_USER" && -z "$ES_API_KEY" && -t 0 && -r /dev/tty ]]; then
   msg "ES 가 인증을 요구합니다 ($ES_URL). 조회 전용 권한(monitor)이면 충분합니다"
   read -r -p "  ES 사용자: " ES_USER < /dev/tty
   read -rs -p "  비밀번호: " ES_PASSWORD < /dev/tty; echo >&2
-  CODE=$(es_get "" "$OUT/root.json")
+  CODE=$(es_get "" /dev/null)
 fi
 if [[ "$CODE" != "200" ]]; then
   if [[ "$CODE" == "401" ]]; then
@@ -89,8 +90,10 @@ if [[ "$CODE" != "200" ]]; then
     echo "ES 접속 실패 (http=$CODE, 마지막 시도 $ES_URL). ES 가 다른 주소에 있으면 --es-url 로 지정하세요."
   fi
   [[ $STRICT -eq 1 ]] && echo "  인증서 검증 모드입니다. 자체 서명 인증서라면 --cacert 로 CA를 지정하세요."
-  rm -rf "$OUT"; exit 2
+  exit 2
 fi
+mkdir -p "$OUT" || exit 1
+es_get "" "$OUT/root.json" >/dev/null
 echo "es_url=$ES_URL"$'\n'"gap=$GAP"$'\n'"start_wall=$(date '+%Y-%m-%d %H:%M:%S %z')" > "$OUT/meta"
 
 # 노드별 디스크·인덱싱 지표 (두 시점의 차분용)

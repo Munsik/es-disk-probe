@@ -131,12 +131,7 @@ EXPECT += [(n, "vm", "",
             [(None, None, "EC2 인스턴스의 EBS 성능 한도")]) for n in ("aws_ebs_v2", "aws_ebs_v3")]
 
 EXPECT += [
-    ("predeploy_ok", "baremetal", "부하 전 점검: 스토리지가 ES 기준을 충족합니다", [], [(None, None, "한 건 지연이 기준보다 큼")]),
-    ("predeploy_slow_fsync", "baremetal", "부하 전 점검: 스토리지가 ES 기준보다 느립니다",
-     [("warn", "하드웨어 담당자", "동기 쓰기(fsync) 한 건 지연이 기준보다 큼")], []),
-    ("predeploy_dd", "baremetal", "부하 전 점검: 대체로 충족하지만 확인할 항목이 있습니다",
-     [("caution", None, "동기 쓰기(fsync) 한 건 지연이 기준보다 큼 (벤치 평균")], []),
-    ("idle_nobench", "baremetal", "성능 판정은 보류", [], []),
+    ("idle_low_load", "baremetal", "성능 판정은 보류", [], []),
 ]
 
 EXPECT += [

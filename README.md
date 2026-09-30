@@ -47,14 +47,14 @@ cron이나 systemd timer로 반복 실행하도록 만들지 마세요. 측정 �
 - SAN을 쓰는 노드에서 서버 쪽(HBA 큐, 경로) 문제인지 스토리지 어레이 문제인지 갈라야 할 때
 - 인덱싱 지연이나 검색 지연의 원인이 디스크인지 확인해야 할 때
 - VMware·스토리지 관리자나 하드웨어 유지보수 쪽에 "느리다"가 아니라 측정 근거를 들고 가야 할 때
-- 신규 구축이나 증설 직전에 스토리지가 ES 운영 기준을 충족하는지, OS 설정과 서버·VM 구성이 권고에 맞는지 확인할 때 (아래 "구축 전 점검")
+- 신규 구축이나 증설 직전에 OS 설정과 서버·VM 구성이 권고에 맞는지 한 번 훑을 때 (성능 판정은 실제 부하가 있을 때 나옵니다)
 - 폐쇄망이라 외부 도구를 들이기 어려울 때
 
 이럴 때는 쓰지 마세요.
 
 - 디스크가 원인이라고 이미 확인한 뒤의 튜닝 작업. 이 도구는 원인을 가리는 데까지만 씁니다
 - 상시 감시 목적. 위 표를 봐 주세요
-- 용량 사이징 근거. 최대 성능을 재는 쪽은 `es_disk_bench.sh`(부하 발생)이고, 기본 수집은 현재 부하만 봅니다
+- 용량 사이징 근거. 이 도구는 부하를 걸어 최대 성능을 재지 않고, 운영 중인 실제 부하만 봅니다
 - 디스크 밖의 성능 문제. CPU, heap, GC, 쿼리 튜닝은 범위가 아닙니다. 다만 "디스크가 원인이 아니다"까지는 판정합니다
 - 컨테이너(ECK, Docker) 안에서 실행. 그 노드(호스트)에서 실행하세요. 호스트에서 돌리면 컨테이너 안 ES를 자동으로 찾고,
   ES 프로세스의 mount 정보로 data가 올라간 장치(로컬 PV, Ceph RBD, 클라우드 볼륨 등)까지 따라갑니다
@@ -67,11 +67,12 @@ cron이나 systemd timer로 반복 실행하도록 만들지 마세요. 측정 �
 - ES에 쓰기 요청. 조회 API(`GET`)만 씁니다. 인덱스 생성, 설정 변경, 재시작 없습니다
 - `drop_caches`, 강제 `sync`, raw device 접근
 - 외부 네트워크 통신. 지정한 ES 주소 외에는 아무 곳에도 접속하지 않습니다
-- 디스크에 부하를 거는 테스트. 그건 `es_disk_bench.sh`이고 별개입니다
+- 디스크에 부하를 거는 테스트. 운영 서버에는 이미 실제 부하가 있으므로 그것을 그대로 잽니다
+- 파일 삭제. 서버의 어떤 파일도 지우지 않습니다. 자기가 만든 결과 파일도 지우지 않습니다
 
 합니다.
 
-- `/proc`, `/sys` 읽기, ES 조회 API 호출, 결과 디렉터리(기본 `/tmp`)에 파일 쓰기
+- `/proc`, `/sys` 읽기, ES 조회 API 호출, 결과 디렉터리(기본 `/tmp`, ES data 와 같은 디스크면 다른 디스크로 자동 변경) 한 곳에만 파일 쓰기
 - ES 서버 로그와 sar 기록의 끝부분 읽기 (아래 부하 표를 봐 주세요)
 - 자기 자신의 우선순위를 낮추는 `renice 19`, `ionice idle`. 프로세스가 끝나면 사라집니다
 - NVMe 온도 읽기. `/sys/class/nvme/*/hwmon` 을 읽으면 커널이 장치에 SMART log 를 한 번 요청합니다. 읽기 전용 명령이고 실행당 1회입니다
@@ -156,106 +157,14 @@ ES가 segment를 열거나 닫을 때(`mmap`, `munmap`) 잠깐 경합하는 정�
 
 처음 쓰실 때는 사내 노드나 개발 노드에서 한 번 돌려 보고 출력을 확인하시면 좋습니다.
 
-### 부하를 거는 도구는 따로 있습니다
-
-`es_disk_bench.sh`는 실제 부하를 겁니다. 위 내용은 이 스크립트에 해당하지 않습니다.
-fio 가 있으면 무작위 읽기·순차 쓰기·순차 읽기·혼합·동기 쓰기 5가지를, 없으면 `dd` 로 순차 쓰기·순차 읽기·동기 쓰기(`oflag=dsync`, 4KiB) 3가지를 잽니다.
-동기 쓰기 지연은 translog fsync 한 번의 비용과 같은 성격이라 fio 가 없어도 꼭 재 두는 편이 좋습니다.
-
-- ES가 떠 있으면 실행을 거부합니다. `--force-with-es`로만 우회됩니다
-- vSAN, SAN 어레이 같은 공유 스토리지는 같은 스토리지를 쓰는 다른 VM·서버에도 영향이 갈 수 있습니다. VMware·스토리지 관리자와 시간을 맞추세요
-- 테스트 파일이 vSAN 캐시 계층이나 RAID 컨트롤러·어레이 캐시에 들어가면 결과가 실제보다 좋게 나옵니다. 상한으로만 해석하세요
-
-### 결과물에 들어가는 정보
-
-번들(`.tar.gz`)에는 호스트명, OS·커널 버전, mount 경로, 인덱스 이름, ES 노드 이름과 IP,
-커널 로그와 ES 로그 발췌가 들어갑니다.
-`elasticsearch.yml`은 `password`, `secret`, `token`, `key`가 들어간 줄을 빼고 필요한 키만 추출합니다.
-사외로 내보낼 일이 있으면 번들을 한 번 열어 보시는 편이 안전합니다.
-
-### 검증 수준
-
-컨테이너와 합성 데이터로 검증했습니다. `/proc/diskstats` 계산은 iostat 12.6과 교차 검증했고
-계산식 단위 테스트를 통과했습니다. 실제 vSphere Guest와 운영 클러스터 검증은 아직 남아 있습니다.
-상세 내역은 아래 [검증 현황](#검증-현황) 표에 있습니다.
-
----
-
-## 왜 필요한가
-
-Elasticsearch에서 디스크는 클러스터 안정성을 좌우하는데, 이 노드 디스크가 어디까지 받아낼 수 있는지
-재는 표준 도구가 없습니다.
-특히 VMware vSAN 위에서는 Guest에서 본 지연이 vSAN, hypervisor, 가상 SCSI를 모두 거친 결과라서
-느린 이유가 어디에 있는지 가려내기 어렵습니다.
-VMware 관리자의 협조를 바로 받기 어려운 현장이 많다는 것도 이 도구를 만든 이유입니다.
-
-bare-metal도 사정은 비슷합니다. RAID 컨트롤러 뒤의 디스크 상태나 SAN 어레이 쪽 응답시간은 OS에서 보이지 않고,
-하드웨어 유지보수나 스토리지 담당이 따로 있는 경우가 많습니다.
-
-그래서 OS에서 볼 수 있는 것을 최대한 모아 판정하고, OS에서 원리상 볼 수 없는 것은
-VMware 관리자, 하드웨어 담당자, 스토리지 관리자 요청 항목으로 따로 분리합니다.
-
----
-
-## 플랫폼별 판정
-
-수집기는 판단 근거만 모으고, 판정은 분석기가 합니다. 번들을 PC로 옮겨 다시 렌더링해도 같은 결과가 나옵니다.
-
-### 판별 순서
-
-1. `systemd-detect-virt -v`(VM), `-c`(컨테이너)
-2. 명령이 없으면 DMI(`/sys/class/dmi/id`), `/sys/hypervisor/type`, `/proc/cpuinfo` 의 hypervisor 플래그
-3. bare-metal 은 "가상화 없음"이 확인될 때만 판정합니다. 근거가 없으면 "플랫폼 미확정"으로 두고 공통 기준을 씁니다
-4. ES data 디스크마다 연결 방식과 매체를 봅니다. NVMe(PCIe), NVMe-oF, FC·iSCSI HBA, 어레이 벤더 이름, dm-multipath, Ceph RBD·NBD,
-   클라우드 볼륨(EBS, Azure Disk, Persistent Disk)과 인스턴스 로컬 NVMe, RAID 컨트롤러 드라이버와 컨트롤러 도구 조회 결과, `rotational`
-5. ES가 컨테이너 안에 있으면 ES 프로세스의 mountinfo 로 data 경로가 올라간 블록 장치를 찾습니다
-
-### 플랫폼별로 달라지는 것
-
-| | VMware Guest | bare-metal 로컬 | bare-metal SAN·네트워크 블록 | 그 밖의 VM·클라우드 |
-|---|---|---|---|---|
-| 판별 | detect-virt = vmware | detect-virt = none | FC·iSCSI HBA, multipath, 어레이 벤더, Ceph RBD | kvm, microsoft, xen, amazon, google 등 |
-| 응답시간 기준 (주의) | 5ms. 데이터스토어 종류는 Guest에서 알 수 없어 공통 기준 (`-s allflash`·`hybrid`·`vmfs` 로 좁힘) | NVMe 1ms / SSD 3ms / HDD 25ms. RAID 뒤 매체는 컨트롤러 도구로 확정 | FC·iSCSI SSD 3ms (어레이가 HDD면 `-s hdd`), Ceph RBD 5ms | 클라우드 볼륨 5ms, 인스턴스 로컬 NVMe 1ms, 그 밖 5ms |
-| 병목 위치 | VM 안의 큐 대 VM 바깥 | 디스크 구성 포화 대 디스크·컨트롤러 이상 | 서버 LUN 큐 대 어레이·SAN 경로, Ceph 는 스토리지 클러스터 | VM 안의 큐 대 VM 바깥 |
-| "바깥" 담당자 | VMware 관리자 | 하드웨어 담당자 | 스토리지 관리자 | 가상화·클라우드 관리자 |
-| 전용 점검 | PVSCSI, balloon, 메모리 예약, SCSI timeout 180초, VMXNET3 | RAID 컨트롤러(논리 디스크 상태, 쓰기 캐시, 배터리, 구성 디스크 오류, rebuild), SMART, NVMe 온도·PCIe 링크, md RAID, CPU governor | FC 포트 상태, multipath 경로별 지연 | CPU steal |
-| 스케줄러 권고 | mq-deadline 또는 none | NVMe·SSD none/kyber, HDD mq-deadline/bfq | mq-deadline 또는 none | mq-deadline 또는 none |
-| tuned 권고 | virtual-guest | throughput-performance | throughput-performance | virtual-guest |
-
-모든 플랫폼에서 공통으로 보는 것도 있습니다.
-
-- 같은 묶음(RAID 0, LVM stripe, md, multipath 경로) 안에서 한 장치만 느린 경우
-- 요청은 쌓이는데 IOPS나 처리량이 같은 값에서 더 오르지 않는 모양. 클라우드 볼륨 한도, VM 디스크 IOPS 한도, 어레이 QoS 같은 한도에 걸렸을 때 나타납니다
-- ES가 컨테이너 안에 있을 때 data 장치를 mount 정보로 따라가기
-
-### VMware 데이터스토어
-
-Guest OS에서는 데이터스토어가 vSAN인지 SAN(VMFS)·NFS인지 알 수 없습니다. 그래서 기본은 어느 쪽에도 맞는 공통 기준(5ms)과 문구를 씁니다.
-종류를 알고 있으면 `-s` 로 알려 주세요. 기준값과 조치 안내가 그 환경에 맞춰집니다.
-
-| `-s` | 데이터스토어 | 달라지는 것 |
-|---|---|---|
-| 지정 안 함 | 모름 (기본) | 공통 기준 5ms. 안내에 vSAN과 SAN·NFS 확인 방법을 함께 적음 |
-| `allflash`, `hybrid` | vSAN | 5ms / 10ms. vSAN 성능 서비스, resync, vSAN 네트워크 중심 안내 |
-| `vmfs` | SAN(VMFS)·NFS | 5ms. 어레이 볼륨 응답시간, 경로 상태, Storage I/O Control 중심 안내 |
-
-### 매체를 확정할 수 없는 경우
-
-RAID 컨트롤러(megaraid_sas, hpsa, smartpqi 등) 뒤의 논리 디스크는 `rotational` 값이 실제 매체와 다를 수 있습니다.
-컨트롤러 도구(storcli·perccli, ssacli, arcconf)가 있으면 구성 디스크의 매체를 읽어 확정합니다.
-도구가 없을 때만 "추정"으로 표시하고 `-s` 지정이나 도구 설치를 안내합니다. SAN도 서버에서 어레이 매체를 알 수 없어 SSD 기준을 기본으로 씁니다.
-ES data 디스크의 매체가 섞여 있으면 가장 느린 매체 기준으로 판정합니다. 빠른 매체 기준을 느린 디스크에 대면 정상인데도 경고가 나기 때문입니다.
-
----
-
-## 핵심 원칙
 
 | 원칙 | 구현 |
 |---|---|
 | 플랫폼 자동 판별 | VMware, bare-metal(로컬·SAN), 그 밖의 hypervisor·클라우드를 구분해 기준값과 담당자를 바꿈. [플랫폼별 판정](#플랫폼별-판정) |
 | 시스템을 바꾸지 않음 | `/proc`, `/sys` 읽기와 ES 조회 API(GET)만. 쓰기는 결과 디렉터리 안에만 |
 | 서비스에 영향 없음 | 실측 CPU 0.97초(300초 측정 시 CPU 1개의 0.32%), 메모리 4.2MB, 디스크 읽기 12MB, `nice 19` + `ionice idle`. [부하 실측 상세](#이-도구가-서버에-주는-부하) |
-| 부하 테스트는 분리 | `es_disk_bench.sh`에만 있음. ES 실행 중이면 실행 거부 |
+| 부하를 걸지 않음 | 부하 테스트 도구가 없음. 운영 중 실제 부하를 측정. 부하가 낮으면 성능 판정을 스스로 보류 |
+| 지우지 않음 | 어떤 스크립트에도 삭제 동작(`rm` 등)이 없음. 벤더 도구가 남기는 로그도 결과 디렉터리 안에 두고 번들에 포함 |
 | 조치는 안내만 | 자동 튜닝 없음. 근거, 이유, 방법, 출처를 제시하고 적용은 담당자가 판단 |
 | 폐쇄망 동작 | 외부 패키지나 CDN 필요 없음. bash + awk + coreutils, 분석기는 Python 3.6 표준 라이브러리 |
 
@@ -304,27 +213,6 @@ flush         초당 40.0회 · 평균 9.00 ms
 같은 내용이 번들 안 `summary.txt` 로 남습니다. 서버에 Python 3.6+ 가 있으면 HTML 리포트도 같이 만듭니다.
 HTML 리포트에는 병목 위치 판정, 클러스터 비교, 인덱스별 분포, 항목마다 근거와 출처가 더 들어 있습니다.
 
-### 구축 전 점검 (ES 를 올리기 전)
-
-ES 가 없거나 부하가 없으면 기본 수집은 "성능 판정 보류"를 냅니다. 이때는 벤치를 먼저 돌린 뒤 수집합니다.
-
-```bash
-sudo ./es_disk_bench.sh -t /data/es     # ES data 로 쓸 경로. 실제 부하를 겁니다 (fio 없으면 dd)
-sudo ./es_disk_collect.sh --no-es -d 60  # 방금 잰 벤치 결과를 자동으로 넣어 판정
-```
-
-ES 가 스토리지에서 가장 자주 기다리는 두 가지를 봅니다. 기준은 운영 중 응답시간 판정과 같은 매체별 기준입니다.
-
-| 항목 | 측정 | 의미 |
-|---|---|---|
-| 동기 쓰기 한 건 | fio 4KiB fsync p99 (dd 는 평균) | translog fsync. bulk 요청마다 기다리는 시간 |
-| 무작위 읽기 한 건 | fio 4KiB randread 동시성 1 p99 (fio 가 있을 때만) | page cache 에 없는 segment 를 읽는 검색이 기다리는 시간 |
-| 무작위 읽기 최대, 순차 쓰기·읽기 | fio | 참고값. 운영 후 여유율 계산에 씀 |
-
-판정은 "스토리지가 ES 기준을 충족합니다", "대체로 충족하지만 확인할 항목이 있습니다", "ES 기준보다 느립니다" 셋 중 하나입니다.
-설정·구성 점검(readahead, 스케줄러, max_map_count, RAID 캐시 등)도 함께 나옵니다.
-벤치 파일이 RAID·어레이 캐시에 들어가면 실제보다 좋게 나오므로, 운영 투입 후 피크 시간대에 한 번 더 수집하세요.
-
 ### 알아서 판단하는 것
 
 사용자가 정할 필요가 없도록 아래는 도구가 자동으로 정합니다. 자동 판단이 틀렸을 때만 옵션으로 바꾸세요.
@@ -340,7 +228,6 @@ ES 가 스토리지에서 가장 자주 기다리는 두 가지를 봅니다. �
 | ES data 경로 | ES 프로세스, `elasticsearch.yml` 의 `path.data` 에서 찾음 (ES가 내려가 있어도) | `-p` |
 | 결과 저장 위치 | `/tmp` 가 ES data와 같은 디스크면 `/var/tmp`, `/root` 등 다른 디스크로 자동 변경 | `-o` |
 | 인덱스별 조회 | 이 노드 샤드 2,000개 이상이거나 클러스터 샤드 20,000개 이상이면 생략 | `--no-index-stats` |
-| 벤치 결과 | 같은 서버에서 `es_disk_bench.sh` 로 잰 최근 결과(180일 이내)를 번들에 넣어 리포트에 반영 | 분석기 `--bench` |
 | 클러스터 조회 | 권한이 없으면(403) 이 노드 결과만으로 리포트 | `--no-cluster` |
 | 리포트 생성 | 서버에 Python 3.6 이상이 있으면 바로 HTML 생성 (RHEL 8 platform-python 포함) | `--no-render` |
 
@@ -361,7 +248,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | HTML 분석기 | Python 3.6+ 표준 라이브러리만 (RHEL 8의 `/usr/libexec/platform-python` 자동 인식). 서버에 없으면 번들을 PC로 옮겨 실행 |
 | 권한 | root 권장 (ES 프로세스 I/O, 커널 로그, VMware 정보) |
 | ES 권한 | `cluster monitor` (`monitoring_user` 수준). 관리자 계정 필요 없음 |
-| 선택 (있으면 더 봄) | `sysstat`(과거 이력), `ethtool`(NIC ring), `open-vm-tools`(VMware 자원), `smartmontools`(SMART), RAID 컨트롤러 도구(`storcli`·`perccli`, `ssacli`, `arcconf`), `fio` + `libaio`(무작위 I/O 최대 성능. 없으면 `dd` 로 순차·동기 쓰기만) |
+| 선택 (있으면 더 봄) | `sysstat`(과거 이력), `ethtool`(NIC ring), `open-vm-tools`(VMware 자원), `smartmontools`(SMART), RAID 컨트롤러 도구(`storcli`·`perccli`, `ssacli`, `arcconf`) |
 
 ### 서버에서 쓰는 명령
 
@@ -375,7 +262,6 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | journalctl, systemd-detect-virt | systemd | 예 | 커널 로그, 플랫폼 판별 |
 | dmsetup | device-mapper (lvm2) | 예 (RHEL, Ubuntu 서버) | LVM·multipath·thin pool 구성과 상태 |
 | curl | curl | 예 | ES 조회 API |
-| dd | coreutils | 예 | fio 가 없을 때의 벤치 |
 | python3 | python3 / platform-python | RHEL 8·9, Ubuntu 예. RHEL 7 아니오 | HTML 리포트 (없으면 셸 요약만) |
 
 `es_disk_collect.sh`와 `es_cluster_probe.sh`는 기본적으로 `curl -k`로 동작합니다.
@@ -428,9 +314,8 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | `es_disk_summary.sh` | 셸(awk)만으로 핵심 판정 요약. 수집기가 끝날 때 자동 실행, `summary.txt` | 번들만 읽음 |
 | `es_disk_render.py` | 전체 분석, 판정, HTML 생성 (서버 또는 PC) | 서버에서 안 돌려도 됨 |
 | `es_cluster_probe.sh` | (선택) 노드 접속 없이 클러스터만 원격 조회 | 조회 API GET만 |
-| `es_disk_bench.sh` | (선택) 최대 성능 측정 | 부하를 검. 점검 시간에만 |
 | `GUARDLINE.md` | 설계, 구성, 상시 감시 기준과 변경 원칙 | 문서 |
-| `tests/` | 합성 번들 생성기와 판정 테스트 (플랫폼·매체·RAID 도구별 22개 시나리오) | 서버에서 안 돌림 |
+| `tests/` | 합성 번들 생성기와 판정 테스트 (플랫폼·매체·RAID 도구별 32개 시나리오) | 서버에서 안 돌림 |
 
 ---
 
@@ -443,7 +328,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 |---|---|---|
 | 부하 수준 | 응답시간 p95(읽기·쓰기), IOPS, 처리량, 요청 크기, 병합 비율, 대기 I/O(aqu-sz), inflight, %util | /proc/diskstats |
 | 포화 | PSI io some/full, ES 스레드 D 상태, iowait, 큐 사용률(aqu-sz ÷ queue_depth), 한도에 걸린 모양(IOPS·처리량 평평 + 대기 증가) | /proc/pressure, /proc/&lt;pid&gt;/task, /sys/block |
-| fsync 비용 | flush 요청 수와 평균 시간 (커널 5.5+), 벤치의 동기 쓰기 지연 | /proc/diskstats, es_disk_bench.sh |
+| fsync 비용 | flush 요청 수와 평균 시간 (커널 5.5+), ES flush 평균 시간 | /proc/diskstats, ES node stats |
 | 원인 위치 | 병목 위치(플랫폼별), 쓰기만 느림, 묶음 안 한 장치만 느림, 여러 노드 동시 고부하 | 위 지표 조합, _nodes/stats |
 | 옆집 부하 | ES 가 아닌 프로세스의 디스크 I/O 상위 목록 | /proc/&lt;pid&gt;/io |
 | 오류 | 커널 로그(I/O error, abort/reset, timeout, hung task, FS 오류, 컨트롤러·PCIe, RAID 컨트롤러 이벤트, multipath, md, thin pool), 장치 상태·타임아웃·오류 카운터, PCIe AER, NVMe 컨트롤러 상태 | journalctl/dmesg, /sys |
@@ -485,7 +370,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 2. 판정 근거와 조치 안내. 담당자별 묶음, 근거·이유·조치·출처
 3. Best practice 대조표. 통과한 항목까지 전부 (약 30개)
 4. Elasticsearch 쪽 영향. 측정 구간의 지표 변화량
-5. 한계 추정. bench 결과가 없으면 큐 기준 상한, 있으면 "최대 능력 대비 사용률"로 바뀝니다
+5. 한계 추정. 부하 테스트 없이 계산한 큐 기준 이론 상한과 현재 사용률
 6. 클러스터 관점, 이 노드 디스크를 쓰는 인덱스
 7. 디바이스별 상세, 과거 7일 이력(sar)
 8. 이 진단이 서버에 준 부하. 그 실행의 실측값
@@ -509,8 +394,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | 지금은 버티지만 위험 요인이 있습니다 | 측정값은 괜찮으나 부하가 늘거나 호스트가 경합하면 문제 될 설정이 있음 |
 | ES에 처리 지연 신호가 있지만 디스크 응답은 정상 | 원인이 디스크 밖(CPU, heap, bulk, 샤드)일 가능성 |
 | 성능 저하 징후 | 측정 중에 디스크 지연, 포화, 오류를 관측 |
-| 성능 판정 보류 | 측정한 시간대의 부하가 낮아 판단 근거가 부족. 피크 때 다시 측정하거나, 구축 전이면 벤치 후 수집 |
-| 부하 전 점검: 충족 / 확인할 항목 있음 / 기준보다 느림 | 부하 없이 벤치 결과로 낸 판정. 위 "구축 전 점검" 참고 |
+| 성능 판정 보류 | 측정한 시간대의 부하가 낮아 판단 근거가 부족. 인덱싱·검색 피크 때 다시 측정 |
 
 병목 위치는 응답시간이 기준을 넘었을 때만 판정합니다.
 큐 사용률(aqu-sz ÷ queue_depth 합계)로 세 구간으로 나눕니다. 구간은 같고, 각 구간의 뜻과 담당자는 플랫폼마다 다릅니다.
@@ -622,7 +506,7 @@ RAID 컨트롤러 캐시는 커널의 `queue/write_cache` 값으로 판단하지
 실제 서버 없이 플랫폼·매체·부하 조합별 판정을 확인할 수 있습니다. Python 표준 라이브러리만 씁니다.
 
 ```bash
-python3 tests/run_tests.py                 # 33개 시나리오 기대 판정 + 셸·HTML 판정 일치 검사
+python3 tests/run_tests.py                 # 32개 시나리오 기대 판정 + 셸·HTML 판정 일치 검사
 ./es_disk_summary.sh <번들 디렉터리>         # 셸 요약 판정만 따로
 python3 tests/run_tests.py --dump /tmp/t   # 시나리오별 HTML 리포트와 판정 목록(JSON) 저장
 python3 tests/make_bundle.py --list        # 시나리오 목록
@@ -640,13 +524,12 @@ python3 tests/make_bundle.py --list        # 시나리오 목록
 | `path.data` 표기 5종 파싱 | 통과 |
 | HTML과 차트 | 태그 검증 + 가짜 DOM 실행 검증 통과 |
 | 호환성 | Python 3.6 문법, bash 4.2, mawk 검사 통과 |
-| 셸 요약 판정 | 합성 번들 33종 모두 HTML 판정과 결론 일치, 매체 추정 여부도 일치. `tests/run_tests.py` 가 매번 비교 (mawk·gawk 모두 확인) |
-| 플랫폼별 판정 | 합성 번들 33종 통과: VMware 6(vSAN All-Flash·Hybrid·기본·VMFS), bare-metal NVMe 2, HDD RAID, md SSD stripe, FC SAN, Ceph RBD, RAID 도구 8, KVM, AWS EBS 4, ECK, 컨테이너, OS 기본 점검, 구축 전 4, ES merge·벡터 direct IO |
+| 셸 요약 판정 | 합성 번들 32종 모두 HTML 판정과 결론 일치, 매체 추정 여부도 일치. `tests/run_tests.py` 가 매번 비교 (mawk·gawk 모두 확인) |
+| 플랫폼별 판정 | 합성 번들 32종 통과: VMware 6(vSAN All-Flash·Hybrid·기본·VMFS), bare-metal NVMe 2, HDD RAID, md SSD stripe, FC SAN, Ceph RBD, RAID 도구 8, KVM, AWS EBS 4, ECK, 컨테이너, RHEL 서비스(PrivateTmp), OS 기본 점검, 저부하 보류, ES merge·벡터 direct IO, 인덱스 설정 |
 | RAID 도구 출력 해석 | storcli JSON 키는 Prometheus storcli exporter 가 쓰는 키, ssacli·arcconf 는 공개된 출력 레이블로 만든 합성 출력으로 검증. storcli2·perccli2 는 키 이름·값 표기를 바꾼 변형 3종(공백·snake_case·개수 필드 동반)과 해석 불가 1종으로 검증. 실제 장비 출력은 미확인 |
 | AWS EBS 통계 해석 | JSON(한 줄·여러 줄), ebsnvme 텍스트, "이름 : 값" 표, 단위(us) 붙은 텍스트 4종으로 검증. 실제 nvme-cli 출력은 미확인 |
-| 구축 전 판정 | fio JSON(동기 쓰기·단건 읽기)과 dd 결과로 검증. 이 컨테이너에서 dd 벤치 → `--no-es` 수집 실제 실행으로 셸·HTML 판정 일치 확인 |
 | 0.9.x → 0.10 회귀 | VMware 합성 번들 3종의 판정 목록이 0.9.5와 동일 |
-| 실제 Linux VM + 실제 ES | UTM(QEMU, Apple Silicon) Rocky Linux 9.8 aarch64 + Elasticsearch 8.19.21 에서 수집·셸 요약·HTML 확인. 여기서 찾은 문제 4건 수정 (CHANGELOG) |
+| 실제 Linux VM + 실제 ES | UTM(QEMU, Apple Silicon) Rocky Linux 9.8 aarch64 + Elasticsearch 8.19.21. 무부하와 bulk 인덱싱 부하(약 12만 docs/s) 두 번 측정해 셸 요약·HTML 판정 일치 확인. 여기서 찾은 수집 문제 6건 수정 (CHANGELOG) |
 | 실제 vSphere Guest | 미검증 |
 | 실제 bare-metal (NVMe, RAID, SAN), 클라우드, Kubernetes | 미검증 |
 | 운영 클러스터 `fs.io_stats` | 단일 노드 실제 ES 8.19 에서 확인. 다중 노드 운영 클러스터는 미검증 |
@@ -686,7 +569,6 @@ RAID 컨트롤러가 논리 디스크의 `rotational` 을 1로 보고하는 경�
 - [ ] 실제 vSphere 환경과 bare-metal(NVMe, 하드웨어 RAID, FC SAN) 검증 후 v1.0.0
 - [x] AWS EBS 한도 초과 시간 판정 (nvme amzn stats). Azure·GCP 는 VM 안에서 볼 지표가 없어 모양 판정만
 - [x] RAID 컨트롤러 벤더 도구(storcli·perccli·storcli2·perccli2, ssacli, arcconf) 캐시·배터리·구성 디스크 판정
-- [x] 구축 전 점검: 벤치 결과로 ES 운영 기준 충족 여부 판정
 - [ ] esxtop 출력 대조 가이드
 - [ ] baseline 비교 모드. 이전 번들과의 차이 표시
 - [ ] 리포트 영문 출력 옵션
@@ -697,7 +579,7 @@ RAID 컨트롤러가 논리 디스크의 `rotational` 을 1로 보고하는 경�
 
 - Elastic이나 VMware의 공식 제품이 아닙니다.
 - 진단 결과와 조치 안내만 제공하고 설정은 바꾸지 않습니다. 조치는 담당자가 검토하고 적용합니다.
-- `es_disk_bench.sh`만 예외로 실제 부하를 겁니다. vSAN, SAN 어레이, 클라우드 볼륨처럼 공유 스토리지라면 같은 스토리지를 쓰는 다른 VM·서버에도 영향이 갈 수 있습니다.
+- 부하를 걸거나 파일을 지우는 동작은 없습니다. 결과 디렉터리에 파일을 쓰는 것이 이 도구가 서버에 남기는 유일한 흔적입니다.
 
 ## 라이선스
 

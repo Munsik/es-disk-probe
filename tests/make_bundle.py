@@ -380,40 +380,12 @@ SCEN["bm_raid_storcli2_snake"] = dict(virt=BM_VIRT, hostdrv={"host0": "mpi3mr"},
 # 24) storcli 에 개수 필드가 함께 있는 형식
 SCEN["bm_raid_storcli_cnt"] = dict(SCEN["bm_raid_storcli"], raw={"raid_storcli": STORCLI_CNT_TXT})
 
-# 구축 전 점검: ES 부하 없이 es_disk_bench.sh 결과만 있는 경우.
-# fio 가 쓰는 JSON 모양("key" : value, 2칸 들여쓰기)을 흉내 낸다. 셸 요약이 이 모양을 그대로 읽어야 한다
-def fio_json(name, r_iops=0, r_bw=0, r_p99_ms=None, w_iops=0, w_bw=0, w_p99_ms=None, sync_p99_ms=None):
-    def side(iops, bw, p99):
-        d = {"io_bytes": 1, "bw": bw, "iops": iops, "clat_ns": {"min": 1, "mean": 1.0}}
-        if p99 is not None:
-            d["clat_ns"]["percentile"] = {"50.000000": int(p99 * 3e5), "99.000000": int(p99 * 1e6), "99.900000": int(p99 * 2e6)}
-        return d
-    job = {"jobname": name, "groupid": 0, "error": 0, "read": side(r_iops, r_bw, r_p99_ms), "write": side(w_iops, w_bw, w_p99_ms)}
-    if sync_p99_ms is not None:
-        job["sync"] = {"total_ios": 1000, "lat_ns": {"min": 1, "mean": 1.0, "percentile": {"99.000000": int(sync_p99_ms * 1e6)}}}
-    return _json.dumps({"fio version": "fio-3.35", "jobs": [job]}, indent=2, separators=(",", " : "))
-
-def bench_set(fsync_ms, rr1_ms, rr_iops=400000, seqw=2500, seqr=3000):
-    return {"fsync_4k": fio_json("fsync_4k", w_iops=3000, w_bw=12000, sync_p99_ms=fsync_ms),
-            "randread_4k_qd1": fio_json("randread_4k_qd1", r_iops=8000, r_bw=32000, r_p99_ms=rr1_ms),
-            "randread_4k": fio_json("randread_4k", r_iops=rr_iops, r_bw=rr_iops * 4, r_p99_ms=1.5),
-            "seqwrite_1m": fio_json("seqwrite_1m", w_iops=seqw, w_bw=seqw * 1024),
-            "seqread_1m": fio_json("seqread_1m", r_iops=seqr, r_bw=seqr * 1024)}
-
 _IDLE_NVME = [dev("sda", rot="0", qd="32", host="host0", vendor="ATA", model="MZ7L3480HCHQ", timeout="30", iops_r=2, iops_w=4),
               dev("nvme0n1", rot="0", lat_r=0.1, lat_w=0.05, iops_r=3, iops_w=5, aqu=0.1, inflight=0, util=1)]
-# 25) 구축 전, NVMe, 벤치 기준 충족
-SCEN["predeploy_ok"] = dict(SCEN["bm_nvme_ok"], devs=_IDLE_NVME, bench=bench_set(0.08, 0.12))
-# 26) 구축 전, NVMe 인데 동기 쓰기가 느림 (쓰기 캐시 보호가 없는 소비자용 장치 등)
-SCEN["predeploy_slow_fsync"] = dict(SCEN["bm_nvme_ok"], devs=_IDLE_NVME, bench=bench_set(4.5, 0.12))
-# 27) 구축 전, fio 없이 dd 만: 동기 쓰기 평균이 주의 수준
-SCEN["predeploy_dd"] = dict(SCEN["bm_nvme_ok"], devs=_IDLE_NVME, bench={
-    "fsync_4k": '{"engine": "dd", "jobs": [{"jobname": "fsync_4k", "write": {"iops": 800.0, "bw": 3200.0}}], "sync_avg_ms": 1.250}\n',
-    "seqwrite_1m": '{"engine": "dd", "jobs": [{"jobname": "seqwrite_1m", "write": {"iops": 1500.0, "bw": 1536000.0}}]}\n'})
-# 28) 부하가 낮고 벤치도 없음: 판정 보류
-SCEN["idle_nobench"] = dict(SCEN["bm_nvme_ok"], devs=_IDLE_NVME)
+# 25) 부하가 거의 없는 시간대: 성능 판정 보류
+SCEN["idle_low_load"] = dict(SCEN["bm_nvme_ok"], devs=_IDLE_NVME)
 
-# 29) ES 9.x 노드: merge 가 시작·끝 모두 대기열에 쌓임 + 벡터 rescoring direct IO 켜짐 (둘 다 참고 수준)
+# 26) ES 9.x 노드: merge 가 시작·끝 모두 대기열에 쌓임 + 벡터 rescoring direct IO 켜짐 (둘 다 참고 수준)
 def _es_stats(ts, mq, idx):
     return _json.dumps({"nodes": {"n1": {"timestamp": ts, "name": "es-hot-1",
         "indices": {"indexing": {"index_total": idx, "index_time_in_millis": idx // 10, "throttle_time_in_millis": 0},
@@ -424,15 +396,15 @@ SCEN["bm_es_merge_vector"] = dict(SCEN["bm_nvme_ok"], raw={
     "es_stats_start.json": _es_stats(1700000000000, 6, 100000),
     "es_stats_end.json": _es_stats(1700000120000, 9, 700000),
     "es_cmdline": "/usr/share/elasticsearch/jdk/bin/java -Xms16g -Xmx16g -Dvector.rescoring.directio=true org.elasticsearch.bootstrap.Elasticsearch\n"})
-# 30) VMware vSAN Hybrid (OSA): 향후 중단 예정 안내
+# 27) VMware vSAN Hybrid (OSA): 향후 중단 예정 안내
 SCEN["vmware_hybrid"] = dict(SCEN["vmware_ok"], storage="hybrid")
 
-# 31) RHEL 패키지 설치 ES (systemd PrivateTmp 로 mount namespace 만 다름): 컨테이너로 오판하면 안 됨.
+# 28) RHEL 패키지 설치 ES (systemd PrivateTmp 로 mount namespace 만 다름): 컨테이너로 오판하면 안 됨.
 #     실제 UTM Rocky 9 + ES 8.19 번들에서 발견. 0.10.0 초기 수집기는 es_in_container=1 로 기록했다
 SCEN["rhel_service_ns"] = dict(SCEN["kvm_slow"], meta_extra="es_in_container=1\n",
     raw={"es_cgroup": "0::/system.slice/elasticsearch.service\n"})
 
-# 32) 인덱스 설정: 실제 ES 가 돌려주는 중첩 모양 (flat_settings 없이 filter_path). async 인덱스를 찾아야 함
+# 29) 인덱스 설정: 실제 ES 가 돌려주는 중첩 모양 (flat_settings 없이 filter_path). async 인덱스를 찾아야 함
 SCEN["idx_settings_nested"] = dict(SCEN["bm_nvme_ok"], raw={"es_idx_settings.json": _json.dumps(
     {"logs-a": {"settings": {"index": {"translog": {"durability": "async", "sync_interval": "30s"}}}},
      "loadtest": {"settings": {"index": {"refresh_interval": "30s"}}}})})
@@ -557,10 +529,6 @@ def build(name, out):
         w(S("mdstat"), sc["mdstat"])
     for fn, text in (sc.get("raw") or {}).items():
         w(S(fn), text)
-    if sc.get("bench"):
-        os.makedirs(os.path.join(out, "bench"), exist_ok=True)
-        for fn, text in sc["bench"].items():
-            w(os.path.join(out, "bench", fn + ".json"), text)
     if sc.get("data_paths"):
         w(S("data_paths"), "\n".join(sc["data_paths"]) + "\n")
     if sc.get("datadev"):

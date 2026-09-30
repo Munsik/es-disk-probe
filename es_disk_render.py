@@ -11,7 +11,7 @@ es_disk_collect.sh 가 만든 번들(디렉터리 또는 .tar.gz)을 읽어
 사용:
   python3 es_disk_render.py <번들 디렉터리 | 번들.tar.gz> [-o report.html]
                             [--platform auto|vmware|baremetal|vm]
-                            [--storage auto|allflash|hybrid|nvme|ssd|hdd] [--bench <es_disk_bench 결과 디렉터리>]
+                            [--storage auto|allflash|hybrid|nvme|ssd|hdd]
 """
 import argparse, html, json, os, re, sys, tarfile, tempfile, datetime
 
@@ -1160,38 +1160,6 @@ def parse_sar(text, wanted_devs):
     return days
 
 # ─────────────────────────────────────────────────────────────────────────────
-# fio 벤치 결과
-# ─────────────────────────────────────────────────────────────────────────────
-def load_bench(d):
-    res = {}
-    if not d or not os.path.isdir(d):
-        return res
-    for f in sorted(os.listdir(d)):
-        if not f.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(d, f)) as fh:
-                j = json.load(fh)
-            job = j["jobs"][0]
-            name = f[:-5]
-            def lat99(side):
-                pc = dig(job, side, "clat_ns", "percentile") or {}
-                v = pc.get("99.000000")
-                return v / 1e6 if v else None
-            res[name] = {
-                "r_iops": dig(job, "read", "iops"), "w_iops": dig(job, "write", "iops"),
-                "r_mbs": (dig(job, "read", "bw") or 0) / 1024.0, "w_mbs": (dig(job, "write", "bw") or 0) / 1024.0,
-                "r_p99": lat99("read"), "w_p99": lat99("write"),
-                "sync_p99": (dig(job, "sync", "lat_ns", "percentile") or {}).get("99.000000"),
-                "sync_avg": j.get("sync_avg_ms"), "engine": j.get("engine", "fio"),
-            }
-            if res[name]["sync_p99"]:
-                res[name]["sync_p99"] /= 1e6
-        except Exception:
-            continue
-    return res
-
-# ─────────────────────────────────────────────────────────────────────────────
 # 클러스터 관점 분석 (es_cluster_probe.sh 결과)
 # ─────────────────────────────────────────────────────────────────────────────
 def analyze_cluster(cdir, add, th, kind="unknown"):
@@ -1407,7 +1375,7 @@ class Finding(object):
         self.sev, self.dim, self.owner = sev, dim, owner
         self.title, self.evidence, self.why, self.action, self.source = title, evidence, why, action, source
 
-def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platform_override=None):
+def analyze(base, storage_override=None, cluster_dir=None, platform_override=None):
     S = os.path.join(base, "static")
     meta = kv(rd(base, "meta"))
     es_pid = meta.get("es_pid", "")
@@ -3193,69 +3161,6 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
                 "해당 시각의 배치·스냅샷·백업{} 작업 이력을 대조하고, 같은 시간대에 이 도구로 재측정하세요.".format(
                     "·" + VMB if is_vmware else ("·RAID 점검(patrol read, consistency check)" if kind == "baremetal" else "")), "sysstat sar 이력")
 
-    # ═════════════ 10. 벤치(선택) → 여유율 ═════════════
-    # 수집기가 번들에 넣어 둔 벤치 결과가 있으면 --bench 없이도 쓴다
-    if not bench_dir and os.path.isdir(os.path.join(base, "bench")):
-        bench_dir = os.path.join(base, "bench")
-    bench = load_bench(bench_dir)
-    headroom = []
-    # 구축 전 적합성: 부하와 무관하게 스토리지 자체가 ES 의 두 가지 기본 동작을 기준 안에서 처리하는지.
-    # translog fsync(요청마다 동기 쓰기)와 page cache 에 없는 데이터 한 건 읽기. 둘 다 동시성 1 의 단건 지연이라
-    # 장치 기대 지연(KB 424485 등)과 같은 판정 기준(th)을 그대로 쓸 수 있다
-    PRE, bench_sev = [], "na"
-    def bsev(v):
-        return "warn" if v >= th["warn"] else ("caution" if v >= th["caution"] else "ok")
-    if bench:
-        def hr(label, obs, cap, unit):
-            if obs is not None and cap:
-                headroom.append((label, obs, cap, 100.0 * obs / cap, unit))
-        b = bench
-        hr("무작위 읽기 IOPS (검색)", A["rs_p95"], (b.get("randread_4k") or {}).get("r_iops"), "IOPS")
-        hr("순차 쓰기 처리량 (flush·merge)", A["wmb_p95"], (b.get("seqwrite_1m") or {}).get("w_mbs"), "MB/s")
-        hr("순차 읽기 처리량 (merge·복구)", A["rmb_p95"], (b.get("seqread_1m") or {}).get("r_mbs"), "MB/s")
-        hr("혼합 쓰기 IOPS", A["ws_p95"], (b.get("randrw_16k") or {}).get("w_iops"), "IOPS")
-        fs_ = b.get("fsync_4k") or {}
-        sync_v = fs_.get("sync_p99") or fs_.get("sync_avg")
-        if sync_v:
-            PRE.append(("동기 쓰기 4KiB 한 건 (translog fsync)", "{} {}".format("p99" if fs_.get("sync_p99") else "평균(dd)", fmt(sync_v, 2, " ms")),
-                        "주의 {} / 경고 {} ms".format(th["caution"], th["warn"]), bsev(sync_v),
-                        "bulk 요청 한 번이 최소로 기다리는 시간"))
-        rr1 = (b.get("randread_4k_qd1") or {}).get("r_p99")
-        if rr1:
-            PRE.append(("무작위 읽기 4KiB 한 건 (cache miss 검색)", "p99 " + fmt(rr1, 2, " ms"),
-                        "주의 {} / 경고 {} ms".format(th["caution"], th["warn"]), bsev(rr1),
-                        "page cache 에 없는 segment 를 읽을 때 한 번 기다리는 시간"))
-            if rr1 >= th["caution"]:
-                add(bsev(rr1), "지연", OUT if kind == "baremetal" else "원인 분리 필요",
-                    "무작위 읽기 한 건 지연이 기준보다 큼 (벤치 p99 {})".format(fmt(rr1, 2, "ms")),
-                    "4KiB 무작위 읽기, 동시성 1, p99 {} · 판정 기준 주의 {}ms".format(fmt(rr1, 2, "ms"), th["caution"]),
-                    "검색이 page cache 에 없는 데이터를 읽을 때마다 이 시간을 기다립니다. 부하와 상관없는 장치·경로 자체의 지연입니다.",
-                    "매체(HDD 여부), RAID·스토리지 경로, 공유 스토리지의 다른 부하를 확인하세요. 검색 위주 노드라면 더 빠른 매체를 검토합니다.",
-                    "es_disk_bench.sh (fio randread psync iodepth 1). 기준은 이 리포트의 판정 기준과 같음 [실무 기준]")
-        if (b.get("randread_4k") or {}).get("r_iops"):
-            PRE.append(("무작위 읽기 최대 IOPS (동시 128)", fmt(b["randread_4k"]["r_iops"], 0), "참고값", "info", "여러 검색이 동시에 디스크를 읽을 때의 상한"))
-        if (b.get("seqwrite_1m") or {}).get("w_mbs"):
-            PRE.append(("순차 쓰기 처리량", fmt(b["seqwrite_1m"]["w_mbs"], 0, " MB/s"), "참고값", "info", "segment flush·merge·복구 쓰기의 상한"))
-        if (b.get("seqread_1m") or {}).get("r_mbs"):
-            PRE.append(("순차 읽기 처리량", fmt(b["seqread_1m"]["r_mbs"], 0, " MB/s"), "참고값", "info", "merge·샤드 복구 읽기의 상한"))
-        judged = [r_[3] for r_ in PRE if r_[3] in ("ok", "caution", "warn")]
-        bench_sev = sev_max(*judged) if judged else "na"
-        if sync_v and sync_v >= th["caution"]:
-            add("warn" if sync_v >= th["warn"] else "caution", "지연", OUT if kind == "baremetal" else "원인 분리 필요",
-                "동기 쓰기(fsync) 한 건 지연이 기준보다 큼 (벤치 {} {})".format("p99" if fs_.get("sync_p99") else "평균", fmt(sync_v, 2, "ms")),
-                "4KiB 동기 쓰기 {} {} · 판정 기준 주의 {}ms".format("p99" if fs_.get("sync_p99") else "평균", fmt(sync_v, 2, "ms"), th["caution"]),
-                "ES 기본 설정은 bulk 요청마다 translog 를 fsync 합니다. 이 값이 크면 부하와 상관없이 인덱싱 요청 한 번의 최소 시간이 길어집니다.",
-                "장치의 쓰기 캐시 보호(전원 차단 보호 SSD, 배터리 보호 RAID 캐시)와 스토리지 쓰기 경로를 확인하세요.",
-                "es_disk_bench.sh (fio fdatasync 또는 dd oflag=dsync), [Elastic 공식] Translog settings")
-        worst_hr = max([h[3] for h in headroom] or [0])
-        if worst_hr >= 60:
-            s = "warn" if worst_hr >= 80 else "caution"
-            add(s, "포화", "원인 분리 필요", "측정 최대 능력 대비 사용률 {:.0f}%".format(worst_hr),
-                ", ".join("{} {:.0f}%".format(h[0], h[3]) for h in headroom),
-                "평상시 피크가 이미 최대 능력의 60~80%를 쓰고 있으면 merge·복구가 겹칠 때 여유가 없습니다.",
-                "피크 증가 추세를 보고 노드·VMDK 증설을 계획하세요.", "fio 벤치 결과 (es_disk_bench.sh)")
-
-
     # ═════════════ Best practice 대조표 (통과 항목 포함 전체) ═════════════
     BP = []
     def bp(cat, item, rec, cur, st, src):
@@ -3561,24 +3466,10 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
     elif SEV_ORDER.get(es_sev, 0) >= SEV_ORDER["warn"] and disk_clean:
         verdict = ("risk", "ES에 처리 지연 신호가 있지만, 디스크 응답은 정상입니다",
                    "인덱싱 스로틀이나 요청 거절이 관측됐지만 같은 시간 디스크 응답시간은 기준 안이었습니다. 디스크보다는 CPU·heap·bulk 크기·샤드 설계 쪽 원인일 가능성이 큽니다.")
-    elif low_load and SEV_ORDER.get(runtime, 0) <= SEV_ORDER["caution"] and bench_sev != "na":
-        # 부하가 없는 상태(구축 전, 점검 시간) + 벤치 결과: 스토리지 자체가 ES 기준을 충족하는지로 판정
-        if bench_sev == "warn":
-            verdict = ("risk", "부하 전 점검: 스토리지가 ES 기준보다 느립니다",
-                       "ES 를 올리기 전 벤치에서 동기 쓰기 또는 무작위 읽기 한 건 지연이 판정 기준의 경고 수준이었습니다. "
-                       "부하가 붙으면 인덱싱·검색 지연으로 바로 드러납니다. 아래 'ES 운영 기준 대조'와 조치를 먼저 확인하세요.")
-        elif bench_sev == "caution" or SEV_ORDER.get(latent, 0) >= SEV_ORDER["warn"]:
-            verdict = ("risk", "부하 전 점검: 대체로 충족하지만 확인할 항목이 있습니다",
-                       "벤치로 잰 단건 지연이 기준 근처이거나, 운영 전에 바로잡을 설정·구성이 있습니다. 아래 항목을 확인하세요.")
-        else:
-            verdict = ("good", "부하 전 점검: 스토리지가 ES 기준을 충족합니다",
-                       "벤치로 잰 동기 쓰기·무작위 읽기 한 건 지연이 기준 안이고 구성상 위험도 없습니다. "
-                       "벤치 파일이 캐시에 들어가면 실제보다 좋게 나오므로, 운영 투입 후 피크 시간대에 한 번 더 수집하세요.")
     elif low_load and SEV_ORDER.get(runtime, 0) <= SEV_ORDER["caution"]:
         verdict = ("hold", "설정 점검은 완료, 성능 판정은 보류합니다",
                    "측정 시간대의 디스크 부하가 낮아(p95 {} IOPS, {} MB/s) 디스크가 부하를 견디는지 판단할 근거가 부족합니다. "
-                   "인덱싱·검색 피크 시간대에 다시 측정하세요. 구축 전이라면 es_disk_bench.sh 를 먼저 돌린 뒤 다시 수집하면 "
-                   "ES 기준 충족 여부를 판정합니다.".format(fmt(A["iops_p95"], 0), fmt(A["mb_p95"], 1)))
+                   "인덱싱·검색 피크 시간대에 다시 측정하세요.".format(fmt(A["iops_p95"], 0), fmt(A["mb_p95"], 1)))
     elif SEV_ORDER.get(latent, 0) >= SEV_ORDER["warn"] or SEV_ORDER.get(runtime, 0) == SEV_ORDER["caution"]:
         verdict = ("risk", "지금은 버티고 있지만 위험 요인이 있습니다",
                    "측정 구간의 디스크 응답은 심각하지 않지만, 부하가 늘거나 호스트 자원이 부족해지면 문제가 될 설정·구성이 있습니다.")
@@ -3650,8 +3541,8 @@ def analyze(base, storage_override=None, bench_dir=None, cluster_dir=None, platf
         "ncpu": ncpu, "mem_gb": mem_total_mb / 1024.0, "path_map": path_map, "phys": phys, "logical": logical,
         "dev_guess": dev_guess, "A": A, "dev_stats": dev_stats, "log_stats": log_stats, "topo": topo,
         "agg": agg, "sysr": sysr, "findings": F, "dims": dims, "verdict": verdict, "n_act": n_act,
-        "low_load": low_load, "klog": klog, "hist": hist, "es_rows": es_rows, "headroom": headroom,
-        "bench": bench, "PRE": PRE, "bench_sev": bench_sev, "overhead": overhead, "sysctl": sysctl, "virt": virt, "drivers": drivers,
+        "low_load": low_load, "klog": klog, "hist": hist, "es_rows": es_rows,
+        "overhead": overhead, "sysctl": sysctl, "virt": virt, "drivers": drivers,
         "CL": CL, "IDX": IDX, "BP": BP, "top": top, "q_ceiling": q_ceiling, "net_sev": net_sev, "nets": nets, "netinfo": netinfo, "dur": dur, "qd_total": qd_total, "qratio": qratio,
     }
 
@@ -3942,48 +3833,18 @@ def render(R, out_path):
             h.append('<tr><td>{}</td><td class="n">{}</td><td class="note">{}</td></tr>'.format(E(a), E(b), E(c)))
         h.append('</table>')
 
-    # 구축 전 적합성 (벤치가 있을 때)
-    if R.get("PRE"):
-        h.append('<h2>ES 운영 기준 대조 (벤치)</h2><p class="lead">es_disk_bench.sh 로 잰 스토리지 자체의 능력입니다. '
-                 '위 두 줄은 동시성 1 의 한 건 지연이라 부하와 상관없이 ES 의 기본 동작(요청마다 translog 동기 쓰기, '
-                 'page cache 에 없는 데이터 읽기)이 최소로 기다리는 시간이고, 이 리포트의 판정 기준({})으로 판정합니다. '
-                 '벤치 파일이 컨트롤러·스토리지 캐시에 들어가면 실제보다 좋게 나옵니다.</p>'.format(E(STORAGE_LABEL.get(R.get("storage"), ""))))
-        h.append('<table><tr><th>항목</th><th>측정값</th><th>기준</th><th>판정</th><th>의미</th></tr>')
-        for it, val, crit, st, why in R["PRE"]:
-            h.append('<tr><td>{}</td><td class="n">{}</td><td>{}</td><td class="s-{}"><b>{}</b></td><td class="note">{}</td></tr>'.format(
-                E(it), E(val), E(crit), st, SEV_LABEL.get(st, st), E(why)))
-        h.append('</table>')
-    # 여유율
-    if R["headroom"]:
-        h.append('<h2>최대 능력 대비 사용률</h2><p class="lead">es_disk_bench.sh로 잰 최대 능력{}과 이번 측정의 p95를 비교했습니다. {}</p>'.format(
-            "(" + E(os.path.basename(meta.get("bench_src", ""))) + ")" if meta.get("bench_src") else "",
-            ("vSAN 캐시 계층이나 스토리지 캐시에" if R.get("vmbk") != "ds" else "스토리지 어레이 캐시에") + " 벤치 파일이 들어가면 최대 능력이 실제보다 높게 나오므로 사용률은 낙관적인 값입니다." if kind == "vmware" else
-            "RAID 컨트롤러·스토리지 캐시에 벤치 파일이 들어가면 최대 능력이 실제보다 높게 나오므로 사용률은 낙관적인 값입니다."))
-        h.append('<table><tr><th>항목</th><th>관측 p95</th><th>측정 최대</th><th>사용률</th></tr>')
-        for l, o, c, p, u in R["headroom"]:
-            s = "warn" if p >= 80 else "caution" if p >= 60 else "ok"
-            h.append('<tr><td>{}</td><td class="n">{}</td><td class="n">{}</td><td class="n s-{}"><b>{:.0f}%</b></td></tr>'.format(E(l), fmt(o, 1, " " + u), fmt(c, 1, " " + u), s, p))
-        h.append('</table>')
-        sync = (R["bench"].get("fsync_4k") or {})
-        if sync.get("sync_p99") or sync.get("w_p99"):
-            h.append('<p class="note">동기 쓰기(fdatasync) p99 {}. translog를 요청마다 fsync하는 기본 설정(durability: request)에서 인덱싱 요청 한 번이 최소로 기다리는 시간입니다.</p>'.format(
-                fmt(sync.get("sync_p99") or sync.get("w_p99"), 2, " ms")))
-        elif sync.get("sync_avg"):
-            h.append('<p class="note">동기 쓰기(dd oflag=dsync, 4KiB) 평균 {}. translog를 요청마다 fsync하는 기본 설정에서 인덱싱 요청 한 번이 최소로 기다리는 시간에 해당합니다. '
-                     'fio 가 없어 dd 로 쟀기 때문에 무작위 I/O 능력은 측정하지 않았습니다.</p>'.format(fmt(sync["sync_avg"], 2, " ms")))
+    # 한계 추정 (부하 테스트 없이 계산할 수 있는 큐 기준 이론 상한)
+    h.append('<h2>한계 추정</h2><p class="lead">부하 테스트 없이 계산할 수 있는 것은 "{} 큐 기준 상한"까지입니다. 동시에 처리할 수 있는 요청 수(queue_depth 합계)를 1건 평균 처리 시간으로 나눈 값입니다. '
+             '실제로는 부하가 늘면 처리 시간도 늘고 {} 먼저 막히므로, 이 값은 <b>넘을 수 없는 상한</b>이지 도달 가능한 값이 아닙니다.</p>'.format(
+                 "장치" if kind == "baremetal" else "가상 디스크",
+                 {"vmware": "vSAN 쪽이" if R.get("vmbk") == "vsan" else "스토리지 쪽이", "baremetal": "디스크 자체가"}.get(kind, "스토리지 백엔드가")))
+    if R.get("q_ceiling"):
+        use = 100.0 * (A["iops_p95"] or 0) / R["q_ceiling"]
+        h.append('<table><tr><th>항목</th><th>값</th></tr><tr><td>{} 큐 기준 이론 상한</td><td class="n">{}</td></tr>'
+                 '<tr><td>이번 측정 p95</td><td class="n">{}</td></tr><tr><td>상한 대비 사용</td><td class="n"><b>{:.0f}%</b></td></tr></table>'.format(
+                     "OS" if kind == "baremetal" else "Guest", fmt(R["q_ceiling"], 0, " IOPS"), fmt(A["iops_p95"], 0, " IOPS"), use))
     else:
-        h.append('<h2>한계 추정</h2><p class="lead">부하 테스트 없이 계산할 수 있는 것은 "{} 큐 기준 상한"까지입니다. 동시에 처리할 수 있는 요청 수(queue_depth 합계)를 1건 평균 처리 시간으로 나눈 값입니다. '
-                 '실제로는 부하가 늘면 처리 시간도 늘고 {} 먼저 막히므로, 이 값은 <b>넘을 수 없는 상한</b>이지 도달 가능한 값이 아닙니다.</p>'.format(
-                     "장치" if kind == "baremetal" else "가상 디스크",
-                     {"vmware": "vSAN 쪽이" if R.get("vmbk") == "vsan" else "스토리지 쪽이", "baremetal": "디스크 자체가"}.get(kind, "스토리지 백엔드가")))
-        if R.get("q_ceiling"):
-            use = 100.0 * (A["iops_p95"] or 0) / R["q_ceiling"]
-            h.append('<table><tr><th>항목</th><th>값</th></tr><tr><td>{} 큐 기준 이론 상한</td><td class="n">{}</td></tr>'
-                     '<tr><td>이번 측정 p95</td><td class="n">{}</td></tr><tr><td>상한 대비 사용</td><td class="n"><b>{:.0f}%</b></td></tr></table>'.format(
-                         "OS" if kind == "baremetal" else "Guest", fmt(R["q_ceiling"], 0, " IOPS"), fmt(A["iops_p95"], 0, " IOPS"), use))
-        else:
-            h.append('<p class="note">측정 구간의 I/O가 적거나 queue_depth를 읽지 못해 계산하지 않았습니다.</p>')
-        h.append('<p class="note">실제 한계는 서비스 투입 전이나 점검 시간에 <code>es_disk_bench.sh</code>로 재고 <code>--bench</code> 옵션으로 넣으면 "최대 능력 대비 사용률"이 이 자리에 표시됩니다.</p>')
+        h.append('<p class="note">측정 구간의 I/O가 적거나 queue_depth를 읽지 못해 계산하지 않았습니다.</p>')
 
     # 클러스터 관점
     CL = R.get("CL")
@@ -4304,7 +4165,6 @@ def main():
     ap.add_argument("-o", "--out")
     ap.add_argument("--storage", choices=["auto", "allflash", "hybrid", "nvme", "ssd", "hdd"])
     ap.add_argument("--platform", choices=["auto", "vmware", "baremetal", "vm"])
-    ap.add_argument("--bench")
     ap.add_argument("--cluster")
     a = ap.parse_args()
     if a.cluster_only:
@@ -4316,7 +4176,7 @@ def main():
     if not a.bundle:
         ap.error("노드 번들 경로 또는 --cluster-only <클러스터 번들> 이 필요합니다")
     base = open_bundle(a.bundle)
-    R = analyze(base, None if a.storage == "auto" else a.storage, a.bench, a.cluster, a.platform)
+    R = analyze(base, None if a.storage == "auto" else a.storage, a.cluster, a.platform)
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.bundle)), "es_disk_report_{}.html".format(R["meta"].get("host", "node")))
     render(R, out)
     print(out)

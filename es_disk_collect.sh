@@ -3,7 +3,9 @@
 # es_disk_collect.sh  (v0.10.0)
 # Elasticsearch 노드 Disk I/O 진단: 데이터 수집기 (READ-ONLY)
 #
-#  - 시스템 설정을 바꾸지 않습니다. /proc, /sys 읽기와 ES 조회 API 호출만 합니다.
+#  - 시스템 설정을 바꾸지 않습니다. /proc, /sys 읽기와 ES 조회 API(GET) 호출만 합니다.
+#  - 파일을 쓰는 곳은 결과 디렉터리 하나뿐이고(ES data 와 다른 디스크를 자동 선택), 무엇도 지우지 않습니다.
+#  - 디스크에 부하를 거는 테스트는 하지 않습니다. 운영 중 실제 부하를 그대로 측정합니다.
 #  - 외부 패키지 불필요 (bash, awk, coreutils). iostat/sysstat 없어도 동작합니다.
 #  - 샘플링 1회당 프로세스 fork는 awk 1개뿐입니다. 자기 자신은 nice 19 / ionice idle.
 #  - drop_caches, fio, dd, sync 같은 부하·캐시 파괴 동작은 하지 않습니다.
@@ -171,11 +173,10 @@ HOST=$(hostname 2>/dev/null || echo unknown)
 TS=$(date +%Y%m%d_%H%M%S)
 OUT="$OUT_BASE/esdisk_${HOST}_${TS}"
 S="$OUT/static"
+# 출력 위치 여유 공간 (50MB 미만이면 중단. 서비스 디스크를 채우지 않으려고). 디렉터리를 만들기 전에 본다
+AVAIL_KB=$(df -Pk "$OUT_BASE" 2>/dev/null | awk 'NR==2{print $4}')
+[[ "${AVAIL_KB:-0}" -lt 51200 ]] && { echo "출력 경로 여유 공간 부족 (<50MB): $OUT_BASE"; exit 1; }
 mkdir -p "$S" || { echo "출력 디렉터리 생성 실패: $OUT"; exit 1; }
-
-# 출력 위치 여유 공간 (50MB 미만이면 중단. 서비스 디스크를 채우지 않으려고)
-AVAIL_KB=$(df -Pk "$OUT_BASE" | awk 'NR==2{print $4}')
-[[ "${AVAIL_KB:-0}" -lt 51200 ]] && { echo "출력 경로 여유 공간 부족 (<50MB): $OUT_BASE"; rm -rf "$OUT"; exit 1; }
 
 cat > "$OUT/meta" <<EOF
 tool_version=$VERSION
@@ -398,11 +399,12 @@ find_tool() {
   done
   return 1
 }
-# 벤더 도구는 실행 디렉터리에 로그 파일을 남기는 것이 있어(storcli.log, UcliEvt.log) 임시 디렉터리에서 돌리고 지운다
+# 벤더 도구는 실행 디렉터리에 로그 파일을 남기는 것이 있다(storcli.log, UcliEvt.log).
+# 서버의 다른 곳에 남지 않도록 결과 디렉터리 안(hw_tool_logs)에서 실행하고, 지우지 않고 번들에 함께 넣는다
 hw_run() {  # $1=출력 파일, 나머지=명령
   local out="$1"; shift
-  mkdir -p "$OUT/.hwtmp"
-  { echo "#CMD $*"; (cd "$OUT/.hwtmp" && timeout 30 "$@" 2>&1 | head -c 4194304); echo; } >> "$out"
+  mkdir -p "$OUT/hw_tool_logs"
+  { echo "#CMD $*"; (cd "$OUT/hw_tool_logs" && timeout 30 "$@" 2>&1 | head -c 4194304); echo; } >> "$out"
 }
 RAID_TOOLS=""
 if [[ $HW -eq 1 && $IS_BARE -eq 1 ]]; then
@@ -455,7 +457,6 @@ if [[ $HW -eq 1 && $IS_BARE -eq 1 ]]; then
       RAID_TOOLS+="arcconf "
     elif [[ "$DRVS" == *" aacraid "* ]]; then echo "#TOOL_ABSENT arcconf" > "$S/raid_arcconf"; fi
   fi
-  rm -rf "$OUT/.hwtmp"
 fi
 echo "raid_tools=$RAID_TOOLS" >> "$OUT/meta"
 
@@ -824,17 +825,6 @@ for dp in ${DATA_PATHS[@]+"${DATA_PATHS[@]}"}; do
     break
   fi
 done
-
-# es_disk_bench.sh 로 이 서버에서 잰 결과가 있으면 번들에 함께 넣는다 (최근 180일, 가장 최신 1건).
-# 리포트에 "최대 능력 대비 사용률"이 자동으로 나오고, --bench 로 따로 연결하지 않아도 된다
-BENCH_SRC=$(for d in "$OUT_BASE" /tmp /var/tmp; do
-              find "$d" -maxdepth 1 -type d -name "esbench_${HOST}_*" -mtime -180 -printf '%T@\t%p\n' 2>/dev/null
-            done | sort -rn | head -1 | cut -f2-)
-if [[ -n "$BENCH_SRC" ]] && ls "$BENCH_SRC"/*.json >/dev/null 2>&1; then
-  mkdir -p "$OUT/bench" && cp "$BENCH_SRC"/*.json "$OUT/bench/" 2>/dev/null
-  echo "bench_src=$BENCH_SRC" >> "$OUT/meta"
-  msg "벤치 결과를 함께 넣었습니다: $BENCH_SRC"
-fi
 
 # =============================================================================
 # 4. 번들 + HTML
