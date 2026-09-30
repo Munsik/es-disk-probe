@@ -35,6 +35,11 @@ class Msg(str):
         m.key = self.key
         return m
 
+    def __add__(self, other):
+        m = Msg(str.__add__(self, other))
+        m.key = self.key
+        return m
+
 
 def _unesc(s):
     out, i = [], 0
@@ -1431,6 +1436,9 @@ class Finding(object):
     def __init__(self, sev, dim, owner, title, evidence, why, action, source):
         self.sev, self.dim, self.owner = sev, dim, owner
         self.title, self.evidence, self.why, self.action, self.source = title, evidence, why, action, source
+        # 언어와 무관한 식별자: 제목 문구의 카탈로그 키, 담당자 키 (테스트와 비교에 쓴다)
+        self.id = getattr(title, "key", None)
+        self.owner_id = getattr(owner, "key", None)
 
 def analyze(base, storage_override=None, cluster_dir=None, platform_override=None):
     S = os.path.join(base, "static")
