@@ -1193,7 +1193,7 @@ def parse_sar(text, wanted_devs):
                 cur_day = m.group(1)
             continue
         p = line.split()
-        if not p or p[0].startswith("Average") or p[0].startswith(T("r.0039")):
+        if not p or p[0].startswith(("Average", "\ud3c9\uade0")):   # sar summary line (en, ko locale). Data, not UI text
             continue
         tok = 2 if len(p) > 1 and p[1] in ("AM", "PM") else 1
         if len(p) <= tok or not TIME_RE.match(" ".join(p[:tok])):
@@ -1314,7 +1314,7 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
             over.append((r, lim, lab))
     if over:
         sev = "crit" if any(r["used_pct"] >= lim for r, lim, _ in over) else "caution"
-        add(sev, T("r.0041"), T("r.0051"), T("r.0052"),
+        add(sev, T("r.0041"), T("r.own_es"), T("r.0052"),
             ", ".join("{} {:.0f}% (high {})".format(r["name"], r["used_pct"], lab) for r, lim, lab in over[:6]),
             T("r.0053"),
             T("r.0054"),
@@ -1365,13 +1365,13 @@ def analyze_cluster(cdir, add, th, kind="unknown"):
                 T("r.0076"),
                 T("r.0077"))
         elif kind == "baremetal":
-            add("info", T("r.0041"), T("r.0051"), T("r.0073"),
+            add("info", T("r.0041"), T("r.own_es"), T("r.0073"),
                 T("r.0074").format(len(data_rows)),
                 T("r.0078"),
                 T("r.0079"),
                 T("r.0077"))
         else:
-            add("info", T("r.0041"), T("r.0051"), T("r.0073"),
+            add("info", T("r.0041"), T("r.own_es"), T("r.0073"),
                 T("r.0074").format(len(data_rows)),
                 T("r.0080"),
                 T("r.0081"),
@@ -2158,7 +2158,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         hr = heap_mb / mem_total_mb
         if hr > 0.5 or heap_big:
             mem_sevs.append("caution")
-            add("caution", T("r.0373"), T("r.0051"), T("r.0385"),
+            add("caution", T("r.0373"), T("r.own_es"), T("r.0385"),
                 "heap {} / RAM {} ({:.0f}%)".format(fmt(heap_mb / 1024, 1, "GB"), fmt(mem_total_mb / 1024, 1, "GB"), hr * 100),
                 T("r.0386")
                 + (T("r.0387") if coops == "false" else ""),
@@ -2347,12 +2347,12 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             lim_pct = lim_pct or 90
             if use >= lim_pct:
                 cfg_sevs.append("crit")
-                add("crit", T("r.0405"), T("r.0051"), T("r.0474"), "{} {}% (high {})".format(p[5], int(use), hi),
+                add("crit", T("r.0405"), T("r.own_es"), T("r.0474"), "{} {}% (high {})".format(p[5], int(use), hi),
                     T("r.0475"), T("r.0476"),
                     T("r.0055"))
             elif use >= lim_pct - 10:
                 cfg_sevs.append("caution")
-                add("caution", T("r.0405"), T("r.0051"), T("r.0477"), "{} {}% (high {})".format(p[5], int(use), hi),
+                add("caution", T("r.0405"), T("r.own_es"), T("r.0477"), "{} {}% (high {})".format(p[5], int(use), hi),
                     T("r.0478"), T("r.0479"), T("r.0055"))
     # OS와 data가 같은 장치/컨트롤러
     root = mount_for("/", mounts)
@@ -2516,7 +2516,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
                 ttl = T("r.0536")
                 tail = (T("r.0537").format(
                     T("r.0538") if unsure else T("r.0539")))
-            add("caution", T("r.0051"), T("r.0051"), ttl,
+            add("caution", T("r.0051"), T("r.own_es"), ttl,
                 T("r.0540").format(
                     len([k for k, v in mtc.items() if str(v) == "1"]),
                     T("r.0541") + ", ".join(sorted(not_one)[:4]) + ")" if not_one else "",
@@ -2718,7 +2718,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
     same_repo = [r_ for r_ in sorted(set(repos)) if phys_of_path(r_) & phys_set]
     if same_repo and not dev_guess:
         cfg_sevs.append("caution")
-        add("caution", T("r.0405"), T("r.0051"), T("r.0597"), ", ".join(same_repo),
+        add("caution", T("r.0405"), T("r.own_es"), T("r.0597"), ", ".join(same_repo),
             T("r.0598"),
             T("r.0599"), T("r.0600"))
     if logs_p and (phys_of_path(logs_p) & phys_set) and not dev_guess:
@@ -3367,7 +3367,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
             med = pctl(vals, 0.5)
             if mine and med and mine >= med * 1.3:
                 loaded = SEV_ORDER.get(lat_sev, 0) >= SEV_ORDER["caution"] or SEV_ORDER.get(sat_sev, 0) >= SEV_ORDER["caution"]
-                add("warn" if loaded else "info", T("r.0041"), T("r.0051") if loaded else T("r.0013"),
+                add("warn" if loaded else "info", T("r.0041"), T("r.own_es") if loaded else T("r.0013"),
                     T("r.0908") + (T("r.0909") if loaded else ""),
                     T("r.0910").format(
                         me_name, mine, med, SEV_LABEL.get(lat_sev, lat_sev), SEV_LABEL.get(sat_sev, sat_sev)),
@@ -3412,7 +3412,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
         tot = sum(r["docs"] for r in IDX) or 1
         top = IDX[0]
         if top["docs"] / float(tot) > 0.5 and top["docs"] > 1000:
-            add("info", T("r.0339"), T("r.0051"), T("r.0936"),
+            add("info", T("r.0339"), T("r.own_es"), T("r.0936"),
                 T("r.0937").format(
                     top["index"], 100.0 * top["docs"] / tot, int(top["docs"]),
                     " · ILM phase {}".format(top["phase"]) if top["phase"] else ""),
@@ -3489,7 +3489,7 @@ def analyze(base, storage_override=None, cluster_dir=None, platform_override=Non
     top = [f for f in F if f.title.startswith(T("r.0960")) and SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["caution"]][:1]
     # 클러스터 교차 판정은 "누가 움직여야 하는가"를 바꾸므로 개별 설정 항목보다 앞에 둔다
     top += [f for f in F if f.dim == T("r.0041") and SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["warn"] and f not in top][:2 - len(top)]
-    act_owner = (OUT, T("r.0148"), T("r.0051"))
+    act_owner = (OUT, T("r.0148"), T("r.own_es"))
     top += sorted([f for f in F if f.owner in act_owner and SEV_ORDER.get(f.sev, 0) >= SEV_ORDER["caution"] and f not in top],
                   key=lambda f: -SEV_ORDER.get(f.sev, 0))[:3 - len(top)]
 
@@ -4045,6 +4045,10 @@ def render_cluster_only(cdir, out_path):
 
 
 
+# 차트 스크립트. 화면 문구 두 개만 카탈로그에서 넣는다
+JS_SRC = '\nfunction chart(id, series, ths, unit){\n  const el=document.getElementById(id); if(!el) return;\n  const svg=el.querySelector(\'svg\'), ro=el.querySelector(\'.ro\');\n  const W=1000,H=190,L=46,R=10,T=10,B=24;\n  const xs=DATA.t; if(!xs.length){ro.textContent=\'__NODATA__\';return;}\n  let mx=0; series.forEach(s=>DATA[s.k].forEach(v=>{if(v!=null&&v>mx)mx=v}));\n  ths.forEach(t=>{if(t.v>mx*0.6&&t.v<mx*2)mx=Math.max(mx,t.v)}); mx=mx*1.1||1;\n  const x=i=>L+(W-L-R)*(xs.length>1?i/(xs.length-1):0), y=v=>T+(H-T-B)*(1-v/mx);\n  let g=\'\';\n  for(let k=0;k<=4;k++){const v=mx*k/4;g+=`<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="#eceef2"/>`+\n    `<text x="${L-6}" y="${y(v)+4}" font-size="11" fill="#8b93a1" text-anchor="end">${v<10?v.toFixed(1):Math.round(v)}</text>`;}\n  ths.forEach(t=>{if(t.v<=mx){g+=`<line x1="${L}" x2="${W-R}" y1="${y(t.v)}" y2="${y(t.v)}" stroke="${t.c}" stroke-dasharray="5 4" stroke-width="1.2"/>`+\n    `<text x="${W-R-4}" y="${y(t.v)-4}" font-size="11" fill="${t.c}" text-anchor="end">${t.l}</text>`;}});\n  const n=xs.length, step=Math.max(1,Math.round(n/6));\n  for(let i=0;i<n;i+=step){g+=`<text x="${x(i)}" y="${H-6}" font-size="11" fill="#8b93a1" text-anchor="middle">${Math.round(xs[i])}s</text>`;}\n  series.forEach(s=>{let d=\'\',pen=false;DATA[s.k].forEach((v,i)=>{if(v==null){pen=false;return;}d+=(pen?\'L\':\'M\')+x(i).toFixed(1)+\',\'+y(v).toFixed(1);pen=true;});\n    g+=`<path d="${d}" fill="none" stroke="${s.c}" stroke-width="1.8"/>`;});\n  g+=`<line id="${id}_c" x1="0" x2="0" y1="${T}" y2="${H-B}" stroke="#9aa3b2" visibility="hidden"/>`;\n  svg.setAttribute(\'viewBox\',`0 0 ${W} ${H}`); svg.innerHTML=g;\n  const cur=document.getElementById(id+\'_c\');\n  svg.addEventListener(\'mousemove\',e=>{const r=svg.getBoundingClientRect();const px=(e.clientX-r.left)/r.width*W;\n    let i=Math.round((px-L)/(W-L-R)*(n-1));i=Math.max(0,Math.min(n-1,i));cur.setAttribute(\'x1\',x(i));cur.setAttribute(\'x2\',x(i));cur.setAttribute(\'visibility\',\'visible\');\n    ro.textContent=`${Math.round(xs[i])}__SEC__ · `+series.map(s=>`${s.n} ${DATA[s.k][i]==null?\'-\':DATA[s.k][i].toFixed(2)}${unit}`).join(\' · \');});\n  svg.addEventListener(\'mouseleave\',()=>{cur.setAttribute(\'visibility\',\'hidden\');ro.textContent=\'\';});\n}\n'
+
+
 def _init_texts():
     """Text constants that depend on the report language. Rebuilt by set_lang()."""
     global STORAGE_LABEL, LAT_SRC, SEV_LABEL, HV_LABEL, JS, OWNER_ORDER, OWNER_DESC, BLIND_VMWARE, BLIND_VMWARE_DS, BLIND_BAREMETAL, BLIND_SAN, BLIND_VM
@@ -4063,8 +4067,8 @@ def _init_texts():
                 "amazon": "AWS Nitro", "google": "Google Compute Engine", "oracle": "VirtualBox", "powervm": "IBM PowerVM",
                 "zvm": "IBM z/VM", "parallels": "Parallels", "bhyve": "bhyve", "qnx": "QNX", "acrn": "ACRN", "apple": "Apple Virtualization",
                 "sre": "SRE", "bochs": "Bochs", "uml": "UML", "vm-other": T("r.0018"), "unknown-vm": T("r.0018")}
-    JS = T("r.0961")
-    OWNER_ORDER = [T("r.0042"), T("r.0148"), T("r.0072"), T("r.0098"), T("r.0095"), T("r.0089"), T("r.0051"), T("r.0013")]
+    JS = JS_SRC.replace("__NODATA__", T("r.js.nodata")).replace("__SEC__", T("r.js.sec"))
+    OWNER_ORDER = [T("r.0042"), T("r.0148"), T("r.0072"), T("r.0098"), T("r.0095"), T("r.0089"), T("r.own_es"), T("r.0013")]
     OWNER_DESC = {
         T("r.0042"): T("r.0962"),
         T("r.0148"): T("r.0963"),
@@ -4072,7 +4076,7 @@ def _init_texts():
         T("r.0098"): T("r.0965"),
         T("r.0095"): T("r.0966"),
         T("r.0089"): T("r.0967"),
-        T("r.0051"): T("r.0968"),
+        T("r.own_es"): T("r.0968"),
         T("r.0013"): T("r.0969"),
     }
     BLIND_VMWARE = [
