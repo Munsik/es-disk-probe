@@ -1,5 +1,34 @@
 # Changelog
 
+Entries from 0.11.0 on are in English. Older entries are kept in Korean as written.
+
+## [0.11.0] - 2026-09-30
+
+Korean and English in every tool. Verdicts, thresholds and checks are unchanged.
+
+### Languages
+- All user-facing text moved to `i18n/ko.txt` and `i18n/en.txt` (`key = "text"`). The code holds keys only.
+- `es_disk_render.py` writes both languages by default: `<name>.ko.html` and `<name>.en.html`. `--lang ko|en|auto|both`.
+- `es_disk_collect.sh`, `es_cluster_probe.sh`, `es_disk_summary.sh`: `--lang ko|en`. Without it, Korean when the locale starts with `ko`, otherwise English.
+  The collector shows the shell summary in that language and saves `summary.ko.txt` and `summary.en.txt`. Both HTML reports go into the bundle.
+- Help (`-h`) comes from the catalogs too.
+- Korean report text is unchanged from 0.10.0 (checked on all 32 test scenarios), except the "no value" marker below.
+
+### Docs
+- `README.md` and `GUARDLINE.md` are English. The Korean versions are `README.ko.md` and `GUARDLINE.ko.md`.
+- `docs/STYLE.md`: writing rules and the Korean/English glossary (severities, verdicts, owners, source tags).
+- `docs/UPDATE_NOTES.md` and this changelog are kept in English from now on.
+- Sample reports in both languages: `docs/sample_*_report.ko.html` and `.en.html`. The cluster sample now comes from a synthetic bundle (`tests/make_bundle.py`, `build_cluster`).
+- Code comments are in English.
+
+### Tests
+- `tests/i18n_check.py`: same keys, same placeholders and HTML tags in both catalogs, no Hangul in English, no em or en dash, no phrases listed in `docs/STYLE.md`.
+- `tests/run_tests.py` runs every scenario in both languages. Checks: expected findings by id, same findings and verdict in ko and en, same verdict in the shell summary and the HTML report, cluster-only report, no em or en dash in any output.
+- `tests/expectations.py` matches findings by catalog key instead of Korean text.
+
+### Fixes
+- The "no value" marker in reports was an en dash. It is now `-`.
+
 ## [0.10.0] - 2026-09-29
 
 VMware vSAN Guest 전용이던 판정을 bare-metal, SAN, 그 밖의 hypervisor·클라우드까지 넓혔다.

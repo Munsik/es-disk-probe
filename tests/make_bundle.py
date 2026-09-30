@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-합성 번들 생성기 (테스트 전용)
+Synthetic bundle generator (tests only)
 
-es_disk_collect.sh 가 만드는 번들과 같은 형식으로 디렉터리를 만든다.
-실제 서버 없이 플랫폼·매체·부하 조합별로 판정 로직을 검증하려는 용도다.
+Builds a directory in the same format as the bundle es_disk_collect.sh produces.
+Used to check the verdict logic per platform/media/load combination without a real server.
 
-  python3 tests/make_bundle.py <시나리오 이름> <출력 디렉터리>
+  python3 tests/make_bundle.py <scenario name> <output directory>
   python3 tests/make_bundle.py --list
 """
 import json, os, sys
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 장치 정의: 이름 → sysfs 속성과 부하
-#   lat_r / lat_w : 구간 평균 응답시간(ms), iops_r / iops_w : 초당 I/O
-#   aqu : 평균 대기 I/O, inflight : 장치 처리 중 I/O, util : %util
+# Device definitions: name → sysfs attributes and load
+#   lat_r / lat_w : mean response time per interval (ms), iops_r / iops_w : I/O per second
+#   aqu : mean queued I/O, inflight : I/O in flight at the device, util : %util
 # ─────────────────────────────────────────────────────────────────────────────
 def dev(name, rot="0", qd=None, host=None, vendor="", model="", sched="none [mq-deadline] kyber bfq",
         ra="128", timeout=None, wcache="write back", lat_r=0.5, lat_w=0.8, iops_r=300, iops_w=300,
         aqu=1.0, inflight=1, util=30.0, extra=None, hctl=None, pattern=None, flush_ps=0, flush_ms=0.0):
-    # pattern: 구간별 (IOPS 배율, aqu) 목록. 한도에 걸린 모양처럼 구간마다 다른 부하를 만들 때 쓴다
+    # pattern: list of (IOPS multiplier, aqu) per interval. Used to vary load per interval, e.g. to mimic hitting a limit
     return dict(name=name, rot=rot, qd=qd, host=host, vendor=vendor, model=model, sched=sched, ra=ra,
                 timeout=timeout, wcache=wcache, lat_r=lat_r, lat_w=lat_w, iops_r=iops_r, iops_w=iops_w,
                 aqu=aqu, inflight=inflight, util=util, extra=extra or {}, hctl=hctl, pattern=pattern,
@@ -33,25 +33,25 @@ KVM_VIRT = "detect_virt=kvm\nsys_vendor=Red Hat\nproduct_name=KVM\ntools_version
 
 SCEN = {}
 
-# 1) 기존 동작 기준: VMware, 정상
+# 1) Baseline of existing behavior: VMware, healthy
 SCEN["vmware_ok"] = dict(virt=VM_VIRT, storage="allflash", hostdrv={"host2": "vmw_pvscsi", "host0": "vmw_pvscsi"},
     devs=[dev("sda", rot="1", qd="64", host="host0", vendor="VMware", model="Virtual disk", timeout="180", iops_r=50, iops_w=50),
           dev("sdb", rot="1", qd="64", host="host2", vendor="VMware", model="Virtual disk", timeout="180",
               lat_r=1.5, lat_w=2.0, iops_r=800, iops_w=600, aqu=3.0, inflight=3)])
 
-# 2) VMware, 지연 높고 큐 여유 → VM 바깥
+# 2) VMware, high latency with queue headroom → outside the VM
 SCEN["vmware_outside"] = dict(SCEN["vmware_ok"], devs=[
     SCEN["vmware_ok"]["devs"][0],
     dev("sdb", rot="1", qd="64", host="host2", vendor="VMware", model="Virtual disk", timeout="180",
         lat_r=14, lat_w=22, iops_r=900, iops_w=700, aqu=8, inflight=8, util=95)])
 
-# 3) VMware, 큐 포화
+# 3) VMware, queue saturated
 SCEN["vmware_queue"] = dict(SCEN["vmware_ok"], devs=[
     SCEN["vmware_ok"]["devs"][0],
     dev("sdb", rot="1", qd="64", host="host2", vendor="VMware", model="Virtual disk", timeout="180",
         lat_r=12, lat_w=15, iops_r=2500, iops_w=2500, aqu=60, inflight=62, util=100)])
 
-# 4) bare-metal NVMe 정상
+# 4) bare-metal NVMe healthy
 SCEN["bm_nvme_ok"] = dict(virt=BM_VIRT, hostdrv={"host0": "ahci"}, governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="0", qd="32", host="host0", vendor="ATA", model="MZ7L3480HCHQ", timeout="30", iops_r=20, iops_w=40),
           dev("nvme0n1", rot="0", lat_r=0.15, lat_w=0.05, iops_r=6000, iops_w=4000, aqu=2, inflight=2, util=40)],
@@ -60,13 +60,13 @@ SCEN["bm_nvme_ok"] = dict(virt=BM_VIRT, hostdrv={"host0": "ahci"}, governor="per
                     "link_speed": "16.0 GT/s PCIe", "max_link_speed": "16.0 GT/s PCIe",
                     "link_width": "4", "max_link_width": "4"}})
 
-# 5) bare-metal NVMe 느림 + 과열 + 링크 저하
+# 5) bare-metal NVMe slow + overheating + degraded link
 SCEN["bm_nvme_slow"] = dict(SCEN["bm_nvme_ok"], governor="powersave", tuned="balanced",
     devs=[SCEN["bm_nvme_ok"]["devs"][0],
           dev("nvme0n1", rot="0", lat_r=2.4, lat_w=3.5, iops_r=6000, iops_w=4000, aqu=30, inflight=30, util=99)],
     nvme={"nvme0": dict(SCEN["bm_nvme_ok"]["nvme"]["nvme0"], temp="72850", link_speed="8.0 GT/s PCIe", link_width="2")})
 
-# 6) bare-metal HDD RAID (megaraid) 쓰기 느림, 큐 여유 → 장치 자체가 느림
+# 6) bare-metal HDD RAID (megaraid) slow writes, queue headroom → the device itself is slow
 SCEN["bm_hdd_raid"] = dict(virt=BM_VIRT, hostdrv={"host0": "megaraid_sas"}, governor="performance",
     tuned="throughput-performance",
     devs=[dev("sda", rot="1", qd="256", host="host0", vendor="DELL", model="PERC H740P Mini", timeout="90",
@@ -74,7 +74,7 @@ SCEN["bm_hdd_raid"] = dict(virt=BM_VIRT, hostdrv={"host0": "megaraid_sas"}, gove
     klog=["2026-09-28T03:11:02+0900 kernel: megaraid_sas 0000:18:00.0: 12567 (749175033s/0x0001/FATAL) - Controller cache pinned for missing or offline VD 00/0",
           "2026-09-28T03:11:05+0900 kernel: sd 0:2:0:0: [sda] tag#12 timing out command, waited 180s"])
 
-# 7) bare-metal SATA SSD 4개 md RAID0, 한 개만 느림 + md resync
+# 7) bare-metal 4x SATA SSD md RAID0, only one slow + md resync
 SCEN["bm_md_outlier"] = dict(virt=BM_VIRT, hostdrv={"host0": "mpt3sas"}, governor="performance",
     tuned="throughput-performance",
     devs=[dev(n, rot="0", qd="32", host="host0", vendor="ATA", model="SAMSUNG MZ7LH960",
@@ -89,7 +89,7 @@ SCEN["bm_md_outlier"] = dict(virt=BM_VIRT, hostdrv={"host0": "mpt3sas"}, governo
             "md0 : active raid0 sde[3] sdd[2] sdc[1] sdb[0]\n      3750223872 blocks super 1.2 512k chunks\n\n"
             "unused devices: <none>\n"))
 
-# 8) bare-metal SAN (FC + multipath) 지연 높음, 큐 여유 → 어레이 쪽
+# 8) bare-metal SAN (FC + multipath) high latency, queue headroom → array side
 SCEN["bm_san"] = dict(virt=BM_VIRT, hostdrv={"host0": "ahci", "host5": "qla2xxx", "host6": "qla2xxx"},
     governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="0", qd="32", host="host0", vendor="ATA", model="MZ7L3480HCHQ", iops_r=10, iops_w=20),
@@ -100,18 +100,18 @@ SCEN["bm_san"] = dict(virt=BM_VIRT, hostdrv={"host0": "ahci", "host5": "qla2xxx"
     dm={"dm-0": {"name": "mpatha", "slaves": ["sdb", "sdc"], "table": "mpatha: 0 4294967296 multipath 1 queue_if_no_path 0 1 1 service-time 0 2 1 8:16 1 8:32 1"}},
     mount_src="/dev/mapper/mpatha")
 
-# 9) KVM 게스트 (virtio-blk) 지연 높음
+# 9) KVM guest (virtio-blk) high latency
 SCEN["kvm_slow"] = dict(virt=KVM_VIRT, hostdrv={}, tuned="virtual-guest",
     devs=[dev("vda", rot="1", iops_r=20, iops_w=30),
           dev("vdb", rot="1", lat_r=9, lat_w=14, iops_r=1200, iops_w=900, aqu=12, inflight=12, util=97)])
 
-# 10) 컨테이너 안에서 실행
+# 10) Running inside a container
 SCEN["container"] = dict(virt="detect_virt=docker\ncontainer=docker\nsys_vendor=\nproduct_name=\ntools_version=absent\n",
     hostdrv={}, devs=[dev("vda", rot="1", lat_r=0.8, lat_w=1.2, iops_r=500, iops_w=400)],
     host_virt="kvm")
 
 
-# ── RAID 컨트롤러 도구 출력 (테스트용으로 직접 만든 것. 형식은 각 도구의 JSON 키·텍스트 레이블을 따름) ──
+# ── RAID controller tool output (hand-made for tests. Format follows each tool's JSON keys and text labels) ──
 import json as _json
 STORCLI_ALL = {"Controllers": [{"Command Status": {"Controller": 0, "Status": "Success"}, "Response Data": {
     "Basics": {"Controller": 0, "Model": "PERC H740P Mini", "Serial Number": "X"},
@@ -142,8 +142,8 @@ STORCLI_TXT = ("#CMD /opt/MegaRAID/perccli/perccli64 /call show all J\n" + _json
                "\n#CMD /opt/MegaRAID/perccli/perccli64 /call show patrolread J\n" +
                _json.dumps({"Controllers": [{"Response Data": {"Controller Properties": [{"Ctrl_Prop": "PR Current State", "Value": "Stopped"}]}}]}) + "\n")
 
-# storcli2·perccli2 형식을 가정한 변형 (키 이름·값 표기를 바꾼 것). 실제 키가 문서로 확정되지 않아,
-# 이름이 바뀌어도 같은 결론이 나오는지 확인하는 용도다
+# Variants assuming storcli2/perccli2 format (key names and value notation changed). The real keys are not confirmed by docs,
+# so this checks that renamed keys still lead to the same conclusion
 S2_PDS = [{"EID:Slot": "32:{}".format(i), "DID": i, "State": "Online", "DG": 0, "Size": "1.818 TB",
            "Interface": "SAS", "Media Type": "HDD", "Model": "ST2000NM0135"} for i in range(4)]
 S2_ALL = {"Controllers": [{"Command Status": {"Controller": 0, "Status": "Success"}, "Response Data": {
@@ -168,7 +168,7 @@ STORCLI2_TXT = ("#CMD /opt/MegaRAID/perccli2/perccli2 /call show all J\n" + _jso
                 "\n#CMD /opt/MegaRAID/perccli2/perccli2 /call/vall show all J\n" + _json.dumps(S2_VALL, indent=1) +
                 "\n#CMD /opt/MegaRAID/perccli2/perccli2 /c0/eall/sall show all J\n" + _json.dumps(S2_PD, indent=1) +
                 "\n#TOOL storcli2\n")
-# storcli2 변형 2: snake_case 키, 대문자 값, 매체 SSD. 정상 RAID1 이 정상으로, 매체는 추정 없이 SSD 로 나와야 함
+# storcli2 variant 2: snake_case keys, uppercase values, SSD media. A healthy RAID1 must show healthy, and media must be SSD with no guessing
 S3_PDS = [{"eid_slot": "0:{}".format(i), "state": "ONLINE", "dg": 0, "media_type": "SSD", "interface": "SAS"} for i in range(2)]
 S3_ALL = {"controllers": [{"command_status": {"status": "success"}, "response_data": {
     "basics": {"controller": 0, "product_name": "MegaRAID 9660-16i"},
@@ -182,7 +182,7 @@ S3_VALL = {"controllers": [{"response_data": {
 STORCLI2_SNAKE_TXT = ("#CMD /opt/MegaRAID/storcli2/storcli2 /call show all J\n" + _json.dumps(S3_ALL, indent=1) +
                       "\n#CMD /opt/MegaRAID/storcli2/storcli2 /call/vall show all J\n" + _json.dumps(S3_VALL, indent=1) +
                       "\n#TOOL storcli2\n")
-# 실제 storcli 처럼 목록 옆에 개수 필드("Virtual Drives": 1)가 있는 경우. 개수가 목록을 가리면 안 된다
+# Like real storcli, a count field ("Virtual Drives": 1) sits next to the list. The count must not shadow the list
 _ra = STORCLI_ALL["Controllers"][0]["Response Data"]
 STORCLI_CNT = {"Controllers": [{"Command Status": {"Controller": 0, "Status": "Success"},
     "Response Data": dict([("Virtual Drives", 1), ("Physical Drives", 4)] + list(_ra.items()))}]}
@@ -262,32 +262,32 @@ Physical Device information
 Invalid controller number.
 """
 
-# 11) HDD RAID5 (PERC) + perccli: 설정은 write-back 인데 CacheVault 이상으로 write-through, 구성 디스크 predictive failure
+# 11) HDD RAID5 (PERC) + perccli: configured write-back but running write-through due to CacheVault fault, member disk predictive failure
 SCEN["bm_raid_storcli"] = dict(virt=BM_VIRT, hostdrv={"host0": "megaraid_sas"}, governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="1", qd="256", host="host0", vendor="DELL", model="PERC H740P Mini", hctl="0:2:0:0",
               lat_r=8, lat_w=40, iops_r=150, iops_w=250, aqu=5, inflight=5, util=85)],
     raw={"raid_storcli": STORCLI_TXT})
-# 12) SSD RAID10 (HPE) + ssacli: 커널은 rotational=1 로 보고하지만 컨트롤러 조회로 SSD 확정
+# 12) SSD RAID10 (HPE) + ssacli: kernel reports rotational=1, but controller query confirms SSD
 SCEN["bm_raid_ssacli"] = dict(virt="detect_virt=none\nsys_vendor=HPE\nproduct_name=ProLiant DL380 Gen10\ntools_version=absent\n",
     hostdrv={"host0": "smartpqi"}, governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="1", qd="1013", host="host0", vendor="HPE", model="LOGICAL VOLUME", hctl="0:1:0:0",
               extra={"device/raid_level": "RAID 1(+0)"}, lat_r=0.6, lat_w=0.9, iops_r=3000, iops_w=2000, aqu=3, inflight=3, util=60)],
     raw={"raid_ssacli": SSACLI_TXT})
-# 13) Adaptec + arcconf: OS 장치 이름 없이 SCSI 주소로 연결, 논리 디스크 degraded
+# 13) Adaptec + arcconf: linked by SCSI address with no OS device name, logical disk degraded
 SCEN["bm_raid_arcconf"] = dict(virt=BM_VIRT, hostdrv={"host0": "aacraid"}, governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="0", qd="256", host="host0", vendor="ASR8805", model="esdata", hctl="0:0:0:0",
               lat_r=1.0, lat_w=1.5, iops_r=2000, iops_w=1500, aqu=2, inflight=2, util=50)],
     raw={"raid_arcconf": ARCCONF_TXT})
-# 14) RAID 도구가 없는 PERC: 도구 설치 안내
+# 14) PERC with no RAID tool: tool install hint
 SCEN["bm_raid_notool"] = dict(virt=BM_VIRT, hostdrv={"host0": "megaraid_sas"}, governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="1", qd="256", host="host0", vendor="DELL", model="PERC H740P Mini", hctl="0:2:0:0",
               lat_r=5, lat_w=6, iops_r=200, iops_w=200, aqu=2, inflight=2, util=60)],
     raw={"raid_storcli": "#TOOL_ABSENT storcli/perccli\n"})
-# 15) VMware, 데이터스토어 종류 미확인(기본) + VM 바깥
+# 15) VMware, datastore type unknown (default) + outside the VM
 SCEN["vmware_default"] = dict(SCEN["vmware_outside"], storage="auto")
-# 16) VMware, SAN·NFS 데이터스토어 지정
+# 16) VMware, SAN/NFS datastore specified
 SCEN["vmware_vmfs"] = dict(SCEN["vmware_outside"], storage="vmfs")
-# 17) AWS EBS: 처리량이 볼륨 한도에서 막히는 모양 (절반 구간은 상한 + 큐 적체)
+# 17) AWS EBS: throughput capped at the volume limit (half the intervals at the cap + queue buildup)
 SCEN["aws_ebs_cap"] = dict(virt="detect_virt=amazon\ndetect_virt_vm=amazon\nsys_vendor=Amazon EC2\nproduct_name=r6i.2xlarge\ntools_version=absent\n",
     hostdrv={}, tuned="virtual-guest",
     devs=[dev("nvme0n1", rot="0", iops_r=50, iops_w=50),
@@ -295,7 +295,7 @@ SCEN["aws_ebs_cap"] = dict(virt="detect_virt=amazon\ndetect_virt_vm=amazon\nsys_
               pattern=[(1.0, 24), (1.0, 26), (0.5, 3), (1.0, 25), (0.6, 4), (0.4, 2)])],
     nvme={"nvme0": {"model": "Amazon Elastic Block Store", "transport": "pcie"},
           "nvme1": {"model": "Amazon Elastic Block Store", "transport": "pcie"}})
-# 18) ECK: 호스트에서 실행, ES 는 컨테이너. data 경로는 컨테이너 기준이고 mountinfo 로 NVMe 에 연결
+# 18) ECK: run on the host, ES in a container. data path is container-relative and maps to NVMe via mountinfo
 SCEN["eck_host"] = dict(virt=BM_VIRT, hostdrv={"host0": "ahci"}, governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="0", qd="32", host="host0", vendor="ATA", model="MZ7L3480HCHQ", iops_r=10, iops_w=20),
           dev("nvme1n1", rot="0", lat_r=0.2, lat_w=0.1, iops_r=5000, iops_w=3000, aqu=2, inflight=2)],
@@ -304,7 +304,7 @@ SCEN["eck_host"] = dict(virt=BM_VIRT, hostdrv={"host0": "ahci"}, governor="perfo
     data_paths=["/usr/share/elasticsearch/data"],
     datadev=[("/usr/share/elasticsearch/data", "259:1", "nvme1n1p1", "xfs", "/dev/nvme1n1p1", "/usr/share/elasticsearch/data")],
     meta_extra="es_in_container=1\n")
-# 19) Ceph RBD (bare-metal Kubernetes 노드의 CSI 볼륨): 네트워크 블록 → 스토리지 관리자
+# 19) Ceph RBD (CSI volume on a bare-metal Kubernetes node): network block → storage admin
 SCEN["bm_ceph_rbd"] = dict(virt=BM_VIRT, hostdrv={"host0": "ahci"}, governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="0", qd="32", host="host0", vendor="ATA", model="MZ7L3480HCHQ", iops_r=10, iops_w=20),
           dev("rbd0", rot="1", lat_r=6, lat_w=9, iops_r=1500, iops_w=1000, aqu=3, inflight=3, util=80)],
@@ -313,7 +313,7 @@ SCEN["bm_ceph_rbd"] = dict(virt=BM_VIRT, hostdrv={"host0": "ahci"}, governor="pe
     datadev=[("/usr/share/elasticsearch/data", "252:0", "rbd0", "ext4", "/dev/rbd0", "/usr/share/elasticsearch/data")],
     meta_extra="es_in_container=1\n")
 
-# 21) AWS EBS: Nitro 가 볼륨 한도 초과 시간을 직접 보고 (nvme amzn stats). 시작은 JSON, 끝은 사람이 읽는 형식
+# 21) AWS EBS: Nitro reports time over the volume limit directly (nvme amzn stats). Start is JSON, end is human-readable
 EBS_START = ('#DEV nvme1n1\n{"total_read_ops": 100, "ebs_volume_performance_exceeded_iops": 1000000, '
              '"ebs_volume_performance_exceeded_tp": 0, "ec2_instance_ebs_performance_exceeded_iops": 0, '
              '"ec2_instance_ebs_performance_exceeded_tp": 200000, "volume_queue_length": 1}\n')
@@ -329,7 +329,7 @@ EC2 Instance EBS Performance Exceeded (us)
   Throughput: 500000
 Queue Length (point in time): 12
 """
-# 같은 값(볼륨 IOPS 한도 초과 30초, 인스턴스 0.3초)을 다른 출력 형식으로. 형식이 달라도 결론이 같아야 한다
+# Same values (volume IOPS limit exceeded 30s, instance 0.3s) in a different output format. Different format must give the same conclusion
 EBS_V2_START = """#DEV nvme1n1
 {
   "total_read_ops": 100,
@@ -359,7 +359,7 @@ EBS_V3_END = EBS_V3_START.replace("100\n", "900000\n").replace("IOPS: 1000000", 
 SCEN["aws_ebs_throttle"] = dict(SCEN["aws_ebs_cap"], raw={"ebs_stats_start": EBS_START, "ebs_stats_end": EBS_END})
 SCEN["aws_ebs_v2"] = dict(SCEN["aws_ebs_cap"], raw={"ebs_stats_start": EBS_V2_START, "ebs_stats_end": EBS_V2_END})
 SCEN["aws_ebs_v3"] = dict(SCEN["aws_ebs_cap"], raw={"ebs_stats_start": EBS_V3_START, "ebs_stats_end": EBS_V3_END})
-# 22) Dell PERC 12 (mpi3mr) + perccli2: 도구는 돌았지만 JSON 형식을 해석하지 못함 → 원문 보존 안내
+# 22) Dell PERC 12 (mpi3mr) + perccli2: tool ran but its JSON format could not be parsed → keep-raw-output hint
 SCEN["bm_mpi3mr_unparsed"] = dict(virt=BM_VIRT, hostdrv={"host0": "mpi3mr"}, governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="0", qd="128", host="host0", vendor="DELL", model="PERC H965i Front", hctl="0:1:0:0",
               lat_r=0.5, lat_w=0.8, iops_r=2000, iops_w=1500, aqu=2, inflight=2, util=40)],
@@ -367,25 +367,25 @@ SCEN["bm_mpi3mr_unparsed"] = dict(virt=BM_VIRT, hostdrv={"host0": "mpi3mr"}, gov
                          '{"Controllers":[{"Command Status":{"Status":"Success"},"Response Data":{"Basics":{"Controller":0}}}]}\n'
                          '#TOOL storcli2\n'})
 
-# 23) PERC 12 (mpi3mr) + perccli2, 키 이름·값 표기가 바뀐 형식: bm_raid_storcli 와 같은 결론이어야 함
+# 23) PERC 12 (mpi3mr) + perccli2, format with changed key names and value notation: must match bm_raid_storcli
 SCEN["bm_raid_storcli2"] = dict(virt=BM_VIRT, hostdrv={"host0": "mpi3mr"}, governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="1", qd="128", host="host0", vendor="DELL", model="PERC H965i Front", hctl="0:1:0:0",
               lat_r=8, lat_w=40, iops_r=150, iops_w=250, aqu=5, inflight=5, util=85)],
     raw={"raid_storcli": STORCLI2_TXT})
-# 23-2) MegaRAID 9660 (mpi3mr) + storcli2, snake_case 형식, SSD RAID1 정상
+# 23-2) MegaRAID 9660 (mpi3mr) + storcli2, snake_case format, SSD RAID1 healthy
 SCEN["bm_raid_storcli2_snake"] = dict(virt=BM_VIRT, hostdrv={"host0": "mpi3mr"}, governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="1", qd="128", host="host0", vendor="BROADCOM", model="MR9660-16i", hctl="0:1:0:0",
               lat_r=0.4, lat_w=0.6, iops_r=3000, iops_w=2000, aqu=2, inflight=2, util=40)],
     raw={"raid_storcli": STORCLI2_SNAKE_TXT})
-# 24) storcli 에 개수 필드가 함께 있는 형식
+# 24) storcli format that also has count fields
 SCEN["bm_raid_storcli_cnt"] = dict(SCEN["bm_raid_storcli"], raw={"raid_storcli": STORCLI_CNT_TXT})
 
 _IDLE_NVME = [dev("sda", rot="0", qd="32", host="host0", vendor="ATA", model="MZ7L3480HCHQ", timeout="30", iops_r=2, iops_w=4),
               dev("nvme0n1", rot="0", lat_r=0.1, lat_w=0.05, iops_r=3, iops_w=5, aqu=0.1, inflight=0, util=1)]
-# 25) 부하가 거의 없는 시간대: 성능 판정 보류
+# 25) Near-idle period: performance verdict withheld
 SCEN["idle_low_load"] = dict(SCEN["bm_nvme_ok"], devs=_IDLE_NVME)
 
-# 26) ES 9.x 노드: merge 가 시작·끝 모두 대기열에 쌓임 + 벡터 rescoring direct IO 켜짐 (둘 다 참고 수준)
+# 26) ES 9.x node: merges queued at both start and end + vector rescoring direct IO on (both informational)
 def _es_stats(ts, mq, idx):
     return _json.dumps({"nodes": {"n1": {"timestamp": ts, "name": "es-hot-1",
         "indices": {"indexing": {"index_total": idx, "index_time_in_millis": idx // 10, "throttle_time_in_millis": 0},
@@ -396,22 +396,22 @@ SCEN["bm_es_merge_vector"] = dict(SCEN["bm_nvme_ok"], raw={
     "es_stats_start.json": _es_stats(1700000000000, 6, 100000),
     "es_stats_end.json": _es_stats(1700000120000, 9, 700000),
     "es_cmdline": "/usr/share/elasticsearch/jdk/bin/java -Xms16g -Xmx16g -Dvector.rescoring.directio=true org.elasticsearch.bootstrap.Elasticsearch\n"})
-# 27) VMware vSAN Hybrid (OSA): 향후 중단 예정 안내
+# 27) VMware vSAN Hybrid (OSA): upcoming deprecation notice
 SCEN["vmware_hybrid"] = dict(SCEN["vmware_ok"], storage="hybrid")
 
-# 28) RHEL 패키지 설치 ES (systemd PrivateTmp 로 mount namespace 만 다름): 컨테이너로 오판하면 안 됨.
-#     실제 UTM Rocky 9 + ES 8.19 번들에서 발견. 0.10.0 초기 수집기는 es_in_container=1 로 기록했다
+# 28) ES installed from RHEL package (only the mount namespace differs, due to systemd PrivateTmp): must not be misread as a container.
+#     Found in a real UTM Rocky 9 + ES 8.19 bundle. The early 0.10.0 collector recorded es_in_container=1
 SCEN["rhel_service_ns"] = dict(SCEN["kvm_slow"], meta_extra="es_in_container=1\n",
     raw={"es_cgroup": "0::/system.slice/elasticsearch.service\n"})
 
-# 29) 인덱스 설정: 실제 ES 가 돌려주는 중첩 모양 (flat_settings 없이 filter_path). async 인덱스를 찾아야 함
+# 29) Index settings: the nested shape real ES returns (filter_path without flat_settings). Must find the async index
 SCEN["idx_settings_nested"] = dict(SCEN["bm_nvme_ok"], raw={"es_idx_settings.json": _json.dumps(
     {"logs-a": {"settings": {"index": {"translog": {"durability": "async", "sync_interval": "30s"}}}},
      "loadtest": {"settings": {"index": {"refresh_interval": "30s"}}}})})
 
-# 20) bare-metal, OS 기본 도구만으로 보이는 문제 모음:
-#     LVM thin pool 92%, nobarrier, swap·snapshot 저장소가 data 디스크, 옆집 프로세스, 느린 flush,
-#     megaraid 커널 로그 이벤트(벤더 도구 없음), SCSI 타임아웃 카운터
+# 20) bare-metal, issues visible with only stock OS tools:
+#     LVM thin pool 92%, nobarrier, swap/snapshot store on the data disk, noisy neighbor process, slow flush,
+#     megaraid kernel log events (no vendor tool), SCSI timeout counters
 SCEN["bm_os_only"] = dict(virt=BM_VIRT, hostdrv={"host0": "megaraid_sas"}, governor="performance", tuned="throughput-performance",
     devs=[dev("sda", rot="0", qd="256", host="host0", vendor="DELL", model="PERC H330 Mini", hctl="0:2:0:0", iops_r=20, iops_w=30),
           dev("sdb", rot="0", qd="256", host="host0", vendor="DELL", model="PERC H330 Mini", hctl="0:2:1:0",
@@ -442,7 +442,7 @@ def build(name, out):
     devs = sc["devs"]
     data_dev = devs[-1]["name"]
     md, dm = sc.get("md") or {}, sc.get("dm") or {}
-    # 마운트: data 는 md/dm/마지막 장치
+    # Mounts: data is on md/dm/last device
     if md:
         data_src = "/dev/" + list(md)[0]
     elif sc.get("mount_src"):
@@ -451,7 +451,7 @@ def build(name, out):
         data_src = "/dev/" + data_dev + ("p1" if data_dev.startswith("nvme") else "1")
     root_src = "/dev/" + devs[0]["name"] + ("p2" if devs[0]["name"].startswith("nvme") else "2")
     if sc.get("host_data_mnt"):
-        # 컨테이너 안 ES: 호스트에는 data 가 다른 경로(kubelet PV 등)로 마운트돼 있다
+        # ES in a container: on the host, data is mounted at a different path (kubelet PV etc.)
         w(S("mounts"), "{} / xfs rw,relatime 0 0\n{} {} xfs rw,noatime 0 0\n".format(root_src, data_src, sc["host_data_mnt"]))
     else:
         w(S("mounts"), "{} / xfs rw,relatime 0 0\n{} /var/lib/elasticsearch ext4 {} 0 0\n".format(root_src, data_src, sc.get("mounts_opts", "rw,noatime")) if sc.get("mounts_opts")
@@ -479,7 +479,7 @@ def build(name, out):
             lines.append("SCSIHOST|{}|{}".format(n, d["host"]))
         if d["hctl"]:
             lines.append("HCTL|{}|{}".format(n, d["hctl"]))
-        # 파티션
+        # Partitions
         if n == devs[0]["name"]:
             p = n + ("p2" if n.startswith("nvme") else "2")
             lines.append("PART|{}|{}|1050624".format(p, n))
@@ -514,7 +514,7 @@ def build(name, out):
     w(S("klog_io"), "\n".join(sc.get("klog", [])) + ("\n" if sc.get("klog") else ""))
     w(S("net"), "IF|eth0|driver={}|mtu=1500|speed=10000|state=up\n".format(
         "vmxnet3" if "vmware" in sc["virt"] else ("virtio_net" if "kvm" in sc["virt"] else "ice")))
-    # 새 수집 항목 (구버전 분석기는 무시)
+    # New collected items (ignored by older analyzers)
     plat = []
     if sc.get("governor"):
         plat.append("cpu_governor={}".format(sc["governor"]))
@@ -540,7 +540,7 @@ def build(name, out):
                 out_l.append("NVME|{}|{}|{}".format(c, k, v))
         w(S("storage"), "\n".join(out_l) + "\nISCSI|sessions|0\n")
 
-    # 샘플: 5초 간격 25개
+    # Samples: 25 at 5s interval
     n_s, dt = 25, 5.0
     acc = {d["name"]: [0] * 17 for d in devs}
     txt = []
@@ -577,6 +577,55 @@ def build(name, out):
     w(os.path.join(out, "user_paths"), "")
     w(os.path.join(out, "self_overhead"), "0m0.10s 0m0.05s\n0m0.30s 0m0.20s\n")
     return out
+
+def build_cluster(out, gap=60):
+    """Synthetic es_cluster_probe.sh bundle: 3 hot nodes (one busier than the rest) and 1 warm node.
+    Used for docs/sample_cluster_report and the cluster-only test."""
+    os.makedirs(out, exist_ok=True)
+    GB = 1024 ** 3
+    # name, roles, busy %, write MB/s, total GB, used %, store GB, index/s, throttle ms, heap %, cpu %
+    nodes = [("es-hot-01", ["data_hot", "data_content", "ingest"], 30, 70, 2000, 62, 1150, 9000, 0, 55, 35),
+             ("es-hot-02", ["data_hot", "data_content", "ingest"], 88, 190, 2000, 71, 1330, 9500, 4200, 63, 48),
+             ("es-hot-03", ["data_hot", "data_content", "ingest"], 38, 85, 2000, 60, 1110, 8800, 0, 52, 33),
+             ("es-warm-01", ["data_warm"], 12, 8, 8000, 58, 4400, 0, 0, 41, 9),
+             ("es-master-01", ["master"], 1, 0.2, 100, 12, 0, 0, 0, 30, 4)]
+
+    def stats(k):
+        ns = {}
+        for i, (nm, roles, busy, wmb, tot, used, store, rate, thr, heap, cpu) in enumerate(nodes):
+            t = gap * k
+            ns["n{:02d}".format(i)] = {
+                "name": nm, "roles": roles, "timestamp": 1790000000000 + t * 1000,
+                "fs": {"total": {"total_in_bytes": tot * GB, "available_in_bytes": int(tot * GB * (100 - used) / 100)},
+                       "io_stats": {"total": {"operations": int(3000 * busy * t), "read_operations": int(1000 * busy * t),
+                                              "write_operations": int(2000 * busy * t), "read_kilobytes": int(wmb * 300 * t),
+                                              "write_kilobytes": int(wmb * 1024 * t), "io_time_in_millis": int(busy * 10 * t)}}},
+                "indices": {"store": {"size_in_bytes": store * GB},
+                            "indexing": {"index_total": rate * t, "index_time_in_millis": rate * t // 20,
+                                         "throttle_time_in_millis": thr * k},
+                            "merges": {"total_throttled_time_in_millis": thr * k // 2},
+                            "flush": {"total": 10 * k, "total_time_in_millis": 900 * k},
+                            "segments": {"count": 400}, "translog": {"size_in_bytes": 512 * 1048576}},
+                "thread_pool": {"write": {"rejected": 0}, "search": {"rejected": 0}},
+                "jvm": {"mem": {"heap_used_percent": heap}}, "os": {"cpu": {"percent": cpu}}}
+        return {"cluster_name": "logs-prod", "nodes": ns}
+    files = {
+        "node_stats_1.json": stats(1), "node_stats_2.json": stats(2),
+        "root.json": {"cluster_name": "logs-prod", "version": {"number": "8.19.4"}},
+        "health.json": {"cluster_name": "logs-prod", "status": "green", "number_of_nodes": len(nodes),
+                        "relocating_shards": 2, "initializing_shards": 0},
+        "cat_recovery.json": [{"index": "logs-2026.09.29", "shard": "3", "stage": "index", "type": "peer"}],
+        "cluster_settings.json": {"persistent": {}, "transient": {}, "defaults": {"cluster": {"routing": {"allocation": {
+            "disk": {"watermark": {"low": "85%", "high": "90%", "flood_stage": "95%"}}}}},
+            "indices": {"recovery": {"max_bytes_per_sec": "40mb"}}}},
+    }
+    for fn, obj in files.items():
+        with open(os.path.join(out, fn), "w") as fh:
+            json.dump(obj, fh)
+    with open(os.path.join(out, "meta"), "w") as fh:
+        fh.write("tool_version=test\nstart_wall=2026-09-29 14:00:00\nend_wall=2026-09-29 14:01:00\ngap={}\n".format(gap))
+    return out
+
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "--list":
