@@ -18,6 +18,7 @@ Fixes from a full review of both languages. Verdict rules are unchanged.
 - Bundle files are read as UTF-8 regardless of the PC locale.
 - Shell summary shows hypervisor names as the HTML report does (`KVM Guest`, not `kvm Guest`).
 - Some evidence text written in English inside the Korean report (rejected counts, shard movement, partition start sector) now comes from the catalogs.
+- The ES command line in the bundle (`static/es_cmdline`) masks JVM options whose name looks like a secret (`name=***`).
 
 ### Text
 - Korean: particle errors in joined fragments, actions ending in `~하세요`, one term per concept (read-modify-write, 구성 디스크, 응답시간, Guest), `°C` and `KiB` units, source tag format.
@@ -25,6 +26,8 @@ Fixes from a full review of both languages. Verdict rules are unchanged.
 - Facts: `--light` also skips the per-index ES queries (help, README), `--no-index-stats` skips 4 queries, not 2. Container advice no longer suggests `-p` with a host path. Bare-metal advice no longer suggests `--smart`, since SMART is collected there by default.
 - README: vendor tool logs are kept in `hw_tool_logs/` in the bundle (the text said they were removed), verdict names match the report, report section names match the English report, locale detection order (`LC_ALL`, `LC_MESSAGES`, `LANG`).
 - `docs/UPDATE_NOTES.md`: the two overlapping open-item tables are merged into one.
+- README: new sections on what the bundle contains and does not contain, and on removing the output after collection. Tested Elasticsearch versions. Where the tool writes is stated as the result directory plus its `.tar.gz`.
+- `LICENSE`: copyright holder is Munsik Kim.
 
 ### Tests
 - A kernel log with hung task and abort lines in one scenario. Any raw catalog key in shell output fails the run.

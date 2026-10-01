@@ -74,7 +74,7 @@ It does not:
 
 It does:
 
-- Read `/proc` and `/sys`, call ES read APIs, and write files in one place only: the output directory (default `/tmp`, moved to another disk automatically if it is on the same disk as ES data)
+- Read `/proc` and `/sys`, call ES read APIs, and write files in one place only: the output location (default `/tmp`, moved to another disk automatically if it is on the same disk as ES data). It creates two things there: the result directory `esdisk_<host>_<time>/` and the bundle `esdisk_<host>_<time>.tar.gz`
 - Read the tail of the ES server logs and the sar records (see the load table below)
 - Lower its own priority with `renice 19` and `ionice idle`. This ends with the process
 - Read NVMe temperatures. Reading `/sys/class/nvme/*/hwmon` makes the kernel request the SMART log from the device once. It is a read-only command, once per run
@@ -94,6 +94,40 @@ Turn them off with `--no-hw`.
 
 Some vendor tools leave log files (storcli.log, UcliEvt.log) in the directory they run from, so the tool runs them in `hw_tool_logs/` inside the output directory and keeps those logs in the bundle instead of deleting them.
 Each command has a 30 s cap. If a tool is missing, it is skipped and the report notes that installing it lets the tool check cache and battery automatically.
+
+### What the bundle contains
+
+Check this before the bundle leaves the customer's network. Everything is plain text or JSON, so you can open and review any file before sending it.
+
+| Contains | Examples |
+|---|---|
+| Server identity | Hostname, kernel and OS version, CPU and memory size, block device and mount layout, network interface names and error counters |
+| Elasticsearch metadata | Cluster and node names, node IPs and roles, index names with their size and write counts, ILM phases, disk-related cluster settings |
+| Log excerpts | Kernel log lines about disks and controllers (last 7 days), ES server log lines about throttling, watermarks and flush failures |
+| Process information | Process names and their I/O byte counters. The ES process command line (JVM options) |
+| Hardware status | SMART attributes, RAID controller configuration and event state, serial numbers as the vendor tools print them |
+
+It does not contain:
+
+- Passwords or API keys. Credentials are passed to curl through standard input and never written to a file.
+- `elasticsearch.yml` lines containing password, secret, token or key. Only path, role, routing and store settings are kept.
+- Secret values in the ES command line. Any JVM option whose name looks like a secret (password, secret, token, api key, credential, private) is saved as `name=***`.
+- Document contents or query text. It reads statistics APIs only.
+
+If hostnames, IPs or index names must not leave the site, run the analyzer on a PC inside the network and pass on only the HTML report.
+The report shows the same names, so review it before sending.
+
+### After collection
+
+The tool deletes nothing, so the result directory and the `.tar.gz` stay in the output location.
+Copy the bundle off the server, then remove both yourself:
+
+```bash
+ls -d /tmp/esdisk_*            # or the location shown at the end of the run
+rm -rf /tmp/esdisk_<host>_<time> /tmp/esdisk_<host>_<time>.tar.gz
+```
+
+On a PC, `es_disk_render.py` unpacks a `.tar.gz` bundle into the system temp directory and leaves it there. Delete it when you are done if needed.
 
 ---
 
@@ -163,7 +197,7 @@ For your first run, try it on an internal or development node and check the outp
 | Principle | Implementation |
 |---|---|
 | Automatic platform detection | Tells VMware, bare-metal (local or SAN), and other hypervisors or clouds apart, and switches thresholds and owners accordingly. [Reading the verdict](#reading-the-verdict) |
-| Does not change the system | Only reads `/proc` and `/sys` and calls ES read APIs (GET). Writes only inside the output directory |
+| Does not change the system | Only reads `/proc` and `/sys` and calls ES read APIs (GET). Writes only the result directory and its `.tar.gz` in the output location |
 | No service impact | Measured CPU 0.97 s (0.32% of one CPU over a 300 s measurement), 4.2MB memory, 12MB disk reads, `nice 19` + `ionice idle`. [Measured load details](#load-this-tool-puts-on-the-server) |
 | Adds no load | No load-test tool. Measures the real production load. When load is low, it holds the performance verdict itself |
 | Deletes nothing | No script contains a delete operation (`rm` and similar). Logs left by vendor tools stay in the output directory and go into the bundle |
@@ -258,6 +292,7 @@ python3 es_disk_render.py esdisk_es-hot-01_20260923_142031.tar.gz
 | HTML analyzer | Python 3.6+ standard library only (detects RHEL 8 `/usr/libexec/platform-python` automatically). If the server has none, copy the bundle to a PC and run it there |
 | Privileges | root recommended (ES process I/O, kernel log, VMware details) |
 | ES privileges | `cluster monitor` (`monitoring_user` level). No admin account needed |
+| Elasticsearch | Run against 8.19 on a real node. Thresholds checked against the documentation up to 9.5. It uses only the stats, `_cat` and health APIs, which 7.x also has, but 7.x and 8.x before 8.19 are not tested. Elastic Cloud Hosted and Serverless are out of scope (no OS access) |
 | Optional (more detail when present) | `sysstat` (history), `ethtool` (NIC ring), `open-vm-tools` (VMware resources), `smartmontools` (SMART), RAID controller tools (`storcli` or `perccli`, `ssacli`, `arcconf`) |
 
 ### Commands it uses on the server
@@ -593,8 +628,8 @@ The server has no Python 3.6 or later. Copy the bundle (`.tar.gz`) to a PC and r
 
 - This is not an official Elastic or VMware product.
 - It provides diagnostic results and action guidance only, and changes no settings. The owner reviews and applies each action.
-- It adds no load and deletes no files. Files written to the output directory are the only trace it leaves on the server.
+- It adds no load and deletes no files. The result directory and the `.tar.gz` in the output location are the only trace it leaves on the server. Remove them yourself after copying the bundle (see "After collection").
 
 ## License
 
-MIT License
+MIT License. See [LICENSE](LICENSE).
