@@ -588,7 +588,11 @@ echo "read_sar_bytes=$SAR_BYTES" >> "$OUT/meta"
 echo "es_instances=$N_ES" >> "$OUT/meta"
 echo "es_pid=$ES_PID" >> "$OUT/meta"
 if [[ -n "$ES_PID" && -d /proc/$ES_PID ]]; then
-  tr '\0' '\n' < /proc/$ES_PID/cmdline > "$S/es_cmdline" 2>/dev/null
+  # JVM options can carry secrets (-D...password=...). Mask the value of any argument whose name looks like one
+  tr '\0' '\n' < /proc/$ES_PID/cmdline 2>/dev/null \
+    | awk '{ l = tolower($0); p = index($0, "=")
+             if (p && substr(l, 1, p) ~ /(passw|secret|token|api[_.-]?key|credential|private)/) $0 = substr($0, 1, p) "***"
+             print }' > "$S/es_cmdline"
   catf /proc/$ES_PID/limits  > "$S/es_limits"
   catf /proc/$ES_PID/status  > "$S/es_status"
   catf /proc/$ES_PID/cgroup  > "$S/es_cgroup"
